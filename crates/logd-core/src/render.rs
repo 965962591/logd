@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn gb18030_truncation_does_not_split_multibyte() {
-        let (raw, _, _) = encoding_rs::GB18030.encode(&"曝".repeat(50));
+        let long = "曝".repeat(50);
+        let (raw, _, _) = encoding_rs::GB18030.encode(&long);
         // 每个汉字 2 字节，切在 7 应退到 6
         let line = prepare_line(&raw, Encoding::Gb18030, &mut Vec::new(), 7);
         assert!(line.truncated);

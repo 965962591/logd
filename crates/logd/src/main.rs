@@ -1,55 +1,44 @@
 //! logd —— 超大日志文件的筛选与阅读工具。
 //!
-//! 引擎在 `logd-core`，这里只管 UI。
+//! 引擎全在 `logd-core`（索引、匹配、筛选、视口数学），这里只做 UI。
 
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
-};
+use gpui::*;
+use gpui_component::{h_flex, v_flex, Root, TitleBar};
 
-mod theme {
-    pub const BG: u32 = 0x1e1e1e;
-    pub const FG: u32 = 0xd4d4d4;
-    pub const MUTED: u32 = 0x808080;
+fn main() {
+    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+
+    app.run(move |cx| {
+        gpui_component::init(cx);
+
+        cx.spawn(async move |cx| {
+            cx.open_window(TitleBar::window_options(), |window, cx| {
+                let view = cx.new(|_| LogdApp);
+                // 窗口第一层必须是 Root，弹窗/通知/tooltip 都挂在它上面
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("创建窗口失败");
+        })
+        .detach();
+    });
 }
 
 struct LogdApp;
 
 impl Render for LogdApp {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
             .size_full()
-            .bg(rgb(theme::BG))
-            .text_color(rgb(theme::FG))
-            .justify_center()
-            .items_center()
-            .gap_2()
-            .child("logd")
+            .child(TitleBar::new().child(h_flex().w_full().pr_2().child("logd")))
             .child(
-                div()
-                    .text_color(rgb(theme::MUTED))
+                v_flex()
+                    .id("body")
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child("logd")
                     .child("拖入日志文件，或按 Ctrl+O 打开"),
             )
     }
-}
-
-fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("logd".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_window, cx| cx.new(|_cx| LogdApp),
-        )
-        .expect("创建窗口失败");
-        cx.activate(true);
-    });
 }
