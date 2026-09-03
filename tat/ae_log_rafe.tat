@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<TextAnalysisTool.NET version="2020-12-17" showOnlyFilteredLines="False">
+  <filters>
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="ae_mgr" />
+    <filter enabled="y" excluding="n" description="" foreColor="6a5acd" type="matches_text" case_sensitive="n" regex="n" text="Mag:" />
+    <filter enabled="y" excluding="n" description="" backColor="ffa07a" type="matches_text" case_sensitive="n" regex="n" text="[updateAEInfo2ISP]" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="m_baeLock" />
+    <filter enabled="n" excluding="n" description="" foreColor="006400" type="matches_text" case_sensitive="n" regex="n" text="aealgo" />
+    <filter enabled="n" excluding="n" description="" foreColor="800080" type="matches_text" case_sensitive="n" regex="n" text="getDeltaIndex_v2p0" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="getRecommendCWTarget_v2p0" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff1493" type="matches_text" case_sensitive="n" regex="n" text="con:" />
+    <filter enabled="n" excluding="n" description="" foreColor="800000" type="matches_text" case_sensitive="n" regex="n" text="onStartRecording" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff69b4" type="matches_text" case_sensitive="n" regex="n" text="open camera" />
+    <filter enabled="n" excluding="n" description="" foreColor="8b008b" type="matches_text" case_sensitive="n" regex="n" text="AE block2" />
+    <filter enabled="n" excluding="n" description="" foreColor="dc143c" type="matches_text" case_sensitive="n" regex="n" text="setonoff" />
+    <filter enabled="n" excluding="n" description="" foreColor="4b0082" type="matches_text" case_sensitive="n" regex="n" text="aaa_hal" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff1493" type="matches_text" case_sensitive="n" regex="n" text="doafae" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="aaa_state" />
+    <filter enabled="n" excluding="n" description="" foreColor="ff1493" type="matches_text" case_sensitive="n" regex="n" text="ContinuousShot" />
+    <filter enabled="n" excluding="n" description="" foreColor="0000ff" type="matches_text" case_sensitive="n" regex="n" text="transit" />
+    <filter enabled="n" excluding="n" description="" foreColor="d2691e" type="matches_text" case_sensitive="n" regex="y" text="calTargetProbs|getSceneSts|getHSTarget|getAOETarget" />
+    <filter enabled="y" excluding="n" description="" foreColor="0000ff" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="takePicture" />
+    <filter enabled="n" excluding="n" description="" foreColor="0000ff" type="matches_text" case_sensitive="n" regex="n" text="doCapAE" />
+    <filter enabled="n" excluding="n" description="" foreColor="008000" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text=".jpg" />
+    <filter enabled="n" excluding="n" description="" foreColor="4b0082" type="matches_text" case_sensitive="n" regex="n" text="getRecommendCWTarget_v2p0" />
+    <filter enabled="n" excluding="n" description="" foreColor="800080" type="matches_text" case_sensitive="n" regex="n" text="Final AE Target" />
+    <filter enabled="y" excluding="n" description="" foreColor="d2691e" type="matches_text" case_sensitive="n" regex="n" text="[getAEPLineMappingID]" />
+  </filters>
+</TextAnalysisTool.NET>

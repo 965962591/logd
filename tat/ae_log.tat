@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<TextAnalysisTool.NET version="2020-12-17" showOnlyFilteredLines="False">
+  <filters>
+    <filter enabled="y" excluding="n" description="ae_algo统计信息" foreColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="updateAEInfo2ISP" />
+    <filter enabled="n" excluding="n" description="ae flow信息" foreColor="000000" type="matches_text" case_sensitive="n" regex="n" text="ae_mgr" />
+    <filter enabled="n" excluding="n" description="曝光表" foreColor="fa8072" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="AEtable" />
+    <filter enabled="n" excluding="n" description="magic数" foreColor="00ff00" type="matches_text" case_sensitive="n" regex="n" text="MagicNum:" />
+    <filter enabled="n" excluding="n" description="af2ae" foreColor="ff1493" type="matches_text" case_sensitive="n" regex="n" text="doafae" />
+    <filter enabled="n" excluding="n" description="拍照task" foreColor="0000ff" type="matches_text" case_sensitive="n" regex="n" text="doCapAE" />
+    <filter enabled="n" excluding="n" description="ae target值" foreColor="800080" type="matches_text" case_sensitive="n" regex="n" text="Final AE Target" />
+    <filter enabled="n" excluding="n" description="曝光表" foreColor="d2691e" type="matches_text" case_sensitive="n" regex="n" text="[getAEPLineMappingID]" />
+    <filter enabled="n" excluding="n" description="ae初始化" foreColor="006400" type="matches_text" case_sensitive="n" regex="n" text="AEINIT" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="CWVY" />
+    <filter enabled="y" excluding="n" description="" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="Magic:" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="getDeltaIndex_v2p0" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="AeAlgo  : [getDeltaIndex_v2p0] eSensorDev:0 " />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="mMagicNumber" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="plinetable" />
+    <filter enabled="n" excluding="n" description="" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="Hal3Av3 : [parseMeta] MTK_CONTROL_AE_EXPOSURE_COMPENSATION" />
+    <filter enabled="n" excluding="n" description="" backColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="i4EVIndex" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="XIAOMI" />
+    <filter enabled="n" excluding="n" description="" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="updatepreevsettingqueue" />
+    <filter enabled="y" excluding="n" description="" backColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="takepicture" />
+    <filter enabled="y" excluding="n" description="" backColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="setupPhotoSaveInterceptors" />
+    <filter enabled="y" excluding="n" description="" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="[get_ae_smooth_idx_v6_s]" />
+    <filter enabled="y" excluding="n" description="闪光灯状态" backColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="StrobeDrvFlashlight: setOnOff()" />
+    <filter enabled="y" excluding="n" description="驱动获取收敛状态" type="matches_text" case_sensitive="n" regex="n" text="IsConvert4MetaResult(2)" />
+  </filters>
+</TextAnalysisTool.NET>

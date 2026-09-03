@@ -1,0 +1,19 @@
+[package]
+name = "logd-core"
+description = "超大日志文件的索引/匹配/筛选引擎，不依赖任何 UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+memchr.workspace = true
+memmap2.workspace = true
+aho-corasick.workspace = true
+regex.workspace = true
+rayon.workspace = true
+quick-xml.workspace = true
+encoding_rs.workspace = true
+dirs.workspace = true

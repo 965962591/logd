@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<TextAnalysisTool.NET version="2020-12-17" showOnlyFilteredLines="True">
+  <filters>
+    <filter enabled="y" excluding="n" description="曝光设定" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="alg_status" />
+    <filter enabled="n" excluding="n" description="flash拍照流程" type="matches_text" case_sensitive="n" regex="n" text="ae_post_process" />
+    <filter enabled="n" excluding="n" description="flash流程" foreColor="7fffd4" type="matches_text" case_sensitive="n" regex="n" text="ae_flash1" />
+    <filter enabled="n" excluding="n" description="flash流程" type="matches_text" case_sensitive="n" regex="n" text="qqx" />
+    <filter enabled="n" excluding="n" description="拍照关键帧" foreColor="0000ff" type="matches_text" case_sensitive="n" regex="n" text="cmr_grab_thread_proc" />
+    <filter enabled="n" excluding="n" description="打开闪光灯" backColor="ffb6c1" type="matches_text" case_sensitive="n" regex="n" text="ae_flash1_callback do-main-flash" />
+    <filter enabled="n" excluding="n" description="flash拍照" backColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="ae_flash1_callback do-capture" />
+    <filter enabled="n" excluding="n" description="前摄面板补光流程" backColor="ffff00" type="matches_text" case_sensitive="n" regex="n" text="camera_front_lcd_flash_callback" />
+    <filter enabled="n" excluding="n" description="lcd面板补光控制" type="matches_text" case_sensitive="n" regex="n" text="DisplayPowerController[0]" />
+    <filter enabled="n" excluding="n" description="camera hal请求时lcd亮度" type="matches_text" case_sensitive="n" regex="n" text="LIGHTS  : func:write_int" />
+    <filter enabled="n" excluding="n" description="" type="matches_text" case_sensitive="n" regex="n" text="ae_update_exp_data" />
+    <filter enabled="n" excluding="n" description="" backColor="f0e68c" type="matches_text" case_sensitive="n" regex="n" text="metering_calc" />
+    <filter enabled="y" excluding="n" description="" foreColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="takePicture" />
+    <filter enabled="n" excluding="n" description="flicker" foreColor="ff0000" type="matches_text" case_sensitive="n" regex="n" text="afl_status" />
+  </filters>
+</TextAnalysisTool.NET>

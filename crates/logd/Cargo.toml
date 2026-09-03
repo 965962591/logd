@@ -1,0 +1,21 @@
+[package]
+name = "logd"
+description = "超大日志文件的筛选与阅读工具"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "logd"
+path = "src/main.rs"
+
+[dependencies]
+logd-core = { path = "../logd-core" }
+# 默认特性含 wayland/x11，它们会激活顶层 [dependencies] 里非 target-gated 的
+# blade-graphics/cosmic-text，在 Windows 上纯属白编译。Windows 后端走 DirectX 11 +
+# DirectWrite（由 target-gated 的 windows crate 提供），不需要这些。
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+anyhow.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
