@@ -128,6 +128,22 @@ pub fn encode_pattern(text: &str, enc: Encoding) -> Vec<u8> {
 }
 
 impl MatcherSet {
+    /// 一条过滤器都没有：全部行可见，无高亮。
+    pub fn empty() -> Self {
+        Self {
+            filters: Vec::new(),
+            ac_cs: None,
+            ac_cs_ids: Vec::new(),
+            ac_ci: None,
+            ac_ci_ids: Vec::new(),
+            re_set: None,
+            re_ids: Vec::new(),
+            re_each: Vec::new(),
+            has_include: false,
+            has_exclude: false,
+        }
+    }
+
     pub fn new(filters: Vec<FilterSpec>, enc: Encoding) -> Result<Self> {
         let (mut lit_cs, mut ac_cs_ids) = (Vec::new(), Vec::new());
         let (mut lit_ci, mut ac_ci_ids) = (Vec::new(), Vec::new());

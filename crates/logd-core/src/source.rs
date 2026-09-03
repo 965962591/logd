@@ -33,6 +33,9 @@ enum Backing {
     Mapped(Mmap),
     /// 空文件在 Windows 上没法 mmap。
     Empty,
+    /// 测试用的内存缓冲，免得每个用例都要落盘。
+    #[cfg(test)]
+    Owned(Vec<u8>),
 }
 
 pub struct FileSource {
@@ -80,6 +83,21 @@ impl FileSource {
         match &self.backing {
             Backing::Mapped(m) => m,
             Backing::Empty => &[],
+            #[cfg(test)]
+            Backing::Owned(v) => v,
+        }
+    }
+
+    /// 用内存里的字节造一个 `FileSource`，只给单测用。
+    #[cfg(test)]
+    pub fn from_bytes_for_test(bytes: Vec<u8>, encoding: Encoding) -> Self {
+        let bom_len = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+        Self {
+            path: PathBuf::from("<memory>"),
+            len: bytes.len() as u64,
+            backing: Backing::Owned(bytes),
+            bom_len,
+            encoding,
         }
     }
 
@@ -107,6 +125,12 @@ impl FileSource {
     #[inline]
     pub fn encoding(&self) -> Encoding {
         self.encoding
+    }
+
+    /// 文件头 BOM 的字节数。第一行的原始切片里含 BOM，渲染前要跳过。
+    #[inline]
+    pub fn bom_len(&self) -> usize {
+        self.bom_len
     }
 
     /// 手动覆盖编码（UI 上的编码菜单）。不影响已建好的行索引——
