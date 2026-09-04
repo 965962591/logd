@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::index::LineIndex;
 use crate::matcher::{MatcherSet, Span};
 use crate::render::{prepare_line, prepare_plain, DEFAULT_MAX_RENDER_BYTES};
-use crate::source::FileSource;
+use crate::source::{Encoding, FileSource};
 use crate::viewport::{ScrollTo, Viewport};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +38,13 @@ pub struct Document {
     show_only_filtered: bool,
     viewport: Viewport,
     max_render_bytes: usize,
+    /// 生效的编码。`FileSource` 在 `Arc` 里改不动，所以用户手动切换的编码存这儿。
+    encoding: Encoding,
 }
 
 impl Document {
     pub fn new(source: Arc<FileSource>, index: Arc<LineIndex>, line_height: f32) -> Self {
+        let encoding = source.encoding();
         let mut d = Self {
             source,
             index,
@@ -50,9 +53,25 @@ impl Document {
             show_only_filtered: false,
             viewport: Viewport::new(line_height),
             max_render_bytes: DEFAULT_MAX_RENDER_BYTES,
+            encoding,
         };
         d.sync_viewport();
         d
+    }
+
+    #[inline]
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    /// 手动切换编码。行索引不受影响——两种编码都是 ASCII 兼容的字节流，
+    /// `b'\n'` 的位置不变；但关键字要按新编码重新编码，所以命中集作废。
+    pub fn set_encoding(&mut self, enc: Encoding) {
+        if self.encoding != enc {
+            self.encoding = enc;
+            self.matches = None;
+            self.sync_viewport();
+        }
     }
 
     // ---- 状态读取 ----
@@ -227,7 +246,7 @@ impl Document {
             s = self.source.bom_len().min(end as usize);
         }
         let raw = &data[s..end as usize];
-        let enc = self.source.encoding();
+        let enc = self.encoding;
 
         if self.matcher.is_noop() {
             let line = prepare_plain(raw, enc, self.max_render_bytes);

@@ -1,13 +1,14 @@
-//! 日志视口：自建滚动 + 自绘滚动条 + 行渲染。
+//! 日志视口：自建滚动 + 自绘滚动条 + 行渲染 + 后台索引/筛选。
 //!
 //! **为什么不用 `uniform_list` / `virtual_list`**：gpui 的 `Pixels` 是 `f32`。
 //! 5 亿行 × 18px = 9e9 px，f32 尾数 24 位，超过约 1.67e7 px（≈93 万行）滚动偏移
 //! 就开始丢精度、抖动、跳行。任何「以像素总高为基准」的虚拟列表在这个量级都不可用。
 //!
-//! 这里的滚动位置由 [`logd_core::Viewport`] 维护为 `(anchor_line: u64, pixel_offset: f32)`，
-//! 全部比例运算走 f64，只在最后一步落到像素。滚动数学本身在 `logd-core` 里有单测。
+//! 滚动位置由 [`logd_core::Viewport`] 维护成 `(anchor_line: u64, pixel_offset: f32)`，
+//! 比例运算全走 f64，只在最后一步落到像素。滚动数学在 `logd-core` 里有单测。
 
 use std::cell::Cell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,55 +16,76 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use logd_core::{
-    index::HEAD_BYTES, Document, FileSource, LineIndex, Progress, RenderRow, ScrollTo,
+    cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
+    MatcherSet, Progress, RenderRow, ScanOutcome, ScrollTo,
 };
 
 use crate::theme;
-
-pub struct LogView {
-    doc: Document,
-    focus: FocusHandle,
-    /// 视口在窗口里的矩形。由 `canvas` 在 prepaint 阶段回填，render 读上一帧的值。
-    area: Rc<Cell<Bounds<Pixels>>>,
-    /// 上一帧用过的尺寸，用来判断是否真的变了，避免 notify 死循环。
-    last_area: Bounds<Pixels>,
-    /// 正在拖滚动条：记录抓取点在滑块内的偏移。
-    drag_grab: Option<f32>,
-    /// 后台全量索引的进度。`None` 表示没有在跑。
-    indexing: Option<Arc<Progress>>,
-}
 
 /// 打开文件的**易错部分**：mmap + 编码探测 + 首屏索引。
 ///
 /// 和构造视图分开，是因为 `cx.new()` 的闭包必须返回 `Self` 而不是 `Result<Self>`。
 pub struct Loaded {
     source: Arc<FileSource>,
-    head: Arc<LineIndex>,
+    index: Arc<LineIndex>,
+    /// 索引是不是从磁盘缓存直接读出来的（省掉一整趟扫描）
+    from_cache: bool,
 }
 
-impl Loaded {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
-        let source = Arc::new(FileSource::open(path)?);
-        // 阶段 A：只索引头部，先把首屏顶出来
-        let head = Arc::new(LineIndex::build_head(source.data(), HEAD_BYTES));
-        Ok(Self { source, head })
-    }
+pub struct LogView {
+    doc: Document,
+    focus: FocusHandle,
+    /// 视口在窗口里的矩形。由 `canvas` 在 prepaint 阶段回填，render 读上一帧的值。
+    area: Rc<Cell<Bounds<Pixels>>>,
+    last_area: Bounds<Pixels>,
+    /// 正在拖滚动条：记录抓取点在滑块内的偏移。
+    drag_grab: Option<f32>,
+    indexing: Option<Arc<Progress>>,
+    scanning: Option<Arc<Progress>>,
+    /// 每次发起筛选自增。回调里对不上就说明结果已经过期，直接丢弃。
+    scan_gen: u64,
+    /// 过滤器变了但这个标签页还没重扫（非活动标签页先记账，切过去再扫）
+    dirty: bool,
+    /// 正则编译失败之类的提示
+    error: Option<String>,
+    from_cache: bool,
 }
 
 impl LogView {
     /// 打开文件但先不建视图。失败在这一步暴露。
-    pub fn load(path: &std::path::Path) -> Result<Loaded> {
-        Loaded::open(path)
+    pub fn load(path: &Path) -> Result<Loaded> {
+        let source = Arc::new(FileSource::open(path)?);
+        // M5：命中索引缓存就整趟扫描都省了，50GB 二次打开 <1s
+        if let Ok(Some(cached)) = cache::load(path) {
+            return Ok(Loaded {
+                source,
+                index: Arc::new(cached),
+                from_cache: true,
+            });
+        }
+        // 阶段 A：只索引头部，先把首屏顶出来
+        let index = Arc::new(LineIndex::build_head(source.data(), HEAD_BYTES));
+        Ok(Loaded {
+            source,
+            index,
+            from_cache: false,
+        })
     }
+
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let complete = loaded.head.complete;
+        let complete = loaded.index.complete;
         let mut view = Self {
-            doc: Document::new(loaded.source, loaded.head, theme::LINE_HEIGHT),
+            doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
             area: Rc::new(Cell::new(Bounds::default())),
             last_area: Bounds::default(),
             drag_grab: None,
             indexing: None,
+            scanning: None,
+            scan_gen: 0,
+            dirty: false,
+            error: None,
+            from_cache: loaded.from_cache,
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -73,6 +95,8 @@ impl LogView {
         view
     }
 
+    // ---- 只读状态，给状态栏用 ----
+
     pub fn doc(&self) -> &Document {
         &self.doc
     }
@@ -81,23 +105,46 @@ impl LogView {
         self.indexing.as_ref().map(|p| p.fraction())
     }
 
-    pub fn focus_handle(&self) -> &FocusHandle {
-        &self.focus
+    pub fn scanning_progress(&self) -> Option<f32> {
+        self.scanning.as_ref().map(|p| p.fraction())
     }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn from_cache(&self) -> bool {
+        self.from_cache
+    }
+
+    // ---- 后台索引 ----
 
     fn start_full_index(&mut self, cx: &mut Context<Self>) {
         let source = self.doc.source().clone();
         let progress = Arc::new(Progress::new(source.len()));
         self.indexing = Some(progress.clone());
 
+        let for_task = progress.clone();
         cx.spawn(async move |this, cx| {
+            let path = source.path().to_path_buf();
             let built = cx
                 .background_executor()
-                .spawn(async move { LineIndex::build_full(source.data(), &progress) })
+                .spawn(async move {
+                    let idx = LineIndex::build_full(source.data(), &for_task);
+                    // 顺手落盘，下次打开就不用再扫了。写失败不影响功能。
+                    if let Some(i) = idx.as_ref() {
+                        let _ = cache::store(&path, i);
+                    }
+                    idx
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(index) = built {
                     this.doc.set_index(Arc::new(index));
+                    // 之前基于部分索引扫出来的命中集不完整，重扫
+                    if !this.doc.matcher().is_noop() {
+                        this.start_scan(cx);
+                    }
                 }
                 this.indexing = None;
                 cx.notify();
@@ -106,19 +153,23 @@ impl LogView {
         })
         .detach();
 
-        // 索引期间 30Hz 刷一次，进度条和行数才会动
+        self.poll_while_busy(cx);
+    }
+
+    /// 后台任务跑着的时候 30Hz 刷一次，进度和行数才会动。
+    fn poll_while_busy(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(33))
                     .await;
-                let running = this
+                let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.indexing.is_some()
+                        this.indexing.is_some() || this.scanning.is_some()
                     })
                     .unwrap_or(false);
-                if !running {
+                if !busy {
                     break;
                 }
             }
@@ -126,7 +177,93 @@ impl LogView {
         .detach();
     }
 
+    // ---- 筛选 ----
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// 换一套过滤器。非活动标签页可以先 [`mark_dirty`]，切过去时再调这个。
+    pub fn apply_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+        self.dirty = false;
+        match MatcherSet::new(filters, self.doc.encoding()) {
+            Ok(m) => {
+                self.error = None;
+                self.doc.set_matcher(Arc::new(m));
+                self.start_scan(cx);
+            }
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn set_show_only_filtered(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.doc.set_show_only_filtered(on);
+        cx.notify();
+    }
+
+    pub fn set_encoding(&mut self, enc: Encoding, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+        self.doc.set_encoding(enc);
+        // 关键字要按新编码重新编码成字节串，matcher 必须重建
+        self.apply_filters(filters, cx);
+    }
+
+    fn start_scan(&mut self, cx: &mut Context<Self>) {
+        // 上一轮还在跑就叫停，它的结果会被 scan_gen 挡掉
+        if let Some(p) = self.scanning.take() {
+            p.cancel();
+        }
+        if self.doc.matcher().is_noop() {
+            self.doc.set_matches(None);
+            cx.notify();
+            return;
+        }
+
+        self.scan_gen += 1;
+        let gen = self.scan_gen;
+        let source = self.doc.source().clone();
+        let index = self.doc.index().clone();
+        let matcher = self.doc.matcher().clone();
+        let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
+        self.scanning = Some(progress.clone());
+
+        cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move { scan_all(source.data(), &index, &matcher, &progress) })
+                .await;
+            this.update(cx, |this, cx| {
+                // 结果过期了（用户又改了过滤器）就丢掉
+                if this.scan_gen != gen {
+                    return;
+                }
+                match out {
+                    Some(ScanOutcome::Matched(v)) => this.doc.set_matches(Some(Arc::new(v))),
+                    Some(ScanOutcome::AllVisible) => this.doc.set_matches(None),
+                    None => {} // 被取消
+                }
+                this.scanning = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
+        self.poll_while_busy(cx);
+    }
+
     // ---- 输入 ----
+
+    pub fn goto_line(&mut self, file_line: u64, cx: &mut Context<Self>) {
+        self.doc.goto_file_line(file_line, ScrollTo::Center);
+        cx.notify();
+    }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let lh = theme::LINE_HEIGHT;
@@ -134,7 +271,7 @@ impl LogView {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
             ScrollDelta::Lines(l) => (l.x * lh, l.y * lh * theme::WHEEL_LINES),
         };
-        // gpui 的 dy 是「内容跟随手指移动」的方向，视口位移要取反
+        // gpui 的 dy 是「内容跟随手指」的方向，视口位移要取反
         let vp = self.doc.viewport_mut();
         vp.scroll_by_pixels(-dy);
         if dx != 0.0 {
@@ -163,29 +300,19 @@ impl LogView {
         cx.notify();
     }
 
-    /// 按文件行号跳转，给 Ctrl+G 和外部调用用。
-    pub fn goto_line(&mut self, file_line: u64, cx: &mut Context<Self>) {
-        self.doc.goto_file_line(file_line, ScrollTo::Center);
-        cx.notify();
-    }
-
     // ---- 滚动条 ----
 
-    fn track_metrics(&self) -> (f32, f32, f32) {
-        let area = self.last_area;
-        let top = f32::from(area.origin.y);
-        let len = f32::from(area.size.height);
-        let (thumb_off, thumb_len) = self.doc.viewport().thumb(len, theme::MIN_THUMB);
-        let _ = thumb_len;
-        (top, len, thumb_off)
+    fn track(&self) -> (f32, f32) {
+        let a = self.last_area;
+        (f32::from(a.origin.y), f32::from(a.size.height))
     }
 
     fn on_scrollbar_down(&mut self, y: f32, cx: &mut Context<Self>) {
-        let (top, len, thumb_off) = self.track_metrics();
-        let (_, thumb_len) = self.doc.viewport().thumb(len, theme::MIN_THUMB);
+        let (top, len) = self.track();
+        let (thumb_off, thumb_len) = self.doc.viewport().thumb(len, theme::MIN_THUMB);
         let local = y - top;
         if local >= thumb_off && local <= thumb_off + thumb_len {
-            // 抓住滑块本体，记住抓取点，拖动时保持相对位置
+            // 抓住滑块本体，拖动时保持相对位置
             self.drag_grab = Some(local - thumb_off);
         } else {
             // 点空白轨道：滑块中心跳到点击处
@@ -200,7 +327,7 @@ impl LogView {
 
     fn on_drag_move(&mut self, y: f32, cx: &mut Context<Self>) {
         let Some(grab) = self.drag_grab else { return };
-        let (top, len, _) = self.track_metrics();
+        let (top, len) = self.track();
         self.doc
             .viewport_mut()
             .set_thumb_offset(y - top - grab, len, theme::MIN_THUMB);
@@ -219,7 +346,7 @@ impl LogView {
             .when_some(line_spec.and_then(|f| f.fore), |el, c| {
                 el.text_color(theme::c(c))
             })
-            .when_some(line_spec.filter(|f| f.bold).map(|_| ()), |el, _| {
+            .when(line_spec.is_some_and(|f| f.bold), |el| {
                 el.font_weight(FontWeight::BOLD)
             });
 
@@ -243,8 +370,7 @@ impl LogView {
                     ))
                 })
                 .collect();
-            content =
-                content.child(StyledText::new(row.text.clone()).with_highlights(runs));
+            content = content.child(StyledText::new(row.text.clone()).with_highlights(runs));
         }
 
         div()
@@ -270,10 +396,16 @@ impl LogView {
             .into_any_element()
     }
 
-    /// 行号槽宽度按当前总行数的位数算，别让它随滚动跳来跳去。
+    /// 行号槽宽度按总行数的位数算，别让它随滚动跳来跳去。
     fn gutter_width(&self) -> f32 {
         let digits = (self.doc.total_file_lines().max(1) as f64).log10().floor() as usize + 1;
         (digits.max(4) as f32) * (theme::FONT_SIZE * 0.62) + 20.0
+    }
+}
+
+impl Focusable for LogView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
@@ -315,7 +447,7 @@ impl Render for LogView {
             .line_height(px(theme::LINE_HEIGHT))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                 if this.drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
                     this.on_drag_move(f32::from(ev.position.y), cx);
                 }
@@ -328,7 +460,7 @@ impl Render for LogView {
                     }
                 }),
             )
-            // 量视口尺寸。prepaint 里回填，尺寸变了才 notify，避免每帧重画
+            // 量视口尺寸：prepaint 回填，尺寸真变了才 notify，避免每帧重画
             .child(
                 canvas(
                     move |bounds, _window, cx| {
@@ -350,10 +482,7 @@ impl Render for LogView {
                     .right_0()
                     .flex()
                     .flex_col()
-                    .children(
-                        rows.iter()
-                            .map(|r| self.render_row(r, gutter_w, h_scroll)),
-                    ),
+                    .children(rows.iter().map(|r| self.render_row(r, gutter_w, h_scroll))),
             )
             .when(show_scrollbar, |el| {
                 el.child(

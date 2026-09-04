@@ -8,7 +8,8 @@ mod log_view;
 mod theme;
 
 fn main() {
-    // 命令行直接给路径，方便拿大文件做性能验收
-    let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
+    // 命令行可以直接给若干路径：日志文件开标签页，.tat 当配置加载。
+    // 方便拿大文件做性能验收。
+    let initial: Vec<_> = std::env::args().skip(1).map(std::path::PathBuf::from).collect();
     app::run(initial);
 }

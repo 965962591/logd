@@ -29,3 +29,42 @@ pub const WHEEL_LINES: f32 = 3.0;
 pub fn c(v: u32) -> Rgba {
     rgb(v)
 }
+
+/// 配色循环表。取自 `tat/` 里真实用过的颜色，点一下换下一个。
+pub const PALETTE: &[u32] = &[
+    0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xfa8072, 0xff1493, 0x800080, 0xd2691e, 0x006400,
+    0x6a5acd, 0xffa07a, 0x7fffd4, 0xffb6c1,
+];
+
+/// `None → PALETTE[0] → … → PALETTE[n-1] → None`，循环回到「不设色」。
+pub fn next_color(cur: Option<u32>) -> Option<u32> {
+    match cur {
+        None => Some(PALETTE[0]),
+        Some(c) => match PALETTE.iter().position(|&p| p == c) {
+            Some(i) if i + 1 < PALETTE.len() => Some(PALETTE[i + 1]),
+            // 走到头或者是 .tat 里带来的表外颜色，都回到「不设色」
+            _ => None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_cycle_wraps_back_to_none() {
+        let mut cur = None;
+        for _ in 0..PALETTE.len() {
+            cur = next_color(cur);
+            assert!(cur.is_some());
+        }
+        assert_eq!(next_color(cur), None, "走完一轮应回到不设色");
+    }
+
+    #[test]
+    fn unknown_color_from_tat_falls_back_to_none() {
+        assert_eq!(next_color(Some(0x123456)), None);
+    }
+}
+

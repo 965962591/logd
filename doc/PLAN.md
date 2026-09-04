@@ -221,9 +221,10 @@ D:\tuning\tools\AE\logd\
 │   ├── PLAN.md                # 本文件
 │   └── PROGRESS.md            # 里程碑与当前进度
 ├── tat/                       # 已有样本，兼作测试夹具
-├── tools/gen_big_log.rs       # 生成 N GB 测试日志
 └── crates/
     ├── logd-core/             # 引擎，无 UI 依赖
+    │   ├── examples/
+    │   │   └── gen_big_log.rs # 生成 N GB 测试日志
     │   └── src/
     │       ├── lib.rs
     │       ├── progress.rs    # 进度/取消
@@ -231,45 +232,63 @@ D:\tuning\tools\AE\logd\
     │       ├── source.rs      # FileSource: mmap + 编码探测
     │       ├── matcher.rs     # MatcherSet: AC + 多正则
     │       ├── scan.rs        # 并行筛选
-    │       ├── cache.rs       # 索引 sidecar 持久化 (M5)
+    │       ├── viewport.rs    # u64 精度滚动数学（见 2.6）
+    │       ├── render.rs      # 编码坐标换算 + char 边界 + 超长行截断
+    │       ├── document.rs    # 文件行号 ↔ 视图行号双坐标系
+    │       ├── cache.rs       # 索引 sidecar 持久化
     │       └── tat.rs         # .tat 读写
     └── logd/                  # bin，GPUI UI
         └── src/
-            ├── main.rs        # Application::new().run(...)
-            ├── app.rs         # 根视图：标签栏 + 活动页 + 状态栏
-            ├── doc.rs         # LogDocument: source+index+matches+视图状态
-            ├── settings.rs    # 窗口状态、最近文件、主题
-            └── ui/
-                ├── log_view.rs    # 自建视口 + 行渲染 + 高亮
-                ├── scrollbar.rs   # u64 精度滚动条
-                ├── tabs.rs
-                ├── filter_panel.rs
-                ├── toolbar.rs
-                └── theme.rs
+            ├── main.rs        # 入口，解析命令行路径
+            ├── app.rs         # 根视图：标签栏 + 工具栏 + 过滤器面板 + 状态栏
+            ├── log_view.rs    # 自建视口 + 自绘滚动条 + 后台索引/筛选
+            └── theme.rs       # 配色、字号、配色循环表
 ```
+
+> 与最初设想的差异：滚动数学、编码换算、双坐标系被抽进 `logd-core` 做成纯函数并单测，
+> 而不是埋在 UI 里。这三块是最容易出错的地方，隔离出来收益很大。
 
 ## 4. 依赖
 
-| crate | 用途 | 本机 cargo cache |
+| crate | 用途 | 来源 |
 |---|---|---|
-| `gpui` | UI 框架 | ❌ **需联网拉取** |
-| `rfd` | 原生文件对话框 | ❌ 需拉取 |
-| `memmap2` 0.9.11 | 文件映射 | ✅ |
-| `memchr` 2.8.0 | 换行扫描 | ✅ |
-| `aho-corasick` 1.1.4 | 多字面量匹配 | ✅ |
-| `regex` 1.12.3 | 多正则 + span（`regex::bytes`） | ✅ |
-| `rayon` 1.12.0 | 并行 | ✅ |
-| `quick-xml` 0.36.2 | `.tat` | ✅ |
-| `encoding_rs` 0.8.35 | UTF-8 / GB18030 | ✅ |
-| `twox-hash` / `dirs` / `anyhow` / `thiserror` / `parking_lot` | 杂项 | ✅ |
+| `gpui` | UI 框架 | zed git HEAD（rev `d7b9b38`） |
+| `gpui_platform` | 平台层（git HEAD 已从 gpui 拆出） | zed git HEAD，`features = ["font-kit"]` |
+| `gpui-component` | 组件库：Input / Button / TitleBar / Root | longbridge git HEAD（rev `f517e74`） |
+| `gpui-component-assets` | 默认图标资源 | longbridge git HEAD |
+| `memmap2` 0.9.11 | 文件映射 | crates.io |
+| `memchr` 2.8.0 | 换行扫描 | crates.io |
+| `aho-corasick` 1.1.4 | 多字面量匹配 | crates.io |
+| `regex` 1.12 | 多正则 + span（`regex::bytes`） | crates.io |
+| `rayon` 1.12.0 | 并行 | crates.io |
+| `quick-xml` 0.36.2 | `.tat` | crates.io |
+| `encoding_rs` 0.8.35 | UTF-8 / GB18030 | crates.io |
+| `dirs` / `anyhow` / `thiserror` / `parking_lot` | 杂项 | crates.io |
 
-**除 gpui / rfd 外全部已在本机 cargo cache 里**（来自同机 `hiviewer_rs` 项目），
-版本已在 workspace `[workspace.dependencies]` 中钉死到缓存版本，避免额外联网。
+**不用 `rfd`**：`.tat` 靠拖拽加载、Ctrl+S 保存。离线环境下少一个依赖少一分风险。
+**不用 `twox-hash`**：缓存文件名去重用内联 FNV-1a 就够。
 
-`gpui` 获取策略：先试 crates.io（`gpui = "*"`），不可用则固定 git rev：
+### ⚠️ gh-proxy 镜像的陷阱
+
+`gpui-component` 自己的 manifest 里，zed 的地址写死的是**原始 github**。
+如果我们这边写成 `https://gh-proxy.org/https://github.com/...`，cargo 会按 URL 字符串
+判成两个 source，拉进**两份 gpui**，编出互不兼容的 `WindowOptions` / `Render`：
+
+```
+error[E0308]: mismatched types
+note: there are multiple different versions of crate `gpui` in the dependency graph
+```
+
+所以 **zed 那两条必须用原始 github 地址**；`gpui-component` 自己没人跟它抢，可以走镜像。
+验证：`grep -c 'gh-proxy.*zed-industries' Cargo.lock` 必须是 0。
+
+⚠️ **git 依赖目前没锁 rev**，zed main 分支随时会变。建议钉死：
 
 ```toml
-gpui = { git = "https://github.com/zed-industries/zed", rev = "<pin>" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "d7b9b38" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d7b9b38", features = ["font-kit"] }
+gpui-component = { git = "https://gh-proxy.org/https://github.com/longbridge/gpui-component", rev = "f517e74" }
+gpui-component-assets = { git = "https://gh-proxy.org/https://github.com/longbridge/gpui-component", rev = "f517e74" }
 ```
 
 **profile 注意**：dev 下 `opt-level = 1` + 依赖 `opt-level = 3`。
