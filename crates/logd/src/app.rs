@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement, DockSkin};
+use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
@@ -18,7 +18,7 @@ use logd_core::{Encoding, FilterSpec, HighlightMode, TatFile};
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
 use crate::theme;
-use crate::ui::dock::{FilterPanel, LogPanel};
+use crate::ui::dock::{logd_dock_area, FilterPanel, LogPanel};
 use crate::ui::title_bar;
 
 struct Tab {
@@ -101,7 +101,7 @@ impl LogdApp {
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app, cx));
-        let (dock_area, skin) = DockSkin::dock_area("logd.main", Some(1), window, cx);
+        let (dock_area, skin) = logd_dock_area("logd.main", Some(1), window, cx);
         // The View menu is the single visibility control; avoid a duplicate dock toggle button.
         skin.set_toggle_button_visible(false, cx);
         dock_area.update(cx, |dock, cx| {
@@ -582,11 +582,7 @@ impl LogdApp {
             .xsmall()
             .ghost()
             .text_color(theme::c(theme::FG))
-            .label(text(command_group, lang))
-            .on_mouse_down(
-                MouseButton::Left,
-                |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation(),
-            );
+            .label(text(command_group, lang));
 
         match command_group {
             Key::File => button
