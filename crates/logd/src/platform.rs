@@ -1,10 +1,17 @@
 //! Cross-platform window policy for Windows and macOS.
 
-use gpui::{px, size, App, WindowDecorations, WindowOptions};
+use gpui::{px, size, App, TitlebarOptions, WindowDecorations, WindowOptions};
 
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        titlebar: None,
+        // Client-side decorations are required for the custom title bar.  An
+        // explicit transparent titlebar also enables GPUI's Windows hit-test
+        // callback instead of creating a native titlebar above our content.
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            ..Default::default()
+        }),
         is_movable: true,
         window_bounds: Some(gpui::WindowBounds::centered(size(px(1280.), px(800.)), cx)),
         window_min_size: Some(size(px(760.), px(480.))),

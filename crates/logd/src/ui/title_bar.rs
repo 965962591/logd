@@ -33,7 +33,6 @@ pub fn render(
         .border_color(theme::c(theme::BORDER))
         .text_color(theme::c(theme::FG))
         .on_double_click(|_, window, _| window.zoom_window())
-        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
         .child(
             h_flex()
                 .h_full()
@@ -59,6 +58,10 @@ pub fn render(
                 .w_full()
                 .min_w_0()
                 .justify_end()
+                // The space before the encoding label is part of the title
+                // bar too. Without its own hitbox it remains a normal client
+                // area and cannot move the window on Windows.
+                .child(drag_region("title-drag-right"))
                 .child(right)
                 .child(control(
                     "window-minimize",
@@ -100,12 +103,10 @@ fn drag_region(id: &'static str) -> impl IntoElement {
         .id(id)
         .h_full()
         .flex_1()
+        // Keep a real, non-zero hitbox even when the title bar is narrow or
+        // the neighboring search/menu content is measured as min-content.
+        .min_w(px(64.))
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-            window.prevent_default();
-            window.start_window_move();
-            cx.stop_propagation();
-        })
 }
 
 fn control(
