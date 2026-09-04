@@ -115,9 +115,9 @@ impl TabGroupRenderer for LogdTabGroupSkin {
             .filter(|panel| panel.visible(cx))
             .count();
         if visible_panels == 1
-            && group
-                .active_panel()
-                .is_some_and(|panel| panel.panel_name(cx) == "logd.workspace")
+            && group.active_panel().is_some_and(|panel| {
+                matches!(panel.panel_name(cx), "logd.workspace" | "logd.filters")
+            })
         {
             Empty.into_any_element()
         } else {

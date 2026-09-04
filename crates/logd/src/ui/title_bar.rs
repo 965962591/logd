@@ -9,6 +9,9 @@ use crate::theme;
 
 const HEIGHT: f32 = 34.0;
 const CONTROL_WIDTH: f32 = 46.0;
+const SIDE_DRAG_MIN_WIDTH: f32 = 64.0;
+const SEARCH_MAX_WIDTH: f32 = 520.0;
+const CENTER_DRAG_MIN_WIDTH: f32 = 20.0;
 
 pub fn render(
     left: AnyElement,
@@ -40,7 +43,7 @@ pub fn render(
                 .flex_1()
                 .items_center()
                 .child(left)
-                .child(drag_region("title-drag-left")),
+                .child(drag_region("title-drag-left", SIDE_DRAG_MIN_WIDTH)),
         )
         .child(
             h_flex()
@@ -48,9 +51,12 @@ pub fn render(
                 .w_full()
                 .min_w_0()
                 .justify_center()
-                .child(drag_region("title-drag-center-left"))
-                .child(div().w_full().max_w(px(360.)).child(center))
-                .child(drag_region("title-drag-center-right")),
+                .child(drag_region("title-drag-center-left", CENTER_DRAG_MIN_WIDTH))
+                .child(div().w_full().max_w(px(SEARCH_MAX_WIDTH)).child(center))
+                .child(drag_region(
+                    "title-drag-center-right",
+                    CENTER_DRAG_MIN_WIDTH,
+                )),
         )
         .child(
             h_flex()
@@ -61,7 +67,7 @@ pub fn render(
                 // The space before the encoding label is part of the title
                 // bar too. Without its own hitbox it remains a normal client
                 // area and cannot move the window on Windows.
-                .child(drag_region("title-drag-right"))
+                .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
                 .child(right)
                 .child(control(
                     "window-minimize",
@@ -98,14 +104,14 @@ pub fn render(
         )
 }
 
-fn drag_region(id: &'static str) -> impl IntoElement {
+fn drag_region(id: &'static str, min_width: f32) -> impl IntoElement {
     div()
         .id(id)
         .h_full()
         .flex_1()
         // Keep a real, non-zero hitbox even when the title bar is narrow or
         // the neighboring search/menu content is measured as min-content.
-        .min_w(px(64.))
+        .min_w(px(min_width))
         .window_control_area(WindowControlArea::Drag)
 }
 

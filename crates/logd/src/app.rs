@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
@@ -56,6 +57,8 @@ pub struct LogdApp {
     keyword: Entity<InputState>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
+    filter_fore: Entity<ColorPickerState>,
+    filter_back: Entity<ColorPickerState>,
     selected_filter: Option<usize>,
     editing_filter: Option<usize>,
     filter_editor_open: bool,
@@ -74,8 +77,15 @@ impl LogdApp {
         let keyword = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::SearchPlaceholder, language))
         });
-        let filter_text = cx.new(|cx| InputState::new(window, cx));
-        let filter_description = cx.new(|cx| InputState::new(window, cx));
+        let filter_text = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::FilterTextPlaceholder, language))
+        });
+        let filter_description = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(text(Key::FilterDescriptionPlaceholder, language))
+        });
+        let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
+        let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
 
         cx.subscribe_in(
             &keyword,
@@ -87,6 +97,10 @@ impl LogdApp {
             },
         )
         .detach();
+        cx.subscribe(&filter_fore, |_, _, _: &ColorPickerEvent, cx| cx.notify())
+            .detach();
+        cx.subscribe(&filter_back, |_, _, _: &ColorPickerEvent, cx| cx.notify())
+            .detach();
         cx.subscribe_in(
             &filter_text,
             window,
@@ -130,6 +144,8 @@ impl LogdApp {
             keyword,
             filter_text,
             filter_description,
+            filter_fore,
+            filter_back,
             selected_filter: None,
             editing_filter: None,
             filter_editor_open: false,
@@ -304,17 +320,24 @@ impl LogdApp {
     }
 
     fn add_keyword(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let value = value.trim().to_string();
-        if value.is_empty() {
+        // The title-bar search uses `|` as an OR separator. Keep each term
+        // as its own filter so the matcher can scan all terms in one pass and
+        // the filter panel can still edit or disable them independently.
+        let keywords = split_search_keywords(&value);
+        if keywords.is_empty() {
             return;
         }
-        self.filters.push(FilterSpec {
-            text: value,
-            mode: HighlightMode::Field,
-            fore: Some(theme::PALETTE[self.filters.len() % theme::PALETTE.len()]),
-            ..Default::default()
-        });
-        self.selected_filter = Some(self.filters.len() - 1);
+
+        for keyword in keywords {
+            let color = theme::PALETTE[self.filters.len() % theme::PALETTE.len()];
+            self.filters.push(FilterSpec {
+                text: keyword,
+                mode: HighlightMode::Field,
+                fore: Some(color),
+                ..Default::default()
+            });
+        }
+        self.selected_filter = self.filters.len().checked_sub(1);
         self.keyword
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filters_changed(cx);
@@ -327,6 +350,12 @@ impl LogdApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
+        let fore = theme::PALETTE[self.filters.len() % theme::PALETTE.len()];
+        self.filter_fore.update(cx, |picker, cx| {
+            picker.set_value(theme::c(fore), window, cx)
+        });
+        self.filter_back
+            .update(cx, |picker, cx| picker.clear_value(window, cx));
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
         self.show_filter_panel(true, window, cx);
     }
@@ -346,6 +375,8 @@ impl LogdApp {
         self.filter_description.update(cx, |state, cx| {
             state.set_value(filter.description, window, cx)
         });
+        set_picker_color(&self.filter_fore, filter.fore, window, cx);
+        set_picker_color(&self.filter_back, filter.back, window, cx);
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
     }
 
@@ -355,10 +386,14 @@ impl LogdApp {
             return;
         }
         let description = self.filter_description.read(cx).value().trim().to_string();
+        let fore = self.filter_fore.read(cx).value().map(hsla_to_rgb);
+        let back = self.filter_back.read(cx).value().map(hsla_to_rgb);
         match self.editing_filter {
             Some(index) if index < self.filters.len() => {
                 self.filters[index].text = value;
                 self.filters[index].description = description;
+                self.filters[index].fore = fore;
+                self.filters[index].back = back;
                 self.selected_filter = Some(index);
             }
             _ => {
@@ -366,7 +401,8 @@ impl LogdApp {
                     text: value,
                     description,
                     mode: HighlightMode::Field,
-                    fore: Some(theme::PALETTE[self.filters.len() % theme::PALETTE.len()]),
+                    fore,
+                    back,
                     ..Default::default()
                 });
                 self.selected_filter = Some(self.filters.len() - 1);
@@ -643,6 +679,9 @@ impl LogdApp {
                     let all_app = app.clone();
                     let only_app = app.clone();
                     let panel_app = app.clone();
+                    let left_app = app.clone();
+                    let right_app = app.clone();
+                    let bottom_app = app.clone();
                     let language_app = app.clone();
                     let menu = menu
                         .item(
@@ -666,6 +705,46 @@ impl LogdApp {
                                     &panel_app,
                                     |this, _, window, cx| {
                                         this.dispatch(MenuCommand::ToggleFilters, window, cx)
+                                    },
+                                )),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(text(Key::DockLeft, lang))
+                                .checked(placement == DockPlacement::Left)
+                                .on_click(window.listener_for(&left_app, |this, _, window, cx| {
+                                    this.dispatch(
+                                        MenuCommand::DockFilters(DockPlacement::Left),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::DockRight, lang))
+                                .checked(placement == DockPlacement::Right)
+                                .on_click(window.listener_for(
+                                    &right_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(
+                                            MenuCommand::DockFilters(DockPlacement::Right),
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::DockBottom, lang))
+                                .checked(placement == DockPlacement::Bottom)
+                                .on_click(window.listener_for(
+                                    &bottom_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(
+                                            MenuCommand::DockFilters(DockPlacement::Bottom),
+                                            window,
+                                            cx,
+                                        )
                                     },
                                 )),
                         );
@@ -716,9 +795,6 @@ impl LogdApp {
                     let edit_app = app.clone();
                     let delete_app = app.clone();
                     let save_app = app.clone();
-                    let left_app = app.clone();
-                    let right_app = app.clone();
-                    let bottom_app = app.clone();
                     menu.item(PopupMenuItem::new(text(Key::AddFilter, lang)).on_click(
                         window.listener_for(&add_app, |this, _, window, cx| {
                             this.dispatch(MenuCommand::AddFilter, window, cx)
@@ -738,44 +814,12 @@ impl LogdApp {
                                 this.dispatch(MenuCommand::DeleteFilter, window, cx)
                             })),
                     )
-                    .item(PopupMenuItem::new(text(Key::SaveFilter, lang)).on_click(
-                        window.listener_for(&save_app, |this, _, window, cx| {
-                            this.dispatch(MenuCommand::SaveFilters, window, cx)
-                        }),
-                    ))
-                    .separator()
                     .item(
-                        PopupMenuItem::new(text(Key::DockLeft, lang))
-                            .checked(placement == DockPlacement::Left)
-                            .on_click(window.listener_for(&left_app, |this, _, window, cx| {
-                                this.dispatch(
-                                    MenuCommand::DockFilters(DockPlacement::Left),
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    )
-                    .item(
-                        PopupMenuItem::new(text(Key::DockRight, lang))
-                            .checked(placement == DockPlacement::Right)
-                            .on_click(window.listener_for(&right_app, |this, _, window, cx| {
-                                this.dispatch(
-                                    MenuCommand::DockFilters(DockPlacement::Right),
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    )
-                    .item(
-                        PopupMenuItem::new(text(Key::DockBottom, lang))
-                            .checked(placement == DockPlacement::Bottom)
-                            .on_click(window.listener_for(&bottom_app, |this, _, window, cx| {
-                                this.dispatch(
-                                    MenuCommand::DockFilters(DockPlacement::Bottom),
-                                    window,
-                                    cx,
-                                )
-                            })),
+                        PopupMenuItem::new(text(Key::SaveFilter, lang)).on_click(
+                            window.listener_for(&save_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::SaveFilters, window, cx)
+                            }),
+                        ),
                     )
                 })
                 .into_any_element(),
@@ -892,7 +936,16 @@ impl LogdApp {
         window: &mut Window,
         cx: &mut Context<FilterPanel>,
     ) -> AnyElement {
-        let (filters, selected, editor_open, editor_text, editor_description, lang) = {
+        let (
+            filters,
+            selected,
+            editor_open,
+            editor_text,
+            editor_description,
+            filter_fore,
+            filter_back,
+            lang,
+        ) = {
             let state = app.read(cx);
             (
                 state.filters.clone(),
@@ -900,6 +953,8 @@ impl LogdApp {
                 state.filter_editor_open,
                 state.filter_text.clone(),
                 state.filter_description.clone(),
+                state.filter_fore.clone(),
+                state.filter_back.clone(),
                 state.language,
             )
         };
@@ -939,6 +994,28 @@ impl LogdApp {
                         .border_color(theme::c(theme::BORDER))
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .items_center()
+                                .child(
+                                    ColorPicker::new(&filter_fore)
+                                        // The component's default featured colors are
+                                        // repeated in its full palette and reuse the same
+                                        // accessibility IDs in debug builds.
+                                        .featured_colors(Vec::new())
+                                        .small()
+                                        .label(text(Key::ForegroundColor, lang))
+                                        .accessibility_label(text(Key::ForegroundColor, lang)),
+                                )
+                                .child(
+                                    ColorPicker::new(&filter_back)
+                                        .featured_colors(Vec::new())
+                                        .small()
+                                        .label(text(Key::BackgroundColor, lang))
+                                        .accessibility_label(text(Key::BackgroundColor, lang)),
+                                ),
+                        )
                         .child(
                             h_flex()
                                 .gap_2()
@@ -1245,6 +1322,22 @@ fn swatch(
         .into_any_element()
 }
 
+fn set_picker_color(
+    picker: &Entity<ColorPickerState>,
+    color: Option<u32>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    picker.update(cx, |picker, cx| match color {
+        Some(color) => picker.set_value(theme::c(color), window, cx),
+        None => picker.clear_value(window, cx),
+    });
+}
+
+fn hsla_to_rgb(color: Hsla) -> u32 {
+    u32::from(color.to_rgb()) >> 8
+}
+
 fn group(number: u64) -> String {
     let source = number.to_string();
     let mut output = String::with_capacity(source.len() + source.len() / 3);
@@ -1255,6 +1348,15 @@ fn group(number: u64) -> String {
         output.push(ch);
     }
     output
+}
+
+fn split_search_keywords(value: &str) -> Vec<String> {
+    value
+        .split('|')
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 pub fn run(initial: Vec<PathBuf>) {
@@ -1278,7 +1380,7 @@ pub fn run(initial: Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::group;
+    use super::{group, split_search_keywords};
 
     #[test]
     fn groups_thousands() {
@@ -1286,5 +1388,14 @@ mod tests {
         assert_eq!(group(999), "999");
         assert_eq!(group(1000), "1,000");
         assert_eq!(group(500_000_000), "500,000,000");
+    }
+
+    #[test]
+    fn splits_search_keywords_on_pipe() {
+        assert_eq!(
+            split_search_keywords("  first | second|| third |  "),
+            vec!["first", "second", "third"]
+        );
+        assert!(split_search_keywords(" | ").is_empty());
     }
 }
