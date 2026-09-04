@@ -52,6 +52,9 @@ pub enum Key {
     FilterDescriptionPlaceholder,
     ForegroundColor,
     BackgroundColor,
+    FilterScope,
+    FilterCurrentFile,
+    FilterAllFiles,
     FilterPanel,
     NoFilters,
     Ready,
@@ -107,9 +110,11 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::SaveFilter, Language::EnUs) => "Save Filters",
         (Key::SaveEditedCopy, Language::ZhCn) => "保存编辑副本",
         (Key::SaveEditedCopy, Language::EnUs) => "Save Edited Copy",
-        (Key::SearchPlaceholder, Language::ZhCn) => "搜索关键字（用 | 分隔多个），回车添加",
+        (Key::SearchPlaceholder, Language::ZhCn) => {
+            "搜索所有已导入文件（关键字用 | 分隔），回车搜索"
+        }
         (Key::SearchPlaceholder, Language::EnUs) => {
-            "Search keywords (use | for multiple), press Enter"
+            "Search all imported files (use | between keywords), press Enter"
         }
         (Key::FilterTextPlaceholder, Language::ZhCn) => "过滤关键字（必填）",
         (Key::FilterTextPlaceholder, Language::EnUs) => "Filter keyword (required)",
@@ -119,10 +124,18 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::ForegroundColor, Language::EnUs) => "Text color",
         (Key::BackgroundColor, Language::ZhCn) => "背景颜色",
         (Key::BackgroundColor, Language::EnUs) => "Background color",
+        (Key::FilterScope, Language::ZhCn) => "搜索范围",
+        (Key::FilterScope, Language::EnUs) => "Search scope",
+        (Key::FilterCurrentFile, Language::ZhCn) => "当前文件",
+        (Key::FilterCurrentFile, Language::EnUs) => "Current file",
+        (Key::FilterAllFiles, Language::ZhCn) => "所有文件",
+        (Key::FilterAllFiles, Language::EnUs) => "All files",
         (Key::FilterPanel, Language::ZhCn) => "过滤器面板",
         (Key::FilterPanel, Language::EnUs) => "Filter Panel",
-        (Key::NoFilters, Language::ZhCn) => "还没有过滤器。使用标题栏搜索框添加。",
-        (Key::NoFilters, Language::EnUs) => "No filters. Use the title-bar search to add one.",
+        (Key::NoFilters, Language::ZhCn) => "还没有过滤器。标题栏搜索可临时搜索所有已导入文件。",
+        (Key::NoFilters, Language::EnUs) => {
+            "No filters. The title-bar search temporarily searches all files."
+        }
         (Key::Ready, Language::ZhCn) => "就绪",
         (Key::Ready, Language::EnUs) => "Ready",
         (Key::Language, Language::ZhCn) => "语言",

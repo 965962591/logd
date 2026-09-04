@@ -583,14 +583,18 @@ impl LogView {
         let line_content = if is_editing {
             div()
                 .flex_1()
+                .min_w_0()
                 .h_full()
                 .child(Input::new(&self.edit_input).xsmall().appearance(false))
                 .into_any_element()
         } else {
             div()
+                .flex()
                 .flex_1()
+                .min_w_0()
                 .pl_2()
                 .overflow_hidden()
+                .whitespace_nowrap()
                 .child(content)
                 .into_any_element()
         };
@@ -601,6 +605,7 @@ impl LogView {
             .flex_row()
             .h(px(theme::LINE_HEIGHT))
             .w_full()
+            .min_w_0()
             .overflow_hidden()
             .when_some(line_spec.and_then(|f| f.back), |el, c| el.bg(theme::c(c)))
             .when(selected, |el| el.bg(theme::c(theme::SELECTION)))

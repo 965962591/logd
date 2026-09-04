@@ -20,7 +20,7 @@ pub mod viewport;
 pub use document::{Document, RenderRow};
 pub use index::{ChunkIndex, LineIndex, ANCHOR_STRIDE};
 pub use logline::{Level, LogLine, Ts};
-pub use matcher::{FilterSpec, HighlightMode, MatcherSet, Span, Verdict};
+pub use matcher::{FilterScope, FilterSpec, HighlightMode, MatcherSet, Span, Verdict};
 pub use merge::{MergedRow, MergedView, TimedLine};
 pub use progress::Progress;
 pub use query::{CompileOptions, Query, QueryScratch};

@@ -2,7 +2,7 @@
 //!
 //! 目标是**双向兼容**：读得懂现有文件，写出来的文件 TAT.NET 还能打开。
 //! 做法是保留所有不认识的属性（[`FilterSpec::extra`]），logd 自己的新特性
-//! 用 `logd_` 前缀的普通属性承载。
+//! 用 `logd_` 前缀的普通属性承载（例如高亮样式和搜索作用域）。
 //!
 //! 为什么不用 XML namespace（`logd:mode`）：带前缀但没声明 `xmlns:logd` 是非法 XML，
 //! 声明了又可能让 TAT.NET 的 XmlSerializer 报错。普通属性名任何宽容解析器都会忽略。
@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::matcher::{FilterSpec, HighlightMode};
+use crate::matcher::{FilterScope, FilterSpec, HighlightMode};
 
 const ROOT: &str = "TextAnalysisTool.NET";
 const DEFAULT_VERSION: &str = "2020-12-17";
@@ -146,6 +146,16 @@ impl TatFile {
             if f.italic {
                 attr(&mut s, "logd_italic", "y");
             }
+            if f.scope != FilterScope::default() {
+                attr(
+                    &mut s,
+                    "logd_scope",
+                    match f.scope {
+                        FilterScope::AllFiles => "all",
+                        FilterScope::CurrentFile => "current",
+                    },
+                );
+            }
             s.push_str(" />\r\n");
         }
 
@@ -191,6 +201,12 @@ fn parse_filter(attrs: &[(String, String)]) -> FilterSpec {
             "logd_mode" => f.mode = HighlightMode::parse(v),
             "logd_bold" => f.bold = parse_bool(v),
             "logd_italic" => f.italic = parse_bool(v),
+            "logd_scope" => {
+                f.scope = match v.trim().to_ascii_lowercase().as_str() {
+                    "current" | "file" => FilterScope::CurrentFile,
+                    _ => FilterScope::AllFiles,
+                }
+            }
             _ => f.extra.push((k.clone(), v.clone())),
         }
     }
@@ -286,11 +302,13 @@ mod tests {
         t.filters[0].mode = HighlightMode::Field;
         t.filters[0].bold = true;
         t.filters[1].italic = true;
+        t.filters[2].scope = FilterScope::CurrentFile;
         t.show_only_filtered = true;
 
         let xml = t.to_xml();
         assert!(xml.contains("logd_mode=\"field\""));
         assert!(xml.contains("logd_bold=\"y\""));
+        assert!(xml.contains("logd_scope=\"current\""));
         assert!(xml.contains("showOnlyFilteredLines=\"True\""));
 
         let back = TatFile::parse(xml.as_bytes()).unwrap();

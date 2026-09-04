@@ -6,6 +6,7 @@ pub const BG: u32 = 0x1e1e1e;
 pub const FG: u32 = 0xd4d4d4;
 pub const TITLE_BAR_BG: u32 = 0x181818;
 pub const CONTROL_HOVER: u32 = 0x2a2d2e;
+pub const SEARCH_FORE: u32 = 0xffd75f;
 pub const DANGER: u32 = 0xc42b1c;
 pub const SELECTION: u32 = 0x264f78;
 /// 行号槽、状态栏次要文字

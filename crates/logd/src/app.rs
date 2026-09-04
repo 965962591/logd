@@ -1,7 +1,8 @@
 //! Desktop shell and application command routing.
 //!
-//! Filters are shared across tabs. Only the active tab is rescanned
-//! immediately; inactive tabs are marked dirty until activated.
+//! Configured filters can target one tab or all imported tabs. Only the active
+//! tab is rescanned immediately after a filter edit; inactive tabs are marked
+//! dirty until activated. Title-bar searches are temporary and scan every tab.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex, InteractiveElementExt as _, Root, Selectable as _, Sizable};
-use logd_core::{Encoding, FilterSpec, HighlightMode, TatFile};
+use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
@@ -51,6 +52,9 @@ pub struct LogdApp {
     tabs: Vec<Tab>,
     active: usize,
     filters: Vec<FilterSpec>,
+    /// Temporary title-bar search terms. They are applied to every tab but
+    /// are intentionally kept out of the persisted/configured filter list.
+    search_filters: Vec<FilterSpec>,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
@@ -59,6 +63,7 @@ pub struct LogdApp {
     filter_description: Entity<InputState>,
     filter_fore: Entity<ColorPickerState>,
     filter_back: Entity<ColorPickerState>,
+    filter_scope: FilterScope,
     selected_filter: Option<usize>,
     editing_filter: Option<usize>,
     filter_editor_open: bool,
@@ -87,15 +92,11 @@ impl LogdApp {
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
 
-        cx.subscribe_in(
-            &keyword,
-            window,
-            |this, state, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
-                    this.add_keyword(state.read(cx).value().to_string(), window, cx);
-                }
-            },
-        )
+        cx.subscribe_in(&keyword, window, |this, state, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.set_global_search(state.read(cx).value().to_string(), cx);
+            }
+        })
         .detach();
         cx.subscribe(&filter_fore, |_, _, _: &ColorPickerEvent, cx| cx.notify())
             .detach();
@@ -138,6 +139,7 @@ impl LogdApp {
             tabs: Vec::new(),
             active: 0,
             filters: Vec::new(),
+            search_filters: Vec::new(),
             show_only_filtered: false,
             tat_path: None,
             recent_files: Vec::new(),
@@ -146,6 +148,7 @@ impl LogdApp {
             filter_description,
             filter_fore,
             filter_back,
+            filter_scope: FilterScope::default(),
             selected_filter: None,
             editing_filter: None,
             filter_editor_open: false,
@@ -193,16 +196,17 @@ impl LogdApp {
         match LogView::load(path) {
             Ok(loaded) => {
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
-                self.apply_current_filters(&view, cx);
+                let tab_index = self.tabs.len();
                 self.tabs.push(Tab {
-                    view,
+                    view: view.clone(),
                     title: path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string()),
                     path: path.to_path_buf(),
                 });
-                self.active = self.tabs.len() - 1;
+                self.active = tab_index;
+                self.apply_filters_to_view(tab_index, &view, cx);
                 self.remember_file(path);
                 self.status = None;
             }
@@ -213,11 +217,24 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn apply_current_filters(&self, view: &Entity<LogView>, cx: &mut App) {
-        if self.filters.is_empty() {
-            return;
-        }
-        let filters = self.filters.clone();
+    fn filters_for_tab(&self, tab_index: usize) -> Vec<FilterSpec> {
+        let mut filters = self
+            .filters
+            .iter()
+            .cloned()
+            .map(|mut filter| {
+                if filter.scope == FilterScope::CurrentFile && tab_index != self.active {
+                    filter.enabled = false;
+                }
+                filter
+            })
+            .collect::<Vec<_>>();
+        filters.extend(self.search_filters.iter().cloned());
+        filters
+    }
+
+    fn apply_filters_to_view(&self, tab_index: usize, view: &Entity<LogView>, cx: &mut App) {
+        let filters = self.filters_for_tab(tab_index);
         let only = self.show_only_filtered;
         view.update(cx, |view, cx| {
             view.apply_filters(filters, cx);
@@ -255,7 +272,7 @@ impl LogdApp {
         match LogView::load(&path) {
             Ok(loaded) => {
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
-                self.apply_current_filters(&view, cx);
+                self.apply_filters_to_view(self.active, &view, cx);
                 self.tabs[self.active].view = view;
                 self.status = Some(format!(
                     "{}: {}",
@@ -275,14 +292,16 @@ impl LogdApp {
             return;
         }
         self.active = index;
-        let filters = self.filters.clone();
-        let only = self.show_only_filtered;
         let view = self.tabs[index].view.clone();
-        if view.read(cx).is_dirty() {
-            view.update(cx, |view, cx| {
-                view.apply_filters(filters, cx);
-                view.set_show_only_filtered(only, cx);
-            });
+        // Reapply even when the view is not dirty: a current-file filter
+        // changes meaning when the active tab changes.
+        if view.read(cx).is_dirty()
+            || self
+                .filters
+                .iter()
+                .any(|filter| filter.scope == FilterScope::CurrentFile)
+        {
+            self.apply_filters_to_view(index, &view, cx);
         }
         cx.notify();
     }
@@ -291,9 +310,16 @@ impl LogdApp {
         if index >= self.tabs.len() {
             return;
         }
+        let previous_active = self.active;
         self.tabs.remove(index);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
+        }
+        // Removing the active tab (or a tab before it) can change which file
+        // a current-file filter belongs to.
+        if !self.tabs.is_empty() && (index == previous_active || index < previous_active) {
+            let view = self.tabs[self.active].view.clone();
+            self.apply_filters_to_view(self.active, &view, cx);
         }
         cx.notify();
     }
@@ -303,15 +329,9 @@ impl LogdApp {
     }
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
-        let filters = self.filters.clone();
-        let only = self.show_only_filtered;
         for (index, tab) in self.tabs.iter().enumerate() {
             if index == self.active {
-                let current = filters.clone();
-                tab.view.update(cx, |view, cx| {
-                    view.apply_filters(current, cx);
-                    view.set_show_only_filtered(only, cx);
-                });
+                self.apply_filters_to_view(index, &tab.view, cx);
             } else {
                 tab.view.update(cx, |view, _| view.mark_dirty());
             }
@@ -319,28 +339,26 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn add_keyword(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        // The title-bar search uses `|` as an OR separator. Keep each term
-        // as its own filter so the matcher can scan all terms in one pass and
-        // the filter panel can still edit or disable them independently.
-        let keywords = split_search_keywords(&value);
-        if keywords.is_empty() {
-            return;
-        }
-
-        for keyword in keywords {
-            let color = theme::PALETTE[self.filters.len() % theme::PALETTE.len()];
-            self.filters.push(FilterSpec {
+    fn set_global_search(&mut self, value: String, cx: &mut Context<Self>) {
+        self.search_filters = split_search_keywords(&value)
+            .into_iter()
+            .map(|keyword| FilterSpec {
                 text: keyword,
                 mode: HighlightMode::Field,
-                fore: Some(color),
+                fore: Some(theme::SEARCH_FORE),
                 ..Default::default()
-            });
+            })
+            .collect();
+
+        // A title-bar search is intentionally independent of configured
+        // filters and is scanned in every imported file.
+        let tab_filters = (0..self.tabs.len())
+            .map(|index| (index, self.tabs[index].view.clone()))
+            .collect::<Vec<_>>();
+        for (index, view) in tab_filters {
+            self.apply_filters_to_view(index, &view, cx);
         }
-        self.selected_filter = self.filters.len().checked_sub(1);
-        self.keyword
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.filters_changed(cx);
+        cx.notify();
     }
 
     fn begin_add_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -350,6 +368,7 @@ impl LogdApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filter_scope = FilterScope::default();
         let fore = theme::PALETTE[self.filters.len() % theme::PALETTE.len()];
         self.filter_fore.update(cx, |picker, cx| {
             picker.set_value(theme::c(fore), window, cx)
@@ -375,6 +394,7 @@ impl LogdApp {
         self.filter_description.update(cx, |state, cx| {
             state.set_value(filter.description, window, cx)
         });
+        self.filter_scope = filter.scope;
         set_picker_color(&self.filter_fore, filter.fore, window, cx);
         set_picker_color(&self.filter_back, filter.back, window, cx);
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
@@ -394,6 +414,7 @@ impl LogdApp {
                 self.filters[index].description = description;
                 self.filters[index].fore = fore;
                 self.filters[index].back = back;
+                self.filters[index].scope = self.filter_scope;
                 self.selected_filter = Some(index);
             }
             _ => {
@@ -403,6 +424,7 @@ impl LogdApp {
                     mode: HighlightMode::Field,
                     fore,
                     back,
+                    scope: self.filter_scope,
                     ..Default::default()
                 });
                 self.selected_filter = Some(self.filters.len() - 1);
@@ -449,7 +471,7 @@ impl LogdApp {
             Encoding::Utf8 => Encoding::Gb18030,
             Encoding::Gb18030 => Encoding::Utf8,
         };
-        let filters = self.filters.clone();
+        let filters = self.filters_for_tab(self.active);
         view.update(cx, |view, cx| view.set_encoding(next, filters, cx));
         cx.notify();
     }
@@ -944,6 +966,7 @@ impl LogdApp {
             editor_description,
             filter_fore,
             filter_back,
+            filter_scope,
             lang,
         ) = {
             let state = app.read(cx);
@@ -955,6 +978,7 @@ impl LogdApp {
                 state.filter_description.clone(),
                 state.filter_fore.clone(),
                 state.filter_back.clone(),
+                state.filter_scope,
                 state.language,
             )
         };
@@ -994,6 +1018,19 @@ impl LogdApp {
                         .border_color(theme::c(theme::BORDER))
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
+                        .child(
+                            Button::new("filter-scope")
+                                .xsmall()
+                                .label(filter_scope_label(filter_scope, lang))
+                                .tooltip(text(Key::FilterScope, lang))
+                                .on_click(window.listener_for(app, |this, _, _, cx| {
+                                    this.filter_scope = match this.filter_scope {
+                                        FilterScope::AllFiles => FilterScope::CurrentFile,
+                                        FilterScope::CurrentFile => FilterScope::AllFiles,
+                                    };
+                                    cx.notify();
+                                })),
+                        )
                         .child(
                             h_flex()
                                 .gap_4()
@@ -1173,6 +1210,7 @@ fn render_filter_row(
     let mode_app = app.clone();
     let regex_app = app.clone();
     let case_app = app.clone();
+    let scope_app = app.clone();
     let fg_app = app.clone();
     let bg_app = app.clone();
     let context_app = app.clone();
@@ -1252,6 +1290,19 @@ fn render_filter_row(
                 .selected(filter.case_sensitive)
                 .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
                     this.filters[index].case_sensitive = !this.filters[index].case_sensitive;
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(
+            Button::new(("filter-scope", index))
+                .xsmall()
+                .label(filter_scope_label(filter.scope, lang))
+                .tooltip(text(Key::FilterScope, lang))
+                .on_click(window.listener_for(&scope_app, move |this, _, _, cx| {
+                    this.filters[index].scope = match this.filters[index].scope {
+                        FilterScope::AllFiles => FilterScope::CurrentFile,
+                        FilterScope::CurrentFile => FilterScope::AllFiles,
+                    };
                     this.filters_changed(cx);
                 })),
         )
@@ -1357,6 +1408,16 @@ fn split_search_keywords(value: &str) -> Vec<String> {
         .filter(|keyword| !keyword.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn filter_scope_label(scope: FilterScope, lang: Language) -> &'static str {
+    text(
+        match scope {
+            FilterScope::CurrentFile => Key::FilterCurrentFile,
+            FilterScope::AllFiles => Key::FilterAllFiles,
+        },
+        lang,
+    )
 }
 
 pub fn run(initial: Vec<PathBuf>) {

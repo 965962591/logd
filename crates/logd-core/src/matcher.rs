@@ -41,6 +41,16 @@ impl HighlightMode {
     }
 }
 
+/// Which imported log files a configured filter applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterScope {
+    /// Preserve the historical behavior of filters loaded from `.tat` files.
+    #[default]
+    AllFiles,
+    /// Apply the filter only to the currently active log tab.
+    CurrentFile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterSpec {
     pub enabled: bool,
@@ -59,6 +69,8 @@ pub struct FilterSpec {
     pub bold: bool,
     pub italic: bool,
     pub mode: HighlightMode,
+    /// Whether this filter is shared by all imported files or only the active file.
+    pub scope: FilterScope,
     /// 读到的、我们不认识的属性。回写时原样吐回去，保证 .tat 往返不丢信息。
     pub extra: Vec<(String, String)>,
 }
@@ -78,6 +90,7 @@ impl Default for FilterSpec {
             bold: false,
             italic: false,
             mode: HighlightMode::default(),
+            scope: FilterScope::default(),
             extra: Vec::new(),
         }
     }
