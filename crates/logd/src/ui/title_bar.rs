@@ -40,7 +40,8 @@ pub fn render(
                 .min_w_0()
                 .flex_1()
                 .items_center()
-                .child(left),
+                .child(left)
+                .child(drag_region("title-drag-left")),
         )
         .child(
             h_flex()
@@ -48,7 +49,9 @@ pub fn render(
                 .w_full()
                 .min_w_0()
                 .justify_center()
-                .child(div().w_full().max_w(px(360.)).child(center)),
+                .child(drag_region("title-drag-center-left"))
+                .child(div().w_full().max_w(px(360.)).child(center))
+                .child(drag_region("title-drag-center-right")),
         )
         .child(
             h_flex()
@@ -92,6 +95,19 @@ pub fn render(
         )
 }
 
+fn drag_region(id: &'static str) -> impl IntoElement {
+    div()
+        .id(id)
+        .h_full()
+        .flex_1()
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            window.start_window_move();
+            cx.stop_propagation();
+        })
+}
+
 fn control(
     id: &'static str,
     icon: IconName,
@@ -108,6 +124,13 @@ fn control(
         .items_center()
         .justify_center()
         .cursor_pointer()
+        .window_control_area(if danger {
+            WindowControlArea::Close
+        } else if id == "window-minimize" {
+            WindowControlArea::Min
+        } else {
+            WindowControlArea::Max
+        })
         .when(danger, |el| {
             el.hover(|s| s.bg(theme::c(theme::DANGER)).text_color(gpui::white()))
         })

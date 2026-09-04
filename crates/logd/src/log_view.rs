@@ -22,7 +22,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
-    MatcherSet, Progress, RenderRow, ScanOutcome, ScrollTo,
+    MatcherSet, Progress, RenderRow, ScanOutcome,
 };
 
 use crate::theme;
@@ -300,11 +300,6 @@ impl LogView {
     }
 
     // ---- 输入 ----
-
-    pub fn goto_line(&mut self, file_line: u64, cx: &mut Context<Self>) {
-        self.doc.goto_file_line(file_line, ScrollTo::Center);
-        cx.notify();
-    }
 
     pub fn copy_selection(&self, cx: &mut App) {
         let Some(selection) = self.selection else {

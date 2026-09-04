@@ -5,6 +5,7 @@ use gpui::{px, size, App, WindowDecorations, WindowOptions};
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         titlebar: None,
+        is_movable: true,
         window_bounds: Some(gpui::WindowBounds::centered(size(px(1280.), px(800.)), cx)),
         window_min_size: Some(size(px(760.), px(480.))),
         window_decorations: Some(WindowDecorations::Client),

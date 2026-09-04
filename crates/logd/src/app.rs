@@ -10,11 +10,9 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement, DockSkin};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{
-    h_flex, v_flex, Disableable as _, InteractiveElementExt as _, Root, Selectable as _, Sizable,
-};
+use gpui_component::{h_flex, v_flex, InteractiveElementExt as _, Root, Selectable as _, Sizable};
 use logd_core::{Encoding, FilterSpec, HighlightMode, TatFile};
 
 use crate::i18n::{text, Key, Language};
@@ -35,6 +33,8 @@ enum MenuCommand {
     OpenRecent(PathBuf),
     Refresh,
     SaveEditedCopy,
+    ToggleEncoding,
+    CopySelection,
     ShowAll,
     ShowOnlyFiltered,
     ToggleFilters,
@@ -54,7 +54,6 @@ pub struct LogdApp {
     tat_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     keyword: Entity<InputState>,
-    goto: Entity<InputState>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
     selected_filter: Option<usize>,
@@ -75,9 +74,6 @@ impl LogdApp {
         let keyword = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::SearchPlaceholder, language))
         });
-        let goto = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(text(Key::GotoPlaceholder, language))
-        });
         let filter_text = cx.new(|cx| InputState::new(window, cx));
         let filter_description = cx.new(|cx| InputState::new(window, cx));
 
@@ -90,12 +86,6 @@ impl LogdApp {
                 }
             },
         )
-        .detach();
-        cx.subscribe_in(&goto, window, |this, state, ev: &InputEvent, _, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) {
-                this.goto_line(&state.read(cx).value().to_string(), cx);
-            }
-        })
         .detach();
         cx.subscribe_in(
             &filter_text,
@@ -112,7 +102,8 @@ impl LogdApp {
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app, cx));
         let (dock_area, skin) = DockSkin::dock_area("logd.main", Some(1), window, cx);
-        skin.set_toggle_button_visible(true, cx);
+        // The View menu is the single visibility control; avoid a duplicate dock toggle button.
+        skin.set_toggle_button_visible(false, cx);
         dock_area.update(cx, |dock, cx| {
             dock.set_center(
                 DockLayout::tabs().panel_view(panel_handle(log_panel), cx),
@@ -137,7 +128,6 @@ impl LogdApp {
             tat_path: None,
             recent_files: Vec::new(),
             keyword,
-            goto,
             filter_text,
             filter_description,
             selected_filter: None,
@@ -407,15 +397,6 @@ impl LogdApp {
         self.filters_changed(cx);
     }
 
-    fn goto_line(&mut self, value: &str, cx: &mut Context<Self>) {
-        let Ok(line) = value.trim().replace(',', "").parse::<u64>() else {
-            return;
-        };
-        if let Some(view) = self.active_view().cloned() {
-            view.update(cx, |view, cx| view.goto_line(line.saturating_sub(1), cx));
-        }
-    }
-
     fn set_show_only(&mut self, only: bool, cx: &mut Context<Self>) {
         self.show_only_filtered = only;
         if let Some(view) = self.active_view().cloned() {
@@ -541,6 +522,12 @@ impl LogdApp {
                     view.update(cx, |view, cx| view.save_edited_copy(window, cx));
                 }
             }
+            MenuCommand::ToggleEncoding => self.toggle_encoding(cx),
+            MenuCommand::CopySelection => {
+                if let Some(view) = self.active_view().cloned() {
+                    view.update(cx, |view, cx| view.copy_selection(cx));
+                }
+            }
             MenuCommand::ShowAll => self.set_show_only(false, cx),
             MenuCommand::ShowOnlyFiltered => self.set_show_only(true, cx),
             MenuCommand::ToggleFilters => self.show_filter_panel(!self.filters_open, window, cx),
@@ -585,6 +572,7 @@ impl LogdApp {
         let filters_open = self.filters_open;
         let selected = self.selected_filter.is_some();
         let placement = self.filter_placement;
+        let has_view = self.active_view().is_some();
         let id = match command_group {
             Key::File => "menu-file",
             Key::View => "menu-view",
@@ -593,6 +581,7 @@ impl LogdApp {
         let button = Button::new(id)
             .xsmall()
             .ghost()
+            .text_color(theme::c(theme::FG))
             .label(text(command_group, lang))
             .on_mouse_down(
                 MouseButton::Left,
@@ -683,6 +672,26 @@ impl LogdApp {
                                         this.dispatch(MenuCommand::ToggleFilters, window, cx)
                                     },
                                 )),
+                        );
+                    let encoding_app = app.clone();
+                    let copy_app = app.clone();
+                    let menu = menu
+                        .item(
+                            PopupMenuItem::new(text(Key::Encoding, lang))
+                                .disabled(!has_view)
+                                .on_click(window.listener_for(
+                                    &encoding_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::ToggleEncoding, window, cx)
+                                    },
+                                )),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::Copy, lang))
+                                .disabled(!has_view)
+                                .on_click(window.listener_for(&copy_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::CopySelection, window, cx)
+                                })),
                         );
                     menu.submenu(
                         text(Key::Language, lang),
@@ -783,7 +792,14 @@ impl LogdApp {
             .items_center()
             .gap_1()
             .pl_2()
-            .child(div().font_weight(FontWeight::SEMIBOLD).px_1().child("logd"))
+            .child(
+                div()
+                    .id("title-app-drag")
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .px_1()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child("logd"),
+            )
             .child(self.menu_button(Key::File, window, cx))
             .child(self.menu_button(Key::View, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
@@ -794,7 +810,12 @@ impl LogdApp {
                 window.prevent_default();
                 cx.stop_propagation();
             })
-            .child(Input::new(&self.keyword).small())
+            .bg(theme::c(theme::GUTTER_BG))
+            .border_1()
+            .border_color(theme::c(theme::BORDER))
+            .rounded(px(4.))
+            .text_color(theme::c(theme::FG))
+            .child(Input::new(&self.keyword).small().appearance(false))
             .into_any_element();
         let right = self
             .active_view()
@@ -848,66 +869,6 @@ impl LogdApp {
             .into_any_element()
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let encoding = self
-            .active_view()
-            .map(|view| view.read(cx).doc().encoding().label())
-            .unwrap_or("-");
-        h_flex()
-            .w_full()
-            .h(px(32.))
-            .px_2()
-            .gap_2()
-            .items_center()
-            .bg(theme::c(theme::GUTTER_BG))
-            .border_b_1()
-            .border_color(theme::c(theme::BORDER))
-            .child(div().w(px(120.)).child(Input::new(&self.goto).small()))
-            .child(
-                Button::new("toggle-encoding")
-                    .xsmall()
-                    .label(encoding)
-                    .tooltip(text(Key::Encoding, self.language))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_encoding(cx))),
-            )
-            .child(
-                Button::new("copy-log-selection")
-                    .xsmall()
-                    .label(text(Key::Copy, self.language))
-                    .disabled(self.active_view().is_none())
-                    .tooltip(text(Key::Copy, self.language))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(view) = this.active_view().cloned() {
-                            view.update(cx, |view, cx| view.copy_selection(cx));
-                        }
-                    })),
-            )
-            .child(
-                Button::new("edit-log-line")
-                    .xsmall()
-                    .label(text(Key::EditLine, self.language))
-                    .disabled(self.active_view().is_none())
-                    .tooltip(text(Key::EditLine, self.language))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(view) = this.active_view().cloned() {
-                            view.update(cx, |view, cx| view.edit_selected(window, cx));
-                        }
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("toggle-filters")
-                    .xsmall()
-                    .label(text(Key::ShowFilters, self.language))
-                    .selected(self.filters_open)
-                    .tooltip(text(Key::FilterPanel, self.language))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.dispatch(MenuCommand::ToggleFilters, window, cx)
-                    })),
-            )
-            .into_any_element()
-    }
-
     pub fn render_workspace(&self, _cx: &App) -> AnyElement {
         self.active_view()
             .cloned()
@@ -948,9 +909,6 @@ impl LogdApp {
         };
 
         let add_app = app.clone();
-        let edit_app = app.clone();
-        let delete_app = app.clone();
-        let save_app = app.clone();
         let cancel_app = app.clone();
 
         v_flex()
@@ -974,33 +932,7 @@ impl LogdApp {
                                 this.begin_add_filter(window, cx)
                             })),
                     )
-                    .child(
-                        Button::new("filter-edit")
-                            .xsmall()
-                            .label(text(Key::EditFilter, lang))
-                            .disabled(selected.is_none())
-                            .on_click(window.listener_for(&edit_app, |this, _, window, cx| {
-                                this.begin_edit_filter(window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("filter-delete")
-                            .xsmall()
-                            .label(text(Key::DeleteFilter, lang))
-                            .disabled(selected.is_none())
-                            .on_click(window.listener_for(&delete_app, |this, _, _, cx| {
-                                this.delete_selected_filter(cx)
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("filter-save-file")
-                            .xsmall()
-                            .label(text(Key::SaveTat, lang))
-                            .on_click(
-                                window.listener_for(&save_app, |this, _, _, cx| this.save_tat(cx)),
-                            ),
-                    ),
+                    .child(div().flex_1()),
             )
             .when(editor_open, |column| {
                 column.child(
@@ -1047,7 +979,7 @@ impl LogdApp {
                     .flex_1()
                     .overflow_y_scrollbar()
                     .children(filters.iter().enumerate().map(|(index, filter)| {
-                        render_filter_row(app, filter, index, selected, window)
+                        render_filter_row(app, filter, index, selected, lang, window)
                     }))
                     .when(filters.is_empty(), |list| {
                         list.child(
@@ -1128,7 +1060,6 @@ impl Render for LogdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.render_title_bar(window, cx);
         let tabs = self.render_tabs(cx);
-        let toolbar = self.render_toolbar(cx);
         let status = self.render_status(cx);
         v_flex()
             .id("root")
@@ -1139,7 +1070,6 @@ impl Render for LogdApp {
             .on_key_down(cx.listener(Self::on_key))
             .child(title)
             .when(!self.tabs.is_empty(), |root| root.child(tabs))
-            .child(toolbar)
             .child(
                 div()
                     .flex_1()
@@ -1160,6 +1090,7 @@ fn render_filter_row(
     filter: &FilterSpec,
     index: usize,
     selected: Option<usize>,
+    lang: Language,
     window: &mut Window,
 ) -> AnyElement {
     let row_app = app.clone();
@@ -1171,6 +1102,7 @@ fn render_filter_row(
     let case_app = app.clone();
     let fg_app = app.clone();
     let bg_app = app.clone();
+    let context_app = app.clone();
     h_flex()
         .id(("filter-row", index))
         .min_h(px(28.))
@@ -1188,6 +1120,13 @@ fn render_filter_row(
             window.listener_for(&double_app, move |this, _, window, cx| {
                 this.selected_filter = Some(index);
                 this.begin_edit_filter(window, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            window.listener_for(&row_app, move |this, _, _, cx| {
+                this.selected_filter = Some(index);
+                cx.notify();
             }),
         )
         .child(
@@ -1272,6 +1211,25 @@ fn render_filter_row(
                 )
             },
         ))
+        .context_menu(move |menu, window, _| {
+            let edit_app = context_app.clone();
+            let delete_app = context_app.clone();
+            menu.item(PopupMenuItem::new(text(Key::EditFilter, lang)).on_click(
+                window.listener_for(&edit_app, move |this, _, window, cx| {
+                    this.selected_filter = Some(index);
+                    this.begin_edit_filter(window, cx);
+                }),
+            ))
+            .item(
+                PopupMenuItem::new(text(Key::DeleteFilter, lang)).on_click(window.listener_for(
+                    &delete_app,
+                    move |this, _, _, cx| {
+                        this.selected_filter = Some(index);
+                        this.delete_selected_filter(cx);
+                    },
+                )),
+            )
+        })
         .into_any_element()
 }
 
@@ -1307,6 +1265,8 @@ pub fn run(initial: Vec<PathBuf>) {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
+        // gpui-component defaults to Light; logd uses a dark client-side shell.
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         let initial = initial.clone();
         let options = crate::platform::window_options(cx);
         cx.spawn(async move |cx| {
