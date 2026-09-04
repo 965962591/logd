@@ -4,6 +4,10 @@ use gpui::{rgb, Rgba};
 
 pub const BG: u32 = 0x1e1e1e;
 pub const FG: u32 = 0xd4d4d4;
+pub const TITLE_BAR_BG: u32 = 0x181818;
+pub const CONTROL_HOVER: u32 = 0x2a2d2e;
+pub const DANGER: u32 = 0xc42b1c;
+pub const SELECTION: u32 = 0x264f78;
 /// 行号槽、状态栏次要文字
 pub const MUTED: u32 = 0x858585;
 /// 行号槽背景
@@ -16,6 +20,9 @@ pub const SCROLL_THUMB: u32 = 0x4e4e4e;
 pub const SCROLL_THUMB_HOVER: u32 = 0x6e6e6e;
 
 /// 等宽字体。Consolas 在 Windows 上必然存在。
+#[cfg(target_os = "macos")]
+pub const MONO: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
 pub const MONO: &str = "Consolas";
 pub const FONT_SIZE: f32 = 13.0;
 pub const LINE_HEIGHT: f32 = 18.0;
@@ -67,4 +74,3 @@ mod tests {
         assert_eq!(next_color(Some(0x123456)), None);
     }
 }
-

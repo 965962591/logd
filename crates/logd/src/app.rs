@@ -1,21 +1,27 @@
-//! 根视图：标签栏 + 工具栏 + 过滤器面板 + 日志视口 + 状态栏。
+//! Desktop shell and application command routing.
 //!
-//! 过滤器**全局共享**（AE 调试通常一套关键字看多个 log）。改动只对当前标签页立刻
-//! 重扫，其它标签页打个 dirty 标记，切过去时才扫——否则一改关键字就要同时扫 4 个
-//! 50GB 文件。
+//! Filters are shared across tabs. Only the active tab is rescanned
+//! immediately; inactive tabs are marked dirty until activated.
 
 use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement, DockSkin};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{h_flex, v_flex, Root, Sizable, TitleBar};
+use gpui_component::{
+    h_flex, v_flex, Disableable as _, InteractiveElementExt as _, Root, Selectable as _, Sizable,
+};
 use logd_core::{Encoding, FilterSpec, HighlightMode, TatFile};
 
+use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
 use crate::theme;
+use crate::ui::dock::{FilterPanel, LogPanel};
+use crate::ui::title_bar;
 
 struct Tab {
     view: Entity<LogView>,
@@ -23,127 +29,263 @@ struct Tab {
     path: PathBuf,
 }
 
+#[derive(Clone)]
+enum MenuCommand {
+    Open,
+    OpenRecent(PathBuf),
+    Refresh,
+    SaveEditedCopy,
+    ShowAll,
+    ShowOnlyFiltered,
+    ToggleFilters,
+    AddFilter,
+    EditFilter,
+    DeleteFilter,
+    SaveFilters,
+    ToggleLanguage,
+    DockFilters(DockPlacement),
+}
+
 pub struct LogdApp {
     tabs: Vec<Tab>,
     active: usize,
-    /// 全局共享的过滤器集合，对应一个 `.tat` 文件的内容
     filters: Vec<FilterSpec>,
     show_only_filtered: bool,
-    /// 上次加载/保存的 `.tat` 路径，Ctrl+S 写回这里
     tat_path: Option<PathBuf>,
+    recent_files: Vec<PathBuf>,
     keyword: Entity<InputState>,
     goto: Entity<InputState>,
-    panel_open: bool,
+    filter_text: Entity<InputState>,
+    filter_description: Entity<InputState>,
+    selected_filter: Option<usize>,
+    editing_filter: Option<usize>,
+    filter_editor_open: bool,
+    dock_area: Entity<DockArea>,
+    filter_panel: Entity<FilterPanel>,
+    filter_placement: DockPlacement,
+    filters_open: bool,
+    language: Language,
     status: Option<String>,
     focus: FocusHandle,
 }
 
 impl LogdApp {
     pub fn new(initial: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let keyword = cx.new(|cx| InputState::new(window, cx).placeholder("关键字，回车添加"));
-        let goto = cx.new(|cx| InputState::new(window, cx).placeholder("跳转行号"));
+        let language = Language::from_env();
+        let keyword = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::SearchPlaceholder, language))
+        });
+        let goto = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::GotoPlaceholder, language))
+        });
+        let filter_text = cx.new(|cx| InputState::new(window, cx));
+        let filter_description = cx.new(|cx| InputState::new(window, cx));
 
-        cx.subscribe_in(&keyword, window, |this, state, ev: &InputEvent, window, cx| {
+        cx.subscribe_in(
+            &keyword,
+            window,
+            |this, state, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.add_keyword(state.read(cx).value().to_string(), window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(&goto, window, |this, state, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) {
-                let text = state.read(cx).value().to_string();
-                this.add_keyword(text, window, cx);
+                this.goto_line(&state.read(cx).value().to_string(), cx);
             }
         })
         .detach();
-
-        cx.subscribe_in(&goto, window, |this, state, ev: &InputEvent, _window, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) {
-                let text = state.read(cx).value().to_string();
-                this.goto_line(&text, cx);
-            }
-        })
+        cx.subscribe_in(
+            &filter_text,
+            window,
+            |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.commit_filter(window, cx);
+                }
+            },
+        )
         .detach();
 
-        let mut app = Self {
+        let app = cx.weak_entity();
+        let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
+        let filter_panel = cx.new(|cx| FilterPanel::new(app, cx));
+        let (dock_area, skin) = DockSkin::dock_area("logd.main", Some(1), window, cx);
+        skin.set_toggle_button_visible(true, cx);
+        dock_area.update(cx, |dock, cx| {
+            dock.set_center(
+                DockLayout::tabs().panel_view(panel_handle(log_panel), cx),
+                window,
+                cx,
+            );
+            dock.set_dock(
+                DockPlacement::Right,
+                DockLayout::tabs().panel_view(panel_handle(filter_panel.clone()), cx),
+                window,
+                cx,
+            );
+            dock.set_dock_size(DockPlacement::Right, px(360.), window, cx);
+            dock.set_dock_collapsible(DockPlacement::Right, true, window, cx);
+        });
+
+        let mut this = Self {
             tabs: Vec::new(),
             active: 0,
             filters: Vec::new(),
             show_only_filtered: false,
             tat_path: None,
+            recent_files: Vec::new(),
             keyword,
             goto,
-            panel_open: true,
+            filter_text,
+            filter_description,
+            selected_filter: None,
+            editing_filter: None,
+            filter_editor_open: false,
+            dock_area,
+            filter_panel,
+            filter_placement: DockPlacement::Right,
+            filters_open: true,
+            language,
             status: None,
             focus: cx.focus_handle(),
         };
-        for p in initial {
-            app.open_path(&p, window, cx);
+        for path in initial {
+            this.open_path(&path, window, cx);
         }
-        app
+        this
     }
 
-    // ---- 打开 ----
+    pub fn language(&self) -> Language {
+        self.language
+    }
 
-    /// `.tat` 当配置加载，其它一律当日志开新标签页。
     pub fn open_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tat")) {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tat"))
+        {
             self.load_tat(path, cx);
         } else {
             self.open_log(path, window, cx);
         }
     }
 
+    fn remember_file(&mut self, path: &Path) {
+        self.recent_files.retain(|item| item != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(10);
+    }
+
     fn open_log(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        // 已经开过就直接切过去，别开重复标签
-        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
-            self.set_active(i, cx);
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.set_active(index, cx);
+            self.remember_file(path);
             return;
         }
         match LogView::load(path) {
             Ok(loaded) => {
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
-                if !self.filters.is_empty() {
-                    let filters = self.filters.clone();
-                    let only = self.show_only_filtered;
-                    view.update(cx, |v, cx| {
-                        v.apply_filters(filters, cx);
-                        v.set_show_only_filtered(only, cx);
-                    });
-                }
+                self.apply_current_filters(&view, cx);
                 self.tabs.push(Tab {
                     view,
                     title: path
                         .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
+                        .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string()),
                     path: path.to_path_buf(),
                 });
                 self.active = self.tabs.len() - 1;
+                self.remember_file(path);
                 self.status = None;
             }
-            Err(e) => self.status = Some(format!("打不开：{e:#}")),
+            Err(error) => {
+                self.status = Some(format!("{}: {error:#}", text(Key::Open, self.language)))
+            }
         }
         cx.notify();
     }
 
-    fn set_active(&mut self, i: usize, cx: &mut Context<Self>) {
-        if i >= self.tabs.len() {
+    fn apply_current_filters(&self, view: &Entity<LogView>, cx: &mut App) {
+        if self.filters.is_empty() {
             return;
         }
-        self.active = i;
-        // 切过来时才把攒下的过滤器改动兑现
         let filters = self.filters.clone();
         let only = self.show_only_filtered;
-        let view = self.tabs[i].view.clone();
+        view.update(cx, |view, cx| {
+            view.apply_filters(filters, cx);
+            view.set_show_only_filtered(only, cx);
+        });
+    }
+
+    fn prompt_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(text(Key::Open, self.language).into()),
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let Some(paths) = paths.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            _ = window.update(|window, cx| {
+                _ = this.update(cx, |this, cx| {
+                    for path in paths {
+                        this.open_path(&path, window, cx);
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let path = tab.path.clone();
+        match LogView::load(&path) {
+            Ok(loaded) => {
+                let view = cx.new(|cx| LogView::new(loaded, window, cx));
+                self.apply_current_filters(&view, cx);
+                self.tabs[self.active].view = view;
+                self.status = Some(format!(
+                    "{}: {}",
+                    text(Key::Refresh, self.language),
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.status = Some(format!("{}: {error:#}", text(Key::Refresh, self.language)))
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_active(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.active = index;
+        let filters = self.filters.clone();
+        let only = self.show_only_filtered;
+        let view = self.tabs[index].view.clone();
         if view.read(cx).is_dirty() {
-            view.update(cx, |v, cx| {
-                v.apply_filters(filters, cx);
-                v.set_show_only_filtered(only, cx);
+            view.update(cx, |view, cx| {
+                view.apply_filters(filters, cx);
+                view.set_show_only_filtered(only, cx);
             });
         }
         cx.notify();
     }
 
-    fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
-        if i >= self.tabs.len() {
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(i); // Entity 释放 → mmap 解除映射
+        self.tabs.remove(index);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
@@ -151,105 +293,179 @@ impl LogdApp {
     }
 
     fn active_view(&self) -> Option<&Entity<LogView>> {
-        self.tabs.get(self.active).map(|t| &t.view)
+        self.tabs.get(self.active).map(|tab| &tab.view)
     }
 
-    // ---- 过滤器 ----
-
-    /// 过滤器变了：当前标签页立刻重扫，其它的打标记。
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
         let filters = self.filters.clone();
         let only = self.show_only_filtered;
-        for (i, tab) in self.tabs.iter().enumerate() {
-            if i == self.active {
-                let f = filters.clone();
-                tab.view.update(cx, |v, cx| {
-                    v.apply_filters(f, cx);
-                    v.set_show_only_filtered(only, cx);
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if index == self.active {
+                let current = filters.clone();
+                tab.view.update(cx, |view, cx| {
+                    view.apply_filters(current, cx);
+                    view.set_show_only_filtered(only, cx);
                 });
             } else {
-                tab.view.update(cx, |v, _| v.mark_dirty());
+                tab.view.update(cx, |view, _| view.mark_dirty());
             }
         }
         cx.notify();
     }
 
-    fn add_keyword(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
+    fn add_keyword(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let value = value.trim().to_string();
+        if value.is_empty() {
             return;
         }
         self.filters.push(FilterSpec {
-            text,
-            // 新加的默认字段模式：AE 调试更常见的是「把关键词点亮」而不是整行刷底色
+            text: value,
             mode: HighlightMode::Field,
             fore: Some(theme::PALETTE[self.filters.len() % theme::PALETTE.len()]),
             ..Default::default()
         });
+        self.selected_filter = Some(self.filters.len() - 1);
         self.keyword
-            .update(cx, |s, cx| s.set_value("", window, cx));
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.filters_changed(cx);
     }
 
-    fn goto_line(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Ok(n) = text.trim().replace(',', "").parse::<u64>() else {
+    fn begin_add_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_editor_open = true;
+        self.editing_filter = None;
+        self.filter_text
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filter_description
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
+        self.show_filter_panel(true, window, cx);
+    }
+
+    fn begin_edit_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .selected_filter
+            .filter(|index| *index < self.filters.len())
+        else {
             return;
         };
-        if let Some(v) = self.active_view().cloned() {
-            // 用户输入是 1-based
-            v.update(cx, |v, cx| v.goto_line(n.saturating_sub(1), cx));
+        let filter = self.filters[index].clone();
+        self.filter_editor_open = true;
+        self.editing_filter = Some(index);
+        self.filter_text
+            .update(cx, |state, cx| state.set_value(filter.text, window, cx));
+        self.filter_description.update(cx, |state, cx| {
+            state.set_value(filter.description, window, cx)
+        });
+        window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
+    }
+
+    fn commit_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.filter_text.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        let description = self.filter_description.read(cx).value().trim().to_string();
+        match self.editing_filter {
+            Some(index) if index < self.filters.len() => {
+                self.filters[index].text = value;
+                self.filters[index].description = description;
+                self.selected_filter = Some(index);
+            }
+            _ => {
+                self.filters.push(FilterSpec {
+                    text: value,
+                    description,
+                    mode: HighlightMode::Field,
+                    fore: Some(theme::PALETTE[self.filters.len() % theme::PALETTE.len()]),
+                    ..Default::default()
+                });
+                self.selected_filter = Some(self.filters.len() - 1);
+            }
+        }
+        self.filter_editor_open = false;
+        self.editing_filter = None;
+        self.filter_text
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filter_description
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filters_changed(cx);
+    }
+
+    fn delete_selected_filter(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .selected_filter
+            .filter(|index| *index < self.filters.len())
+        else {
+            return;
+        };
+        self.filters.remove(index);
+        self.selected_filter = (index < self.filters.len())
+            .then_some(index)
+            .or_else(|| self.filters.len().checked_sub(1));
+        self.filter_editor_open = false;
+        self.editing_filter = None;
+        self.filters_changed(cx);
+    }
+
+    fn goto_line(&mut self, value: &str, cx: &mut Context<Self>) {
+        let Ok(line) = value.trim().replace(',', "").parse::<u64>() else {
+            return;
+        };
+        if let Some(view) = self.active_view().cloned() {
+            view.update(cx, |view, cx| view.goto_line(line.saturating_sub(1), cx));
         }
     }
 
-    fn toggle_show_only(&mut self, cx: &mut Context<Self>) {
-        self.show_only_filtered = !self.show_only_filtered;
-        let only = self.show_only_filtered;
-        if let Some(v) = self.active_view().cloned() {
-            v.update(cx, |v, cx| v.set_show_only_filtered(only, cx));
+    fn set_show_only(&mut self, only: bool, cx: &mut Context<Self>) {
+        self.show_only_filtered = only;
+        if let Some(view) = self.active_view().cloned() {
+            view.update(cx, |view, cx| view.set_show_only_filtered(only, cx));
         }
         cx.notify();
     }
 
     fn toggle_encoding(&mut self, cx: &mut Context<Self>) {
-        let Some(v) = self.active_view().cloned() else {
+        let Some(view) = self.active_view().cloned() else {
             return;
         };
-        let next = match v.read(cx).doc().encoding() {
+        let next = match view.read(cx).doc().encoding() {
             Encoding::Utf8 => Encoding::Gb18030,
             Encoding::Gb18030 => Encoding::Utf8,
         };
         let filters = self.filters.clone();
-        v.update(cx, |v, cx| v.set_encoding(next, filters, cx));
+        view.update(cx, |view, cx| view.set_encoding(next, filters, cx));
         cx.notify();
     }
 
-    // ---- .tat ----
-
     fn load_tat(&mut self, path: &Path, cx: &mut Context<Self>) {
         match TatFile::load(path) {
-            Ok(t) => {
-                self.filters = t.filters;
-                self.show_only_filtered = t.show_only_filtered;
+            Ok(tat) => {
+                self.filters = tat.filters;
+                self.show_only_filtered = tat.show_only_filtered;
                 self.tat_path = Some(path.to_path_buf());
-                self.status = Some(format!("已加载 {} 条过滤器", self.filters.len()));
+                self.selected_filter = (!self.filters.is_empty()).then_some(0);
+                self.status = Some(format!(
+                    "{}: {}",
+                    text(Key::Filters, self.language),
+                    self.filters.len()
+                ));
                 self.filters_changed(cx);
             }
-            Err(e) => {
-                self.status = Some(format!("读 .tat 失败：{e:#}"));
+            Err(error) => {
+                self.status = Some(format!(".tat: {error:#}"));
                 cx.notify();
             }
         }
     }
 
     fn save_tat(&mut self, cx: &mut Context<Self>) {
-        // 没来源就存到当前日志旁边
         let path = self.tat_path.clone().or_else(|| {
             self.tabs
                 .get(self.active)
-                .map(|t| t.path.with_extension("tat"))
+                .map(|tab| tab.path.with_extension("tat"))
         });
         let Some(path) = path else {
-            self.status = Some("没有可保存的位置".into());
+            self.status = Some(text(Key::Ready, self.language).to_string());
             cx.notify();
             return;
         };
@@ -261,32 +477,343 @@ impl LogdApp {
         self.status = Some(match file.save(&path) {
             Ok(()) => {
                 self.tat_path = Some(path.clone());
-                format!("已保存 {}", path.display())
+                format!(
+                    "{}: {}",
+                    text(Key::SaveFilter, self.language),
+                    path.display()
+                )
             }
-            Err(e) => format!("保存失败：{e:#}"),
+            Err(error) => format!("{}: {error:#}", text(Key::SaveFilter, self.language)),
         });
         cx.notify();
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        if !ks.modifiers.control {
+    fn show_filter_panel(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filters_open != show {
+            self.dock_area.update(cx, |dock, cx| {
+                dock.toggle_dock(self.filter_placement, window, cx)
+            });
+            self.filters_open = show;
+        }
+        cx.notify();
+    }
+
+    fn move_filter_panel(
+        &mut self,
+        placement: DockPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if placement == self.filter_placement {
+            self.show_filter_panel(true, window, cx);
             return;
         }
-        match ks.key.as_str() {
-            "s" => self.save_tat(cx),
-            "tab" => {
-                if !self.tabs.is_empty() {
-                    let next = (self.active + 1) % self.tabs.len();
-                    self.set_active(next, cx);
+        let old = self.filter_placement;
+        let panel = self.filter_panel.clone();
+        self.dock_area.update(cx, |dock, cx| {
+            dock.remove_dock(old, window, cx);
+            dock.set_dock(
+                placement,
+                DockLayout::tabs().panel_view(panel_handle(panel), cx),
+                window,
+                cx,
+            );
+            let size = if placement == DockPlacement::Bottom {
+                px(240.)
+            } else {
+                px(360.)
+            };
+            dock.set_dock_size(placement, size, window, cx);
+            dock.set_dock_collapsible(placement, true, window, cx);
+        });
+        self.filter_placement = placement;
+        self.filters_open = true;
+        cx.notify();
+    }
+
+    fn dispatch(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            MenuCommand::Open => self.prompt_open(window, cx),
+            MenuCommand::OpenRecent(path) => self.open_path(&path, window, cx),
+            MenuCommand::Refresh => self.refresh_active(window, cx),
+            MenuCommand::SaveEditedCopy => {
+                if let Some(view) = self.active_view().cloned() {
+                    view.update(cx, |view, cx| view.save_edited_copy(window, cx));
                 }
+            }
+            MenuCommand::ShowAll => self.set_show_only(false, cx),
+            MenuCommand::ShowOnlyFiltered => self.set_show_only(true, cx),
+            MenuCommand::ToggleFilters => self.show_filter_panel(!self.filters_open, window, cx),
+            MenuCommand::AddFilter => self.begin_add_filter(window, cx),
+            MenuCommand::EditFilter => self.begin_edit_filter(window, cx),
+            MenuCommand::DeleteFilter => self.delete_selected_filter(cx),
+            MenuCommand::SaveFilters => self.save_tat(cx),
+            MenuCommand::ToggleLanguage => {
+                self.language = self.language.toggle();
+                cx.notify();
+            }
+            MenuCommand::DockFilters(placement) => self.move_filter_panel(placement, window, cx),
+        }
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::platform::primary_modifier(&event.keystroke.modifiers) {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "o" => self.dispatch(MenuCommand::Open, window, cx),
+            "r" => self.dispatch(MenuCommand::Refresh, window, cx),
+            "s" => self.dispatch(MenuCommand::SaveFilters, window, cx),
+            "tab" if !self.tabs.is_empty() => {
+                self.set_active((self.active + 1) % self.tabs.len(), cx)
             }
             "w" => self.close_tab(self.active, cx),
             _ => {}
         }
     }
 
-    // ---- 渲染 ----
+    fn menu_button(
+        &self,
+        command_group: Key,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app = cx.entity();
+        let lang = self.language;
+        let recent = self.recent_files.clone();
+        let only = self.show_only_filtered;
+        let filters_open = self.filters_open;
+        let selected = self.selected_filter.is_some();
+        let placement = self.filter_placement;
+        let id = match command_group {
+            Key::File => "menu-file",
+            Key::View => "menu-view",
+            _ => "menu-filters",
+        };
+        let button = Button::new(id)
+            .xsmall()
+            .ghost()
+            .label(text(command_group, lang))
+            .on_mouse_down(
+                MouseButton::Left,
+                |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation(),
+            );
+
+        match command_group {
+            Key::File => button
+                .dropdown_menu(move |menu, window, cx| {
+                    let open_app = app.clone();
+                    let refresh_app = app.clone();
+                    let save_copy_app = app.clone();
+                    let menu = menu
+                        .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
+                            window.listener_for(&open_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::Open, window, cx)
+                            }),
+                        ))
+                        .item(PopupMenuItem::new(text(Key::Refresh, lang)).on_click(
+                            window.listener_for(&refresh_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::Refresh, window, cx)
+                            }),
+                        ))
+                        .item(
+                            PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
+                                window.listener_for(&save_copy_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
+                                }),
+                            ),
+                        );
+                    let submenu_recent = recent.clone();
+                    let submenu_app = app.clone();
+                    menu.submenu(
+                        text(Key::RecentFiles, lang),
+                        window,
+                        cx,
+                        move |menu, window, _| {
+                            if submenu_recent.is_empty() {
+                                return menu.item(
+                                    PopupMenuItem::new(text(Key::NoRecentFiles, lang))
+                                        .disabled(true),
+                                );
+                            }
+                            submenu_recent.iter().fold(menu, |menu, path| {
+                                let target = path.clone();
+                                let target_app = submenu_app.clone();
+                                menu.item(PopupMenuItem::new(path.display().to_string()).on_click(
+                                    window.listener_for(&target_app, move |this, _, window, cx| {
+                                        this.dispatch(
+                                            MenuCommand::OpenRecent(target.clone()),
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                ))
+                            })
+                        },
+                    )
+                })
+                .into_any_element(),
+            Key::View => button
+                .dropdown_menu(move |menu, window, cx| {
+                    let all_app = app.clone();
+                    let only_app = app.clone();
+                    let panel_app = app.clone();
+                    let language_app = app.clone();
+                    let menu = menu
+                        .item(
+                            PopupMenuItem::new(text(Key::ShowAll, lang))
+                                .checked(!only)
+                                .on_click(window.listener_for(&all_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::ShowAll, window, cx)
+                                })),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::ShowOnlyFiltered, lang))
+                                .checked(only)
+                                .on_click(window.listener_for(&only_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::ShowOnlyFiltered, window, cx)
+                                })),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::ShowFilters, lang))
+                                .checked(filters_open)
+                                .on_click(window.listener_for(
+                                    &panel_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::ToggleFilters, window, cx)
+                                    },
+                                )),
+                        );
+                    menu.submenu(
+                        text(Key::Language, lang),
+                        window,
+                        cx,
+                        move |menu, window, _| {
+                            menu.item(
+                                PopupMenuItem::new(match lang {
+                                    Language::ZhCn => text(Key::English, lang),
+                                    Language::EnUs => text(Key::Chinese, lang),
+                                })
+                                .on_click(window.listener_for(
+                                    &language_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::ToggleLanguage, window, cx)
+                                    },
+                                )),
+                            )
+                        },
+                    )
+                })
+                .into_any_element(),
+            _ => button
+                .dropdown_menu(move |menu, window, _| {
+                    let add_app = app.clone();
+                    let edit_app = app.clone();
+                    let delete_app = app.clone();
+                    let save_app = app.clone();
+                    let left_app = app.clone();
+                    let right_app = app.clone();
+                    let bottom_app = app.clone();
+                    menu.item(PopupMenuItem::new(text(Key::AddFilter, lang)).on_click(
+                        window.listener_for(&add_app, |this, _, window, cx| {
+                            this.dispatch(MenuCommand::AddFilter, window, cx)
+                        }),
+                    ))
+                    .item(
+                        PopupMenuItem::new(text(Key::EditFilter, lang))
+                            .disabled(!selected)
+                            .on_click(window.listener_for(&edit_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::EditFilter, window, cx)
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new(text(Key::DeleteFilter, lang))
+                            .disabled(!selected)
+                            .on_click(window.listener_for(&delete_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::DeleteFilter, window, cx)
+                            })),
+                    )
+                    .item(PopupMenuItem::new(text(Key::SaveFilter, lang)).on_click(
+                        window.listener_for(&save_app, |this, _, window, cx| {
+                            this.dispatch(MenuCommand::SaveFilters, window, cx)
+                        }),
+                    ))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(text(Key::DockLeft, lang))
+                            .checked(placement == DockPlacement::Left)
+                            .on_click(window.listener_for(&left_app, |this, _, window, cx| {
+                                this.dispatch(
+                                    MenuCommand::DockFilters(DockPlacement::Left),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new(text(Key::DockRight, lang))
+                            .checked(placement == DockPlacement::Right)
+                            .on_click(window.listener_for(&right_app, |this, _, window, cx| {
+                                this.dispatch(
+                                    MenuCommand::DockFilters(DockPlacement::Right),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new(text(Key::DockBottom, lang))
+                            .checked(placement == DockPlacement::Bottom)
+                            .on_click(window.listener_for(&bottom_app, |this, _, window, cx| {
+                                this.dispatch(
+                                    MenuCommand::DockFilters(DockPlacement::Bottom),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                })
+                .into_any_element(),
+        }
+    }
+
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let left = h_flex()
+            .h_full()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .child(div().font_weight(FontWeight::SEMIBOLD).px_1().child("logd"))
+            .child(self.menu_button(Key::File, window, cx))
+            .child(self.menu_button(Key::View, window, cx))
+            .child(self.menu_button(Key::Filters, window, cx))
+            .into_any_element();
+        let center = div()
+            .w_full()
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .child(Input::new(&self.keyword).small())
+            .into_any_element();
+        let right = self
+            .active_view()
+            .map(|view| view.read(cx).doc().encoding().label().to_string())
+            .unwrap_or_default();
+        title_bar::render(
+            left,
+            center,
+            div()
+                .pr_2()
+                .text_size(px(11.))
+                .text_color(theme::c(theme::MUTED))
+                .child(right)
+                .into_any_element(),
+            window,
+            self.language,
+        )
+        .into_any_element()
+    }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
@@ -296,10 +823,10 @@ impl LogdApp {
             .border_b_1()
             .border_color(theme::c(theme::BORDER))
             .text_size(px(12.))
-            .children(self.tabs.iter().enumerate().map(|(i, t)| {
-                let active = i == self.active;
+            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                let active = index == self.active;
                 h_flex()
-                    .id(("tab", i))
+                    .id(("tab", index))
                     .h_full()
                     .px_3()
                     .gap_2()
@@ -308,236 +835,229 @@ impl LogdApp {
                     .border_color(theme::c(theme::BORDER))
                     .bg(theme::c(if active { theme::BG } else { theme::GUTTER_BG }))
                     .text_color(theme::c(if active { theme::FG } else { theme::MUTED }))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                        this.set_active(i, cx)
-                    }))
-                    .child(t.title.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_active(index, cx)))
+                    .child(tab.title.clone())
                     .child(
                         div()
-                            .id(("close", i))
+                            .id(("close", index))
                             .px_1()
-                            .text_color(theme::c(theme::MUTED))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.close_tab(i, cx)
-                            })),
+                            .child("x")
+                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(index, cx))),
                     )
             }))
             .into_any_element()
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let enc = self
+        let encoding = self
             .active_view()
-            .map(|v| v.read(cx).doc().encoding().label())
-            .unwrap_or("—");
-
+            .map(|view| view.read(cx).doc().encoding().label())
+            .unwrap_or("-");
         h_flex()
             .w_full()
-            .h(px(34.))
+            .h(px(32.))
             .px_2()
             .gap_2()
             .items_center()
             .bg(theme::c(theme::GUTTER_BG))
             .border_b_1()
             .border_color(theme::c(theme::BORDER))
-            .text_size(px(12.))
-            .child(div().w(px(220.)).child(Input::new(&self.keyword).small()))
-            .child(div().w(px(110.)).child(Input::new(&self.goto).small()))
+            .child(div().w(px(120.)).child(Input::new(&self.goto).small()))
             .child(
-                self.toggle_chip(
-                    "only-filtered",
-                    "仅显示筛选",
-                    self.show_only_filtered,
-                    cx.listener(|this, _: &ClickEvent, _w, cx| this.toggle_show_only(cx)),
-                ),
+                Button::new("toggle-encoding")
+                    .xsmall()
+                    .label(encoding)
+                    .tooltip(text(Key::Encoding, self.language))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_encoding(cx))),
             )
             .child(
-                self.toggle_chip(
-                    "panel",
-                    "过滤器面板",
-                    self.panel_open,
-                    cx.listener(|this, _: &ClickEvent, _w, cx| {
-                        this.panel_open = !this.panel_open;
-                        cx.notify();
-                    }),
-                ),
+                Button::new("copy-log-selection")
+                    .xsmall()
+                    .label(text(Key::Copy, self.language))
+                    .disabled(self.active_view().is_none())
+                    .tooltip(text(Key::Copy, self.language))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(view) = this.active_view().cloned() {
+                            view.update(cx, |view, cx| view.copy_selection(cx));
+                        }
+                    })),
             )
             .child(
-                self.toggle_chip(
-                    "encoding",
-                    enc,
-                    false,
-                    cx.listener(|this, _: &ClickEvent, _w, cx| this.toggle_encoding(cx)),
-                ),
+                Button::new("edit-log-line")
+                    .xsmall()
+                    .label(text(Key::EditLine, self.language))
+                    .disabled(self.active_view().is_none())
+                    .tooltip(text(Key::EditLine, self.language))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(view) = this.active_view().cloned() {
+                            view.update(cx, |view, cx| view.edit_selected(window, cx));
+                        }
+                    })),
             )
+            .child(div().flex_1())
             .child(
-                Button::new("save-tat")
-                    .small()
-                    .label("保存 .tat")
-                    .on_click(cx.listener(|this, _, _w, cx| this.save_tat(cx))),
+                Button::new("toggle-filters")
+                    .xsmall()
+                    .label(text(Key::ShowFilters, self.language))
+                    .selected(self.filters_open)
+                    .tooltip(text(Key::FilterPanel, self.language))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch(MenuCommand::ToggleFilters, window, cx)
+                    })),
             )
             .into_any_element()
     }
 
-    /// 一个小方块开关。用裸 div 而不是 Checkbox，样式更贴近这个工具的密度。
-    fn toggle_chip(
-        &self,
-        id: &'static str,
-        label: impl Into<SharedString>,
-        on: bool,
-        click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        h_flex()
-            .id(id)
-            .px_2()
-            .h(px(22.))
-            .items_center()
-            .rounded_sm()
-            .border_1()
-            .border_color(theme::c(theme::BORDER))
-            .bg(theme::c(if on { theme::STATUS_BG } else { theme::BG }))
-            .text_color(theme::c(if on { theme::STATUS_FG } else { theme::FG }))
-            .child(label.into())
-            .on_click(click)
-            .into_any_element()
-    }
-
-    /// 颜色小方块。`None` 时画成暗灰的空位，点一下换 [`theme::next_color`] 的下一个。
-    fn swatch(
-        &self,
-        id: (&'static str, usize),
-        glyph: &'static str,
-        color: Option<u32>,
-        click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        div()
-            .id(id)
-            .w(px(18.))
-            .text_color(theme::c(color.unwrap_or(theme::BORDER)))
-            .child(glyph)
-            .on_click(click)
-            .into_any_element()
-    }
-
-    fn render_filter_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .w_full()
-            .max_h(px(200.))
-            .overflow_y_scrollbar()
-            .id("filter-panel")
-            .bg(theme::c(theme::BG))
-            .border_b_1()
-            .border_color(theme::c(theme::BORDER))
-            .text_size(px(12.))
-            .children(self.filters.iter().enumerate().map(|(i, f)| {
-                h_flex()
-                    .w_full()
-                    .h(px(24.))
-                    .px_2()
-                    .gap_2()
+    pub fn render_workspace(&self, _cx: &App) -> AnyElement {
+        self.active_view()
+            .cloned()
+            .map(IntoElement::into_any_element)
+            .unwrap_or_else(|| {
+                v_flex()
+                    .size_full()
                     .items_center()
-                    // 启用
+                    .justify_center()
+                    .gap_2()
+                    .bg(theme::c(theme::BG))
+                    .text_color(theme::c(theme::FG))
+                    .child("logd")
                     .child(
                         div()
-                            .id(("en", i))
-                            .w(px(18.))
-                            .child(if f.enabled { "☑" } else { "☐" })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.filters[i].enabled = !this.filters[i].enabled;
-                                this.filters_changed(cx);
-                            })),
-                    )
-                    // 排除
-                    .child(
-                        div()
-                            .id(("ex", i))
-                            .w(px(28.))
-                            .text_color(theme::c(if f.excluding { 0xf48771 } else { theme::MUTED }))
-                            .child(if f.excluding { "排除" } else { "包含" })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.filters[i].excluding = !this.filters[i].excluding;
-                                this.filters_changed(cx);
-                            })),
-                    )
-                    // 高亮模式：每条过滤器独立
-                    .child(
-                        div()
-                            .id(("mode", i))
-                            .w(px(34.))
                             .text_color(theme::c(theme::MUTED))
-                            .child(match f.mode {
-                                HighlightMode::Field => "字段",
-                                HighlightMode::Line => "整行",
-                            })
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.filters[i].mode = match this.filters[i].mode {
-                                    HighlightMode::Field => HighlightMode::Line,
-                                    HighlightMode::Line => HighlightMode::Field,
-                                };
-                                this.filters_changed(cx);
+                            .child(text(Key::Open, self.language)),
+                    )
+                    .into_any_element()
+            })
+    }
+
+    pub fn render_filters(
+        app: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<FilterPanel>,
+    ) -> AnyElement {
+        let (filters, selected, editor_open, editor_text, editor_description, lang) = {
+            let state = app.read(cx);
+            (
+                state.filters.clone(),
+                state.selected_filter,
+                state.filter_editor_open,
+                state.filter_text.clone(),
+                state.filter_description.clone(),
+                state.language,
+            )
+        };
+
+        let add_app = app.clone();
+        let edit_app = app.clone();
+        let delete_app = app.clone();
+        let save_app = app.clone();
+        let cancel_app = app.clone();
+
+        v_flex()
+            .size_full()
+            .bg(theme::c(theme::BG))
+            .text_color(theme::c(theme::FG))
+            .text_size(px(12.))
+            .child(
+                h_flex()
+                    .h(px(32.))
+                    .px_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme::c(theme::BORDER))
+                    .child(
+                        Button::new("filter-add")
+                            .xsmall()
+                            .label("+")
+                            .tooltip(text(Key::AddFilter, lang))
+                            .on_click(window.listener_for(&add_app, |this, _, window, cx| {
+                                this.begin_add_filter(window, cx)
                             })),
                     )
-                    // 正则
                     .child(
-                        div()
-                            .id(("re", i))
-                            .w(px(28.))
-                            .text_color(theme::c(if f.regex { theme::FG } else { theme::MUTED }))
-                            .child(".*")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.filters[i].regex = !this.filters[i].regex;
-                                this.filters_changed(cx);
+                        Button::new("filter-edit")
+                            .xsmall()
+                            .label(text(Key::EditFilter, lang))
+                            .disabled(selected.is_none())
+                            .on_click(window.listener_for(&edit_app, |this, _, window, cx| {
+                                this.begin_edit_filter(window, cx)
                             })),
                     )
-                    // 前景色 / 背景色，点一下换下一个
-                    .child(self.swatch(("fg", i), "A", f.fore, cx.listener(
-                        move |this, _: &ClickEvent, _w, cx| {
-                            this.filters[i].fore = theme::next_color(this.filters[i].fore);
-                            this.filters_changed(cx);
-                        },
-                    )))
-                    .child(self.swatch(("bg", i), "■", f.back, cx.listener(
-                        move |this, _: &ClickEvent, _w, cx| {
-                            this.filters[i].back = theme::next_color(this.filters[i].back);
-                            this.filters_changed(cx);
-                        },
-                    )))
-                    // 关键字本体 + 描述
                     .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .when_some(f.fore, |el, c| el.text_color(theme::c(c)))
-                            .child(f.text.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(160.))
-                            .overflow_hidden()
-                            .text_color(theme::c(theme::MUTED))
-                            .child(f.description.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(("del", i))
-                            .px_1()
-                            .text_color(theme::c(theme::MUTED))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                                this.filters.remove(i);
-                                this.filters_changed(cx);
+                        Button::new("filter-delete")
+                            .xsmall()
+                            .label(text(Key::DeleteFilter, lang))
+                            .disabled(selected.is_none())
+                            .on_click(window.listener_for(&delete_app, |this, _, _, cx| {
+                                this.delete_selected_filter(cx)
                             })),
                     )
-            }))
-            .when(self.filters.is_empty(), |el| {
-                el.child(
-                    div()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("filter-save-file")
+                            .xsmall()
+                            .label(text(Key::SaveTat, lang))
+                            .on_click(
+                                window.listener_for(&save_app, |this, _, _, cx| this.save_tat(cx)),
+                            ),
+                    ),
+            )
+            .when(editor_open, |column| {
+                column.child(
+                    v_flex()
                         .p_2()
-                        .text_color(theme::c(theme::MUTED))
-                        .child("还没有过滤器。上面输入关键字回车添加，或把 .tat 文件拖进来。"),
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme::c(theme::BORDER))
+                        .child(Input::new(&editor_text).small())
+                        .child(Input::new(&editor_description).small())
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("filter-editor-cancel")
+                                        .xsmall()
+                                        .label(text(Key::Cancel, lang))
+                                        .on_click(window.listener_for(
+                                            &cancel_app,
+                                            |this, _, _, cx| {
+                                                this.filter_editor_open = false;
+                                                this.editing_filter = None;
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Button::new("filter-editor-save")
+                                        .xsmall()
+                                        .label(text(Key::SaveFilter, lang))
+                                        .on_click(
+                                            window.listener_for(app, |this, _, window, cx| {
+                                                this.commit_filter(window, cx)
+                                            }),
+                                        ),
+                                ),
+                        ),
                 )
             })
+            .child(
+                v_flex()
+                    .id("filter-list")
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .children(filters.iter().enumerate().map(|(index, filter)| {
+                        render_filter_row(app, filter, index, selected, window)
+                    }))
+                    .when(filters.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .p_3()
+                                .text_color(theme::c(theme::MUTED))
+                                .child(text(Key::NoFilters, lang)),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -550,78 +1070,66 @@ impl LogdApp {
             .bg(theme::c(theme::STATUS_BG))
             .text_color(theme::c(theme::STATUS_FG))
             .text_size(px(11.));
-
-        if let Some(v) = self.active_view() {
-            let v = v.read(cx);
-            let doc = v.doc();
-            let total = doc.total_file_lines();
+        if let Some(view) = self.active_view() {
+            let view = view.read(cx);
+            let doc = view.doc();
+            let suffix = if doc.index_complete() { "" } else { "+" };
             bar = bar
-                .child(if doc.index_complete() {
-                    format!("{} 行", group(total))
-                } else {
-                    // 索引还在跑，行数会继续涨
-                    format!("{}+ 行", group(total))
-                })
                 .child(format!(
-                    "第 {} 行",
-                    group(doc.top_file_line().map(|l| l + 1).unwrap_or(0))
+                    "{}{} {}",
+                    group(doc.total_file_lines()),
+                    suffix,
+                    text(Key::Lines, self.language)
+                ))
+                .child(format!(
+                    "{} {}",
+                    text(Key::Line, self.language),
+                    group(doc.top_file_line().map(|line| line + 1).unwrap_or(0))
                 ))
                 .child(doc.encoding().label().to_string());
-
-            if let Some(n) = doc.match_count() {
-                bar = bar.child(format!("命中 {}", group(n as u64)));
+            if let Some(count) = doc.match_count() {
+                bar = bar.child(format!(
+                    "{} {}",
+                    text(Key::Matches, self.language),
+                    group(count as u64)
+                ));
             }
-            if let Some(p) = v.indexing_progress() {
-                bar = bar.child(format!("建索引 {:.0}%", p * 100.0));
+            if let Some(progress) = view.indexing_progress() {
+                bar = bar.child(format!(
+                    "{} {:.0}%",
+                    text(Key::Indexing, self.language),
+                    progress * 100.
+                ));
             }
-            if let Some(p) = v.scanning_progress() {
-                bar = bar.child(format!("筛选中 {:.0}%", p * 100.0));
+            if let Some(progress) = view.scanning_progress() {
+                bar = bar.child(format!(
+                    "{} {:.0}%",
+                    text(Key::Filtering, self.language),
+                    progress * 100.
+                ));
             }
-            if v.from_cache() {
-                bar = bar.child("索引缓存命中".to_string());
+            if view.from_cache() {
+                bar = bar.child(text(Key::Cache, self.language));
             }
-            if let Some(e) = v.error() {
-                bar = bar.child(e.to_string());
+            if let Some(error) = view.error() {
+                bar = bar.child(error.to_string());
             }
         } else {
-            bar = bar.child("就绪".to_string());
+            bar = bar.child(text(Key::Ready, self.language));
         }
-
-        if let Some(s) = &self.status {
-            bar = bar.child(s.clone());
+        if let Some(status) = &self.status {
+            bar = bar.child(status.clone());
         }
         bar.into_any_element()
-    }
-
-    fn empty_state(&self) -> AnyElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .bg(theme::c(theme::BG))
-            .text_color(theme::c(theme::FG))
-            .child("logd")
-            .child(
-                div()
-                    .text_color(theme::c(theme::MUTED))
-                    .child("把日志文件拖进来；拖 .tat 文件可加载关键字配置"),
-            )
-            .into_any_element()
     }
 }
 
 impl Render for LogdApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body: AnyElement = match self.active_view() {
-            Some(v) => v.clone().into_any_element(),
-            None => self.empty_state(),
-        };
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.render_title_bar(window, cx);
         let tabs = self.render_tabs(cx);
         let toolbar = self.render_toolbar(cx);
-        let panel = self.panel_open.then(|| self.render_filter_panel(cx));
         let status = self.render_status(cx);
-
         v_flex()
             .id("root")
             .key_context("Logd")
@@ -629,47 +1137,184 @@ impl Render for LogdApp {
             .size_full()
             .bg(theme::c(theme::BG))
             .on_key_down(cx.listener(Self::on_key))
-            .child(TitleBar::new().child(h_flex().w_full().pr_2().child("logd")))
-            .when(!self.tabs.is_empty(), |el| el.child(tabs))
+            .child(title)
+            .when(!self.tabs.is_empty(), |root| root.child(tabs))
             .child(toolbar)
-            .when_some(panel, |el, p| el.child(p))
-            .child(div().flex_1().overflow_hidden().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(self.dock_area.clone()),
+            )
             .child(status)
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                for p in paths.paths() {
-                    this.open_path(p, window, cx);
+                for path in paths.paths() {
+                    this.open_path(path, window, cx);
                 }
             }))
     }
 }
 
-/// 千分位分隔。5 亿行的数字不加分隔没法读。
-fn group(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
+fn render_filter_row(
+    app: &Entity<LogdApp>,
+    filter: &FilterSpec,
+    index: usize,
+    selected: Option<usize>,
+    window: &mut Window,
+) -> AnyElement {
+    let row_app = app.clone();
+    let double_app = app.clone();
+    let enable_app = app.clone();
+    let exclude_app = app.clone();
+    let mode_app = app.clone();
+    let regex_app = app.clone();
+    let case_app = app.clone();
+    let fg_app = app.clone();
+    let bg_app = app.clone();
+    h_flex()
+        .id(("filter-row", index))
+        .min_h(px(28.))
+        .px_2()
+        .gap_2()
+        .items_center()
+        .when(selected == Some(index), |row| {
+            row.bg(theme::c(theme::SELECTION))
+        })
+        .on_click(window.listener_for(&row_app, move |this, _, _, cx| {
+            this.selected_filter = Some(index);
+            cx.notify();
+        }))
+        .on_double_click(
+            window.listener_for(&double_app, move |this, _, window, cx| {
+                this.selected_filter = Some(index);
+                this.begin_edit_filter(window, cx);
+            }),
+        )
+        .child(
+            Button::new(("filter-enabled", index))
+                .xsmall()
+                .label(if filter.enabled { "[x]" } else { "[ ]" })
+                .on_click(window.listener_for(&enable_app, move |this, _, _, cx| {
+                    this.filters[index].enabled = !this.filters[index].enabled;
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(
+            Button::new(("filter-exclude", index))
+                .xsmall()
+                .label(if filter.excluding { "-" } else { "+" })
+                .on_click(window.listener_for(&exclude_app, move |this, _, _, cx| {
+                    this.filters[index].excluding = !this.filters[index].excluding;
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(
+            Button::new(("filter-mode", index))
+                .xsmall()
+                .label(match filter.mode {
+                    HighlightMode::Field => "Aa",
+                    HighlightMode::Line => "Ln",
+                })
+                .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
+                    this.filters[index].mode = match this.filters[index].mode {
+                        HighlightMode::Field => HighlightMode::Line,
+                        HighlightMode::Line => HighlightMode::Field,
+                    };
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(
+            Button::new(("filter-regex", index))
+                .xsmall()
+                .label(".*")
+                .selected(filter.regex)
+                .on_click(window.listener_for(&regex_app, move |this, _, _, cx| {
+                    this.filters[index].regex = !this.filters[index].regex;
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(
+            Button::new(("filter-case", index))
+                .xsmall()
+                .label("Aa")
+                .selected(filter.case_sensitive)
+                .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
+                    this.filters[index].case_sensitive = !this.filters[index].case_sensitive;
+                    this.filters_changed(cx);
+                })),
+        )
+        .child(swatch(
+            ("filter-fg", index),
+            "A",
+            filter.fore,
+            window.listener_for(&fg_app, move |this, _, _, cx| {
+                this.filters[index].fore = theme::next_color(this.filters[index].fore);
+                this.filters_changed(cx);
+            }),
+        ))
+        .child(swatch(
+            ("filter-bg", index),
+            "#",
+            filter.back,
+            window.listener_for(&bg_app, move |this, _, _, cx| {
+                this.filters[index].back = theme::next_color(this.filters[index].back);
+                this.filters_changed(cx);
+            }),
+        ))
+        .child(v_flex().min_w_0().flex_1().child(filter.text.clone()).when(
+            !filter.description.is_empty(),
+            |item| {
+                item.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(theme::c(theme::MUTED))
+                        .child(filter.description.clone()),
+                )
+            },
+        ))
+        .into_any_element()
+}
+
+fn swatch(
+    id: (&'static str, usize),
+    glyph: &'static str,
+    color: Option<u32>,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex_none()
+        .w(px(18.))
+        .text_color(theme::c(color.unwrap_or(theme::BORDER)))
+        .child(glyph)
+        .on_click(click)
+        .into_any_element()
+}
+
+fn group(number: u64) -> String {
+    let source = number.to_string();
+    let mut output = String::with_capacity(source.len() + source.len() / 3);
+    for (index, ch) in source.chars().enumerate() {
+        if index > 0 && (source.len() - index) % 3 == 0 {
+            output.push(',');
         }
-        out.push(ch);
+        output.push(ch);
     }
-    out
+    output
 }
 
 pub fn run(initial: Vec<PathBuf>) {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
-
     app.run(move |cx| {
         gpui_component::init(cx);
-
         let initial = initial.clone();
+        let options = crate::platform::window_options(cx);
         cx.spawn(async move |cx| {
-            cx.open_window(TitleBar::window_options(), |window, cx| {
+            cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| LogdApp::new(initial, window, cx));
-                // 窗口第一层必须是 Root
-                cx.new(|cx| Root::new(view, window, cx))
+                cx.new(|cx| Root::new(view, window, cx).bordered(false))
             })
-            .expect("创建窗口失败");
+            .expect("failed to create logd window");
         })
         .detach();
     });

@@ -8,13 +8,18 @@
 //! 比例运算全走 f64，只在最后一步落到像素。滚动数学在 `logd-core` 里有单测。
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
     MatcherSet, Progress, RenderRow, ScanOutcome, ScrollTo,
@@ -49,6 +54,23 @@ pub struct LogView {
     /// 正则编译失败之类的提示
     error: Option<String>,
     from_cache: bool,
+    selection: Option<LineSelection>,
+    selecting: bool,
+    edits: BTreeMap<u64, String>,
+    editing_line: Option<u64>,
+    edit_input: Entity<InputState>,
+}
+
+#[derive(Clone, Copy)]
+struct LineSelection {
+    anchor_row: u64,
+    active_row: u64,
+}
+
+impl LineSelection {
+    fn range(self) -> std::ops::RangeInclusive<u64> {
+        self.anchor_row.min(self.active_row)..=self.anchor_row.max(self.active_row)
+    }
 }
 
 impl LogView {
@@ -74,6 +96,17 @@ impl LogView {
 
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let complete = loaded.index.complete;
+        let edit_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(
+            &edit_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_edit(window, cx);
+                }
+            },
+        )
+        .detach();
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
@@ -86,6 +119,11 @@ impl LogView {
             dirty: false,
             error: None,
             from_cache: loaded.from_cache,
+            selection: None,
+            selecting: false,
+            edits: BTreeMap::new(),
+            editing_line: None,
+            edit_input,
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -158,20 +196,18 @@ impl LogView {
 
     /// 后台任务跑着的时候 30Hz 刷一次，进度和行数才会动。
     fn poll_while_busy(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
-                let busy = this
-                    .update(cx, |this, cx| {
-                        cx.notify();
-                        this.indexing.is_some() || this.scanning.is_some()
-                    })
-                    .unwrap_or(false);
-                if !busy {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(33))
+                .await;
+            let busy = this
+                .update(cx, |this, cx| {
+                    cx.notify();
+                    this.indexing.is_some() || this.scanning.is_some()
+                })
+                .unwrap_or(false);
+            if !busy {
+                break;
             }
         })
         .detach();
@@ -208,7 +244,12 @@ impl LogView {
         cx.notify();
     }
 
-    pub fn set_encoding(&mut self, enc: Encoding, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+    pub fn set_encoding(
+        &mut self,
+        enc: Encoding,
+        filters: Vec<FilterSpec>,
+        cx: &mut Context<Self>,
+    ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
         self.apply_filters(filters, cx);
@@ -265,6 +306,151 @@ impl LogView {
         cx.notify();
     }
 
+    pub fn copy_selection(&self, cx: &mut App) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let mut output = String::new();
+        for row in selection.range() {
+            let Some(file_line) = self.doc.row_to_file_line(row) else {
+                continue;
+            };
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            if let Some(edited) = self.edits.get(&file_line) {
+                output.push_str(edited);
+            } else if let Some(text) = self.doc.line_text(file_line) {
+                output.push_str(&text);
+            }
+        }
+        if !output.is_empty() {
+            cx.write_to_clipboard(output.into());
+        }
+    }
+
+    pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .selection
+            .map(|selection| selection.active_row)
+            .unwrap_or_else(|| self.doc.viewport().anchor_line());
+        let Some(file_line) = self.doc.row_to_file_line(row) else {
+            return;
+        };
+        let text = self
+            .edits
+            .get(&file_line)
+            .cloned()
+            .or_else(|| self.doc.line_text(file_line))
+            .unwrap_or_default();
+        self.editing_line = Some(file_line);
+        self.edit_input
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+        window.focus(&self.edit_input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn save_edited_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edits.is_empty() {
+            return;
+        }
+        let source = self.doc.source().clone();
+        let index = self.doc.index().clone();
+        let encoding = self.doc.encoding();
+        let edits = self.edits.clone();
+        let directory = source.path().parent().unwrap_or_else(|| Path::new("."));
+        let name = source
+            .path()
+            .file_name()
+            .map(|name| format!("{}.edited", name.to_string_lossy()))
+            .unwrap_or_else(|| "log.edited".to_string());
+        let target = cx.prompt_for_new_path(directory, Some(&name));
+        let executor = cx.background_executor().clone();
+
+        cx.spawn_in(window, async move |this, window| {
+            let Some(target) = target.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            if target == source.path() {
+                _ = window.update(|_, cx| {
+                    _ = this.update(cx, |this, cx| {
+                        this.error = Some("edited copy must use a new path".to_string());
+                        cx.notify();
+                    });
+                });
+                return;
+            }
+            let result = executor
+                .spawn(async move { write_edited_copy(target, source, index, encoding, edits) })
+                .await;
+            _ = window.update(|_, cx| {
+                _ = this.update(cx, |this, cx| {
+                    this.error = result.err().map(|error| format!("{error:#}"));
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file_line) = self.editing_line.take() else {
+            return;
+        };
+        let value = self.edit_input.read(cx).value().to_string();
+        self.edits.insert(file_line, value);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_line.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    fn select_row(&mut self, row: u64, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = match (extend, self.selection) {
+            (true, Some(selection)) => Some(LineSelection {
+                active_row: row,
+                ..selection
+            }),
+            _ => Some(LineSelection {
+                anchor_row: row,
+                active_row: row,
+            }),
+        };
+        self.selecting = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn row_at_y(&self, y: f32) -> Option<u64> {
+        let area = self.last_area;
+        let local = y - f32::from(area.origin.y);
+        if local < 0. || local > f32::from(area.size.height) {
+            return None;
+        }
+        let visible_offset = ((local + self.doc.viewport().pixel_offset()) / theme::LINE_HEIGHT)
+            .floor()
+            .max(0.) as u64;
+        let row = self.doc.viewport().anchor_line() + visible_offset;
+        (row < self.doc.display_rows()).then_some(row)
+    }
+
+    fn extend_selection_to_y(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some(row) = self.row_at_y(y) else {
+            return;
+        };
+        if let Some(selection) = &mut self.selection {
+            if selection.active_row != row {
+                selection.active_row = row;
+                cx.notify();
+            }
+        }
+    }
+
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let lh = theme::LINE_HEIGHT;
         let (dx, dy) = match ev.delta {
@@ -282,15 +468,27 @@ impl LogView {
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let ctrl = ks.modifiers.control;
+        let primary = crate::platform::primary_modifier(&ks.modifiers);
+        if primary && ks.key == "c" {
+            self.copy_selection(cx);
+            return;
+        }
+        if ks.key == "enter" {
+            self.edit_selected(_window, cx);
+            return;
+        }
+        if ks.key == "escape" {
+            self.cancel_edit(_window, cx);
+            return;
+        }
         let vp = self.doc.viewport_mut();
         match ks.key.as_str() {
             "up" => vp.scroll_by_lines(-1),
             "down" => vp.scroll_by_lines(1),
             "pageup" => vp.page(-1),
             "pagedown" => vp.page(1),
-            "home" if ctrl => vp.scroll_to_top(),
-            "end" if ctrl => vp.scroll_to_bottom(),
+            "home" if primary => vp.scroll_to_top(),
+            "end" if primary => vp.scroll_to_bottom(),
             "home" => vp.scroll_h_by(-f32::MAX),
             "end" => vp.scroll_h_by(f32::MAX),
             "left" => vp.scroll_h_by(-40.0),
@@ -336,9 +534,21 @@ impl LogView {
 
     // ---- 渲染 ----
 
-    fn render_row(&self, row: &RenderRow, gutter_w: f32, h_scroll: f32) -> AnyElement {
+    fn render_row(
+        &self,
+        row: &RenderRow,
+        view_row: u64,
+        gutter_w: f32,
+        h_scroll: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let filters = self.doc.matcher().filters();
         let line_spec = row.line_filter.and_then(|i| filters.get(i));
+        let selected = self
+            .selection
+            .is_some_and(|selection| selection.range().contains(&view_row));
+        let edited = self.edits.get(&row.file_line);
+        let is_editing = self.editing_line == Some(row.file_line);
 
         let mut content = div()
             .flex_none()
@@ -350,7 +560,9 @@ impl LogView {
                 el.font_weight(FontWeight::BOLD)
             });
 
-        if row.spans.is_empty() {
+        if let Some(edited) = edited {
+            content = content.child(edited.clone());
+        } else if row.spans.is_empty() {
             content = content.child(row.text.clone());
         } else {
             let runs: Vec<(std::ops::Range<usize>, HighlightStyle)> = row
@@ -373,13 +585,39 @@ impl LogView {
             content = content.child(StyledText::new(row.text.clone()).with_highlights(runs));
         }
 
+        let line_content = if is_editing {
+            div()
+                .flex_1()
+                .h_full()
+                .child(Input::new(&self.edit_input).xsmall().appearance(false))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .pl_2()
+                .overflow_hidden()
+                .child(content)
+                .into_any_element()
+        };
+
         div()
+            .id(("log-row", view_row as usize))
             .flex()
             .flex_row()
             .h(px(theme::LINE_HEIGHT))
             .w_full()
             .overflow_hidden()
             .when_some(line_spec.and_then(|f| f.back), |el, c| el.bg(theme::c(c)))
+            .when(selected, |el| el.bg(theme::c(theme::SELECTION)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.select_row(view_row, event.modifiers.shift, window, cx);
+                    if event.click_count >= 2 {
+                        this.edit_selected(window, cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -392,7 +630,7 @@ impl LogView {
                     // 行号槽显示的永远是**文件行号**，筛选视图下也不变
                     .child(format!("{}", row.file_line + 1)),
             )
-            .child(div().flex_1().pl_2().overflow_hidden().child(content))
+            .child(line_content)
             .into_any_element()
     }
 
@@ -401,6 +639,35 @@ impl LogView {
         let digits = (self.doc.total_file_lines().max(1) as f64).log10().floor() as usize + 1;
         (digits.max(4) as f32) * (theme::FONT_SIZE * 0.62) + 20.0
     }
+}
+
+fn write_edited_copy(
+    target: PathBuf,
+    source: Arc<FileSource>,
+    index: Arc<LineIndex>,
+    encoding: Encoding,
+    edits: BTreeMap<u64, String>,
+) -> anyhow::Result<()> {
+    let mut output = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    let data = source.data();
+    let mut cursor = 0usize;
+    let mut spans = Vec::with_capacity(1);
+    for (file_line, text) in edits {
+        index.line_spans(data, file_line, 1, &mut spans);
+        let Some(&(start, end)) = spans.first() else {
+            continue;
+        };
+        let mut start = start as usize;
+        if start == 0 {
+            start = source.bom_len().min(end as usize);
+        }
+        output.write_all(&data[cursor..start])?;
+        output.write_all(&logd_core::matcher::encode_pattern(&text, encoding))?;
+        cursor = end as usize;
+    }
+    output.write_all(&data[cursor..])?;
+    output.flush()?;
+    Ok(())
 }
 
 impl Focusable for LogView {
@@ -428,6 +695,7 @@ impl Render for LogView {
         let show_scrollbar = self.doc.display_rows() > 0 && thumb_len < track_len;
 
         let gutter_w = self.gutter_width();
+        let first_row = vp.anchor_line();
         let rows = self.doc.rows();
 
         let bounds_sink = self.area.clone();
@@ -450,6 +718,8 @@ impl Render for LogView {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                 if this.drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
                     this.on_drag_move(f32::from(ev.position.y), cx);
+                } else if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
+                    this.extend_selection_to_y(f32::from(ev.position.y), cx);
                 }
             }))
             .on_mouse_up(
@@ -458,6 +728,7 @@ impl Render for LogView {
                     if this.drag_grab.take().is_some() {
                         cx.notify();
                     }
+                    this.selecting = false;
                 }),
             )
             // 量视口尺寸：prepaint 回填，尺寸真变了才 notify，避免每帧重画
@@ -482,7 +753,9 @@ impl Render for LogView {
                     .right_0()
                     .flex()
                     .flex_col()
-                    .children(rows.iter().map(|r| self.render_row(r, gutter_w, h_scroll))),
+                    .children(rows.iter().enumerate().map(|(index, row)| {
+                        self.render_row(row, first_row + index as u64, gutter_w, h_scroll, cx)
+                    })),
             )
             .when(show_scrollbar, |el| {
                 el.child(
@@ -497,6 +770,7 @@ impl Render for LogView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
                                 this.on_scrollbar_down(f32::from(ev.position.y), cx);
                             }),
                         )

@@ -195,6 +195,28 @@ impl Document {
         self.row_to_file_line(self.viewport.anchor_line())
     }
 
+    /// Decode one file line without changing the viewport. UI-only edit and
+    /// copy operations use this to keep their buffers proportional to the
+    /// user's selection rather than to the mapped file size.
+    pub fn line_text(&self, file_line: u64) -> Option<String> {
+        let mut line_buf = Vec::with_capacity(1);
+        self.index
+            .line_spans(self.source.data(), file_line, 1, &mut line_buf);
+        let &(start, end) = line_buf.first()?;
+        let mut start = start as usize;
+        if start == 0 {
+            start = self.source.bom_len().min(end as usize);
+        }
+        Some(
+            prepare_plain(
+                &self.source.data()[start..end as usize],
+                self.encoding,
+                self.max_render_bytes,
+            )
+            .text,
+        )
+    }
+
     /// 按**文件行号**跳转，两种视图下都好用。
     pub fn goto_file_line(&mut self, file_line: u64, how: ScrollTo) {
         let row = self.file_line_to_row(file_line);
@@ -338,6 +360,14 @@ mod tests {
         let rows = d.rows();
         assert_eq!(rows[0].file_line, 100);
         assert_eq!(rows[0].text, "0100 TARGET payload");
+    }
+
+    #[test]
+    fn line_text_decodes_without_moving_viewport() {
+        let d = sample();
+        assert_eq!(d.line_text(10).as_deref(), Some("0010 TARGET payload"));
+        assert_eq!(d.viewport().anchor_line(), 0);
+        assert_eq!(d.line_text(1000), None);
     }
 
     #[test]

@@ -5,9 +5,13 @@
 pub mod cache;
 pub mod document;
 pub mod index;
+pub mod logline;
 pub mod matcher;
+pub mod merge;
 pub mod progress;
+pub mod query;
 pub mod render;
+pub mod rowmap;
 pub mod scan;
 pub mod source;
 pub mod tat;
@@ -15,9 +19,13 @@ pub mod viewport;
 
 pub use document::{Document, RenderRow};
 pub use index::{ChunkIndex, LineIndex, ANCHOR_STRIDE};
+pub use logline::{Level, LogLine, Ts};
 pub use matcher::{FilterSpec, HighlightMode, MatcherSet, Span, Verdict};
+pub use merge::{MergedRow, MergedView, TimedLine};
 pub use progress::Progress;
+pub use query::{CompileOptions, Query, QueryScratch};
 pub use render::{prepare_line, prepare_plain, RenderLine, DEFAULT_MAX_RENDER_BYTES};
+pub use rowmap::{ContextMap, Matches, RowIndex, Segment};
 pub use scan::{scan_all, ScanOutcome};
 pub use source::{Encoding, FileSource};
 pub use tat::TatFile;
