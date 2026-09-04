@@ -13,7 +13,7 @@ use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerSta
 use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{h_flex, v_flex, InteractiveElementExt as _, Root, Selectable as _, Sizable};
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 
@@ -39,7 +39,7 @@ impl Render for TabDrag {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_3()
-            .h(px(28.))
+            .h(px(24.))
             .bg(theme::c(theme::SELECTION))
             .text_color(theme::c(theme::FG))
             .child(self.title.clone())
@@ -52,6 +52,7 @@ enum MenuCommand {
     OpenRecent(PathBuf),
     Refresh,
     SaveEditedCopy,
+    ImportFilters,
     ToggleEncoding,
     CopySelection,
     ShowAll,
@@ -277,6 +278,38 @@ impl LogdApp {
                 _ = this.update(cx, |this, cx| {
                     for path in paths {
                         this.open_path(&path, window, cx);
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn prompt_import_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(text(Key::ImportFilters, self.language).into()),
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let Some(paths) = paths.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            _ = window.update(|_, cx| {
+                _ = this.update(cx, |this, cx| {
+                    if path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tat"))
+                    {
+                        this.load_tat(&path, cx);
+                    } else {
+                        this.status =
+                            Some(format!("{}: .tat", text(Key::ImportFilters, this.language)));
+                        cx.notify();
                     }
                 });
             });
@@ -677,6 +710,7 @@ impl LogdApp {
                     view.update(cx, |view, cx| view.save_edited_copy(window, cx));
                 }
             }
+            MenuCommand::ImportFilters => self.prompt_import_filters(window, cx),
             MenuCommand::ToggleEncoding => self.toggle_encoding(cx),
             MenuCommand::CopySelection => {
                 if let Some(view) = self.active_view().cloned() {
@@ -914,6 +948,13 @@ impl LogdApp {
                     let edit_app = app.clone();
                     let delete_app = app.clone();
                     let save_app = app.clone();
+                    let import_app = app.clone();
+                    let menu =
+                        menu.item(PopupMenuItem::new(text(Key::ImportFilters, lang)).on_click(
+                            window.listener_for(&import_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::ImportFilters, window, cx)
+                            }),
+                        ));
                     menu.item(PopupMenuItem::new(text(Key::AddFilter, lang)).on_click(
                         window.listener_for(&add_app, |this, _, window, cx| {
                             this.dispatch(MenuCommand::AddFilter, window, cx)
@@ -999,10 +1040,10 @@ impl LogdApp {
         let app = cx.entity();
         let lang = self.language;
         self.tab_scroll.scroll_to_item(self.active);
-        h_flex()
+        let tabs = h_flex()
             .id("tab-strip")
             .w_full()
-            .h(px(28.))
+            .h(px(24.))
             .flex_none()
             .bg(theme::c(theme::GUTTER_BG))
             .border_b_1()
@@ -1078,7 +1119,45 @@ impl LogdApp {
                             ),
                         )
                     })
-            }))
+            }));
+
+        // Scrollbars are painted as an overlay by gpui. Keep a small bottom
+        // strip for it so the tab labels remain fully visible.
+        v_flex()
+            .id("tab-strip-frame")
+            .w_full()
+            .h(px(28.))
+            .flex_none()
+            .relative()
+            .bg(theme::c(theme::GUTTER_BG))
+            .child(tabs)
+            .child(
+                Scrollbar::horizontal(&self.tab_scroll)
+                    .id("tab-scrollbar")
+                    .mode(ScrollbarMode::Always)
+                    .viewport_from_layout()
+                    .styles(|styles| {
+                        styles
+                            .track(|track| {
+                                track
+                                    .width(px(4.))
+                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
+                            })
+                            .track_hover(|track| {
+                                track
+                                    .width(px(4.))
+                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
+                            })
+                            .track_active(|track| {
+                                track
+                                    .width(px(4.))
+                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
+                            })
+                            .thumb(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                            .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                            .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                    }),
+            )
             .into_any_element()
     }
 

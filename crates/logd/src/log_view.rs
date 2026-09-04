@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
@@ -109,6 +109,10 @@ impl LogView {
             |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.commit_edit(window, cx);
+                } else if matches!(event, InputEvent::Change) {
+                    // The edited line can grow beyond the current viewport;
+                    // redraw the parent so its horizontal range is refreshed.
+                    cx.notify();
                 }
             },
         )
@@ -338,6 +342,17 @@ impl LogView {
     }
 
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selected_at(window, cx, None, 0.0, 0.0);
+    }
+
+    fn edit_selected_at(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        cursor_x: Option<f32>,
+        gutter_w: f32,
+        h_scroll: f32,
+    ) {
         let row = self
             .selection
             .map(|selection| selection.active_row)
@@ -354,8 +369,36 @@ impl LogView {
         self.editing_line = Some(file_line);
         self.edit_input
             .update(cx, |state, cx| state.set_value(text, window, cx));
-        window.focus(&self.edit_input.read(cx).focus_handle(cx), cx);
+        if let Some(cursor_x) = cursor_x {
+            let column = self.cursor_column_at_x(
+                &self.edit_input.read(cx).value().to_string(),
+                cursor_x,
+                gutter_w,
+                h_scroll,
+            );
+            self.edit_input.update(cx, |state, cx| {
+                state.set_cursor_position(Position::new(0, column as u32), window, cx);
+                // The log view owns the document's horizontal viewport. Keep
+                // the input text at the same offset while the row is edited.
+                state.set_scroll_offset(point(px(-h_scroll), px(0.)), cx);
+            });
+        } else {
+            window.focus(&self.edit_input.read(cx).focus_handle(cx), cx);
+        }
         cx.notify();
+    }
+
+    fn cursor_column_at_x(&self, text: &str, x: f32, gutter_w: f32, h_scroll: f32) -> usize {
+        let local = (x - f32::from(self.last_area.origin.x) - gutter_w - 8.0 + h_scroll).max(0.0);
+        let mut width = 0.0;
+        for (column, ch) in text.chars().enumerate() {
+            let char_width = theme::FONT_SIZE * if ch.is_ascii() { 0.62 } else { 1.0 };
+            if local < width + char_width * 0.5 {
+                return column;
+            }
+            width += char_width;
+        }
+        text.chars().count()
     }
 
     pub fn save_edited_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -614,6 +657,7 @@ impl LogView {
         let selected = self
             .selection
             .is_some_and(|selection| selection.range().contains(&view_row));
+        let file_line = row.file_line;
         let edited = self.edits.get(&row.file_line);
         let is_editing = self.editing_line == Some(row.file_line);
 
@@ -657,6 +701,8 @@ impl LogView {
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .pl_2()
+                .overflow_hidden()
                 .child(Input::new(&self.edit_input).xsmall().appearance(false))
                 .into_any_element()
         } else {
@@ -684,9 +730,28 @@ impl LogView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    let in_content = f32::from(event.position.x)
+                        >= f32::from(this.last_area.origin.x) + gutter_w;
+                    // Let the input's own handler place the caret. The row
+                    // handler must not focus LogView again after the child has
+                    // processed the click.
+                    if this.editing_line == Some(file_line) && !event.modifiers.shift && in_content
+                    {
+                        return;
+                    }
                     this.select_row(view_row, event.modifiers.shift, window, cx);
-                    if event.click_count >= 2 {
-                        this.edit_selected(window, cx);
+                    if this.editing_line != Some(file_line) && !event.modifiers.shift && in_content
+                    {
+                        if this.editing_line.is_some() {
+                            this.commit_edit(window, cx);
+                        }
+                        this.edit_selected_at(
+                            window,
+                            cx,
+                            Some(f32::from(event.position.x)),
+                            gutter_w,
+                            h_scroll,
+                        );
                     }
                 }),
             )
@@ -761,14 +826,20 @@ impl Render for LogView {
 
         let gutter_w = self.gutter_width();
         let rows = self.doc.rows();
+        let editing_line = self.editing_line;
+        let editing_text =
+            editing_line.map(|file_line| self.edit_input.read(cx).value().to_string());
         let estimated_width = rows
             .iter()
             .map(|row| {
-                let text = self
-                    .edits
-                    .get(&row.file_line)
-                    .map(String::as_str)
-                    .unwrap_or(&row.text);
+                let text = if editing_line == Some(row.file_line) {
+                    editing_text.as_deref().unwrap_or(&row.text)
+                } else {
+                    self.edits
+                        .get(&row.file_line)
+                        .map(String::as_str)
+                        .unwrap_or(&row.text)
+                };
                 text.chars()
                     .map(|ch| if ch.is_ascii() { 0.62 } else { 1.0 })
                     .sum::<f32>()

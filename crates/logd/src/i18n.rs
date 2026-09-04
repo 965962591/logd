@@ -47,6 +47,7 @@ pub enum Key {
     DeleteFilter,
     SaveFilter,
     SaveEditedCopy,
+    ImportFilters,
     SearchPlaceholder,
     FilterTextPlaceholder,
     FilterDescriptionPlaceholder,
@@ -114,6 +115,8 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::SaveFilter, Language::EnUs) => "Save Filters",
         (Key::SaveEditedCopy, Language::ZhCn) => "保存编辑副本",
         (Key::SaveEditedCopy, Language::EnUs) => "Save Edited Copy",
+        (Key::ImportFilters, Language::ZhCn) => "导入 .tat 过滤器",
+        (Key::ImportFilters, Language::EnUs) => "Import .tat Filters",
         (Key::SearchPlaceholder, Language::ZhCn) => {
             "搜索所有已导入文件（关键字用 | 分隔），回车搜索"
         }
