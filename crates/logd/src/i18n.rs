@@ -78,6 +78,10 @@ pub enum Key {
     Indexing,
     Filtering,
     Cache,
+    CloseTab,
+    CloseTabsBefore,
+    CloseTabsAfter,
+    CloseCleanTabs,
 }
 
 pub fn text(key: Key, lang: Language) -> &'static str {
@@ -178,5 +182,13 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::Filtering, Language::EnUs) => "Filter",
         (Key::Cache, Language::ZhCn) => "索引缓存",
         (Key::Cache, Language::EnUs) => "cache",
+        (Key::CloseTab, Language::ZhCn) => "关闭当前标签页",
+        (Key::CloseTab, Language::EnUs) => "Close Current Tab",
+        (Key::CloseTabsBefore, Language::ZhCn) => "关闭前面的标签页",
+        (Key::CloseTabsBefore, Language::EnUs) => "Close Tabs to the Left",
+        (Key::CloseTabsAfter, Language::ZhCn) => "关闭后面的标签页",
+        (Key::CloseTabsAfter, Language::EnUs) => "Close Tabs to the Right",
+        (Key::CloseCleanTabs, Language::ZhCn) => "关闭未修改或已保存的标签页",
+        (Key::CloseCleanTabs, Language::EnUs) => "Close Unmodified or Saved Tabs",
     }
 }

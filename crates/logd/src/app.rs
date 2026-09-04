@@ -30,6 +30,23 @@ struct Tab {
 }
 
 #[derive(Clone)]
+struct TabDrag {
+    index: usize,
+    title: String,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .h(px(28.))
+            .bg(theme::c(theme::SELECTION))
+            .text_color(theme::c(theme::FG))
+            .child(self.title.clone())
+    }
+}
+
+#[derive(Clone)]
 enum MenuCommand {
     Open,
     OpenRecent(PathBuf),
@@ -68,6 +85,7 @@ pub struct LogdApp {
     editing_filter: Option<usize>,
     filter_editor_open: bool,
     dock_area: Entity<DockArea>,
+    tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
     filter_placement: DockPlacement,
     filters_open: bool,
@@ -153,6 +171,7 @@ impl LogdApp {
             editing_filter: None,
             filter_editor_open: false,
             dock_area,
+            tab_scroll: ScrollHandle::new(),
             filter_panel,
             filter_placement: DockPlacement::Right,
             filters_open: true,
@@ -206,6 +225,7 @@ impl LogdApp {
                     path: path.to_path_buf(),
                 });
                 self.active = tab_index;
+                self.tab_scroll.scroll_to_item(tab_index);
                 self.apply_filters_to_view(tab_index, &view, cx);
                 self.remember_file(path);
                 self.status = None;
@@ -292,6 +312,7 @@ impl LogdApp {
             return;
         }
         self.active = index;
+        self.tab_scroll.scroll_to_item(index);
         let view = self.tabs[index].view.clone();
         // Reapply even when the view is not dirty: a current-file filter
         // changes meaning when the active tab changes.
@@ -310,17 +331,93 @@ impl LogdApp {
         if index >= self.tabs.len() {
             return;
         }
-        let previous_active = self.active;
+        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        let removed_active = index == self.active;
         self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if removed_active {
+            self.active = index.min(self.tabs.len() - 1);
+        } else if let Some(path) = active_path.as_ref() {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| &tab.path == path)
+                .unwrap_or_else(|| index.min(self.tabs.len() - 1));
         }
-        // Removing the active tab (or a tab before it) can change which file
-        // a current-file filter belongs to.
-        if !self.tabs.is_empty() && (index == previous_active || index < previous_active) {
+        if removed_active && !self.tabs.is_empty() {
+            // Removing the active tab changes which file a current-file filter belongs to.
             let view = self.tabs[self.active].view.clone();
             self.apply_filters_to_view(self.active, &view, cx);
         }
+        if !self.tabs.is_empty() {
+            self.tab_scroll.scroll_to_item(self.active);
+        }
+        cx.notify();
+    }
+
+    fn close_tabs_before(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == 0 || index >= self.tabs.len() {
+            return;
+        }
+        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        self.tabs.drain(..index);
+        self.restore_active_path(active_path, cx);
+    }
+
+    fn close_tabs_after(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len().saturating_sub(1) {
+            return;
+        }
+        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        self.tabs.truncate(index + 1);
+        self.restore_active_path(active_path, cx);
+    }
+
+    fn close_clean_tabs(&mut self, cx: &mut Context<Self>) {
+        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        self.tabs
+            .retain(|tab| tab.view.read(cx).can_close_without_prompt());
+        self.restore_active_path(active_path, cx);
+    }
+
+    fn restore_active_path(&mut self, active_path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            self.active = 0;
+            cx.notify();
+            return;
+        }
+        let old_path = active_path;
+        let next = old_path
+            .as_ref()
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.path == path))
+            .unwrap_or_else(|| self.active.min(self.tabs.len() - 1));
+        let changed = self.active != next
+            || old_path
+                .as_ref()
+                .is_some_and(|path| self.tabs.get(next).is_some_and(|tab| &tab.path != path));
+        self.active = next;
+        self.tab_scroll.scroll_to_item(self.active);
+        if changed {
+            let view = self.tabs[self.active].view.clone();
+            self.apply_filters_to_view(self.active, &view, cx);
+        }
+        cx.notify();
+    }
+
+    fn reorder_tab(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
+        if from >= self.tabs.len() || target >= self.tabs.len() || from == target {
+            return;
+        }
+        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        let tab = self.tabs.remove(from);
+        let insertion = if from < target { target - 1 } else { target };
+        self.tabs.insert(insertion, tab);
+        self.active = active_path
+            .as_ref()
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.path == path))
+            .unwrap_or(insertion);
+        self.tab_scroll.scroll_to_item(self.active);
         cx.notify();
     }
 
@@ -899,17 +996,32 @@ impl LogdApp {
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let app = cx.entity();
+        let lang = self.language;
+        self.tab_scroll.scroll_to_item(self.active);
         h_flex()
+            .id("tab-strip")
             .w_full()
             .h(px(28.))
+            .flex_none()
             .bg(theme::c(theme::GUTTER_BG))
             .border_b_1()
             .border_color(theme::c(theme::BORDER))
             .text_size(px(12.))
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
+                let drag = TabDrag {
+                    index,
+                    title: tab.title.clone(),
+                };
+                let drop_app = app.clone();
+                let close_app = app.clone();
+                let context_app = app.clone();
                 h_flex()
                     .id(("tab", index))
+                    .flex_none()
                     .h_full()
                     .px_3()
                     .gap_2()
@@ -919,14 +1031,53 @@ impl LogdApp {
                     .bg(theme::c(if active { theme::BG } else { theme::GUTTER_BG }))
                     .text_color(theme::c(if active { theme::FG } else { theme::MUTED }))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_active(index, cx)))
+                    .on_drag(drag, move |drag, _, _, cx| cx.new(|_| drag.clone()))
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                        this.reorder_tab(drag.index, index, cx);
+                    }))
                     .child(tab.title.clone())
                     .child(
                         div()
                             .id(("close", index))
                             .px_1()
                             .child("x")
-                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(index, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(index, cx)
+                            })),
                     )
+                    .context_menu(move |menu, window, _| {
+                        let close_app = close_app.clone();
+                        let before_app = context_app.clone();
+                        let after_app = context_app.clone();
+                        let clean_app = drop_app.clone();
+                        menu.item(PopupMenuItem::new(text(Key::CloseTab, lang)).on_click(
+                            window.listener_for(&close_app, move |this, _, _, cx| {
+                                this.close_tab(index, cx);
+                            }),
+                        ))
+                        .item(
+                            PopupMenuItem::new(text(Key::CloseTabsBefore, lang)).on_click(
+                                window.listener_for(&before_app, move |this, _, _, cx| {
+                                    this.close_tabs_before(index, cx);
+                                }),
+                            ),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::CloseTabsAfter, lang)).on_click(
+                                window.listener_for(&after_app, move |this, _, _, cx| {
+                                    this.close_tabs_after(index, cx);
+                                }),
+                            ),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::CloseCleanTabs, lang)).on_click(
+                                window.listener_for(&clean_app, move |this, _, _, cx| {
+                                    this.close_clean_tabs(cx);
+                                }),
+                            ),
+                        )
+                    })
             }))
             .into_any_element()
     }

@@ -76,6 +76,11 @@ impl Viewport {
         self.h_scroll
     }
 
+    #[inline]
+    pub fn max_h_scroll(&self) -> f32 {
+        self.max_h_scroll
+    }
+
     pub fn set_line_height(&mut self, h: f32) {
         self.line_height = h.max(1.0);
         self.pixel_offset = self.pixel_offset.min(self.line_height - 0.001).max(0.0);
@@ -273,6 +278,41 @@ impl Viewport {
 
     pub fn scroll_h_by(&mut self, dx: f32) {
         self.h_scroll = (self.h_scroll + dx).clamp(0.0, self.max_h_scroll);
+    }
+
+    /// Return the horizontal scrollbar thumb offset and length.
+    pub fn h_thumb(&self, track: f32, viewport_width: f32, min_thumb: f32) -> (f32, f32) {
+        let viewport = viewport_width.max(0.0) as f64;
+        let total = viewport + self.max_h_scroll as f64;
+        if track <= 0.0 || total <= viewport || viewport <= 0.0 {
+            return (0.0, track.max(0.0));
+        }
+        let len = ((viewport / total) as f32 * track).clamp(min_thumb.min(track), track);
+        let span = track - len;
+        let fraction = if self.max_h_scroll > 0.0 {
+            self.h_scroll / self.max_h_scroll
+        } else {
+            0.0
+        };
+        (span * fraction.clamp(0.0, 1.0), len)
+    }
+
+    /// Set horizontal scrolling from a scrollbar thumb offset.
+    pub fn set_h_thumb_offset(
+        &mut self,
+        offset: f32,
+        track: f32,
+        viewport_width: f32,
+        min_thumb: f32,
+    ) {
+        let (_, len) = self.h_thumb(track, viewport_width, min_thumb);
+        let span = track - len;
+        let fraction = if span > 0.0 {
+            (offset / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.h_scroll = self.max_h_scroll * fraction;
     }
 }
 
