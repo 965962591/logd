@@ -1313,10 +1313,16 @@ impl Render for LogView {
             // 量视口尺寸：prepaint 回填，尺寸真变了才 notify，避免每帧重画
             .child(
                 canvas(
-                    move |bounds, _window, cx| {
+                    move |bounds, window, _cx| {
                         if bounds_sink.get() != bounds {
                             bounds_sink.set(bounds);
-                            handle.update(cx, |_, cx| cx.notify()).ok();
+                            let handle = handle.clone();
+                            // Rows are computed during render from the previous measured bounds.
+                            // Notify after this frame finishes so the invalidation cannot be
+                            // consumed by the frame that performed the measurement.
+                            window.on_next_frame(move |_, cx| {
+                                handle.update(cx, |_, cx| cx.notify()).ok();
+                            });
                         }
                     },
                     |_, _, _, _| {},
