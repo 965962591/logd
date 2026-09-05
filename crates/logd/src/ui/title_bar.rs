@@ -4,7 +4,10 @@ use std::sync::{Arc, LazyLock};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{h_flex, Icon, IconName, InteractiveElementExt as _, Sizable as _};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{
+    h_flex, Icon, IconName, InteractiveElementExt as _, Selectable as _, Sizable as _,
+};
 
 use crate::i18n::{text, Key, Language};
 use crate::theme;
@@ -22,6 +25,25 @@ static APP_ICON: LazyLock<Arc<Image>> =
 
 pub fn app_icon() -> impl IntoElement {
     img(APP_ICON.clone()).size(px(20.)).flex_none()
+}
+
+pub fn panel_toggle(
+    id: &'static str,
+    open_icon: IconName,
+    closed_icon: IconName,
+    open: bool,
+    tooltip: impl Into<SharedString>,
+    action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    Button::new(id)
+        .icon(if open { open_icon } else { closed_icon })
+        .xsmall()
+        .ghost()
+        .selected(open)
+        .toggled(open)
+        .tab_stop(false)
+        .tooltip(tooltip)
+        .on_click(action)
 }
 
 pub fn render(

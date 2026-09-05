@@ -1480,11 +1480,15 @@ impl LogdApp {
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette(cx);
         let app = cx.entity();
+        let filters_open = self.filter_panel.read(cx).visible();
+        let search_results_open = self.search_results_panel.read(cx).visible();
         let search_history = self.search_history.clone();
         let has_search_history = !search_history.is_empty();
         let search_history_select = self.search_history_select.clone();
         let keyword = self.keyword.clone();
         let lang = self.language;
+        let filter_toggle_app = app.clone();
+        let search_results_toggle_app = app.clone();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -1504,6 +1508,44 @@ impl LogdApp {
             .child(self.menu_button(Key::View, window, cx))
             .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
+            .child(title_bar::panel_toggle(
+                "title-toggle-filters",
+                IconName::PanelLeft,
+                IconName::PanelLeftOpen,
+                filters_open,
+                text(
+                    if filters_open {
+                        Key::HideFilters
+                    } else {
+                        Key::ShowFilters
+                    },
+                    lang,
+                ),
+                move |_, window, cx| {
+                    filter_toggle_app.update(cx, |app, cx| {
+                        app.show_filter_panel(!filters_open, window, cx)
+                    });
+                },
+            ))
+            .child(title_bar::panel_toggle(
+                "title-toggle-search-results",
+                IconName::PanelBottom,
+                IconName::PanelBottomOpen,
+                search_results_open,
+                text(
+                    if search_results_open {
+                        Key::HideSearchResults
+                    } else {
+                        Key::ShowSearchResults
+                    },
+                    lang,
+                ),
+                move |_, window, cx| {
+                    search_results_toggle_app.update(cx, |app, cx| {
+                        app.show_search_results(!search_results_open, window, cx)
+                    });
+                },
+            ))
             .into_any_element();
         let clear_app = app.clone();
         let search_history_combo = Combobox::new(&search_history_select)

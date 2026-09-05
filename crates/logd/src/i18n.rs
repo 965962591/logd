@@ -41,6 +41,7 @@ pub enum Key {
     ShowAll,
     ShowOnlyFiltered,
     ShowFilters,
+    HideFilters,
     Filters,
     AddFilter,
     EditFilter,
@@ -73,6 +74,7 @@ pub enum Key {
     FilterPanel,
     SearchResults,
     ShowSearchResults,
+    HideSearchResults,
     SearchResultsPrompt,
     NoSearchResults,
     SearchInProgress,
@@ -123,6 +125,8 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::ShowOnlyFiltered, Language::EnUs) => "Show Only Filtered",
         (Key::ShowFilters, Language::ZhCn) => "显示过滤器",
         (Key::ShowFilters, Language::EnUs) => "Show Filters",
+        (Key::HideFilters, Language::ZhCn) => "隐藏过滤器",
+        (Key::HideFilters, Language::EnUs) => "Hide Filters",
         (Key::Filters, Language::ZhCn) => "过滤器",
         (Key::Filters, Language::EnUs) => "Filters",
         (Key::AddFilter, Language::ZhCn) => "新增过滤器",
@@ -191,6 +195,8 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::SearchResults, Language::EnUs) => "Search Results",
         (Key::ShowSearchResults, Language::ZhCn) => "显示多文件搜索结果",
         (Key::ShowSearchResults, Language::EnUs) => "Show Search Results",
+        (Key::HideSearchResults, Language::ZhCn) => "隐藏多文件搜索结果",
+        (Key::HideSearchResults, Language::EnUs) => "Hide Search Results",
         (Key::SearchResultsPrompt, Language::ZhCn) => "在标题栏输入关键字并按回车搜索",
         (Key::SearchResultsPrompt, Language::EnUs) => {
             "Enter keywords in the title bar and press Enter"
