@@ -921,6 +921,7 @@ impl LogdApp {
         }
 
         gpui_component::Theme::change(mode, Some(window), cx);
+        theme::apply_dark_surface(cx);
         let search_foreground = theme::search_foreground_rgb(cx);
         if !self.search_filters.is_empty() {
             for filter in &mut self.search_filters {
@@ -1558,10 +1559,10 @@ impl LogdApp {
                 window.prevent_default();
                 cx.stop_propagation();
             })
-            .bg(palette.gutter)
+            .bg(palette.input_background)
             .border_1()
             .border_color(palette.border)
-            .rounded(px(4.))
+            .rounded(px(8.))
             .text_color(palette.foreground)
             .child(
                 div()
@@ -2836,6 +2837,7 @@ pub fn run(initial: Vec<PathBuf>) {
     app.run(move |cx| {
         gpui_component::init(cx);
         gpui_component::Theme::change(crate::settings::load_theme_mode(), None, cx);
+        crate::theme::apply_dark_surface(cx);
         let initial = initial.clone();
         let options = crate::platform::window_options(cx);
         cx.spawn(async move |cx| {

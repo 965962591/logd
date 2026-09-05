@@ -3,9 +3,12 @@
 use gpui::{rgb, App, Hsla, Rgba};
 use gpui_component::ActiveTheme as _;
 
+const DARK_SURFACE_RGB: u32 = 0x171717;
+
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub background: Hsla,
+    pub input_background: Hsla,
     pub foreground: Hsla,
     pub title_bar: Hsla,
     pub title_bar_border: Hsla,
@@ -31,8 +34,19 @@ pub struct Palette {
 
 pub fn palette(cx: &App) -> Palette {
     let active = cx.theme();
+    let dark_surface = dark_surface();
+    let surface = if active.mode.is_dark() {
+        dark_surface
+    } else {
+        active.background
+    };
     Palette {
-        background: active.background,
+        background: surface,
+        input_background: if active.mode.is_dark() {
+            surface
+        } else {
+            active.sidebar
+        },
         foreground: active.foreground,
         title_bar: active.title_bar,
         title_bar_border: active.title_bar_border,
@@ -41,7 +55,11 @@ pub fn palette(cx: &App) -> Palette {
         danger_foreground: active.danger_foreground,
         selection: active.selection,
         muted: active.muted_foreground,
-        gutter: active.sidebar,
+        gutter: if active.mode.is_dark() {
+            surface
+        } else {
+            active.sidebar
+        },
         border: active.border,
         status: active.status_bar,
         scroll_track: active.scrollbar,
@@ -55,6 +73,34 @@ pub fn palette(cx: &App) -> Palette {
         tab_active_indicator: active.accent,
         search_foreground: active.yellow,
     }
+}
+
+/// Keep gpui-kit Dock chrome on the same surface as the log workspace.
+///
+/// Dock renderers read these legacy theme tokens directly instead of going
+/// through the application's palette, so changing only the root view leaves
+/// split frames and tiles with the stock dark-theme background.
+pub fn apply_dark_surface(cx: &mut App) {
+    if !cx.theme().mode.is_dark() {
+        return;
+    }
+
+    let surface = dark_surface();
+    {
+        let active = gpui_component::Theme::global_mut(cx);
+        active.background = surface;
+        active.sidebar = surface;
+        active.tab_bar = surface;
+        active.tiles = surface;
+        active.tokens.background = surface.into();
+        active.tokens.tab_bar = surface.into();
+        active.tokens.tiles = surface.into();
+    }
+    gpui_component::Theme::sync_base(cx);
+}
+
+fn dark_surface() -> Hsla {
+    Hsla::from(rgb(DARK_SURFACE_RGB))
 }
 
 pub fn search_foreground_rgb(cx: &App) -> u32 {
