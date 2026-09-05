@@ -836,10 +836,9 @@ impl LogView {
                                 this.editing_line.filter(|previous| *previous != file_line)
                             {
                                 this.commit_line_input(previous, cx);
+                                this.editing_line = None;
                             }
-                            this.editing_line = Some(file_line);
                             this.active_input_line = Some(file_line);
-                            this.editing_changed = false;
                             this.selection = None;
                             cx.notify();
                         }
