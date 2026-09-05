@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
@@ -1278,6 +1278,15 @@ impl Render for LogView {
             .font_family(theme::MONO)
             .text_size(px(theme::FONT_SIZE))
             .line_height(px(theme::LINE_HEIGHT))
+            .capture_action(cx.listener(|this, _: &Copy, _window, cx| {
+                if this
+                    .text_selection
+                    .is_some_and(|selection| !selection.is_empty())
+                {
+                    this.copy_selection(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
