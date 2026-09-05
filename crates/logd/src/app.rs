@@ -2813,6 +2813,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_dot_millisecond_time_range_search_expression() {
+        assert_eq!(
+            parse_search_expression("t:06-17 04:18:19.809 06-17 04:28:39.571"),
+            SearchExpression {
+                keywords: Vec::new(),
+                query: concat!(
+                    "(time>=\"06-17 04:18:19.809\" and ",
+                    "time<=\"06-17 04:28:39.571\")"
+                )
+                .into(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_open_ended_time_search_expression() {
         assert_eq!(
             parse_search_expression("t:05-09 21:41:08:001129178"),

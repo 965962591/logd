@@ -430,9 +430,25 @@ impl LogView {
     }
 
     pub fn apply_search(&mut self, query_source: String, cx: &mut Context<Self>) {
+        // Use the first structured log timestamp as the date context for
+        // time-of-day queries. This keeps searches on logs with an explicit
+        // year aligned with the same file's timestamps.
+        let base_date = self
+            .doc
+            .source()
+            .data()
+            .split(|byte| *byte == b'\n')
+            .take(64)
+            .find_map(|line| {
+                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+                let line = line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(line);
+                logd_core::logline::parse(line)
+            })
+            .and_then(|line| line.ts);
         let query = Query::parse(
             &query_source,
             CompileOptions {
+                base_date,
                 encoding: Some(self.doc.encoding()),
                 ..Default::default()
             },
@@ -1698,7 +1714,7 @@ impl Render for LogView {
                         .right_0()
                         .w(px(theme::SCROLLBAR_W))
                         .cursor_default()
-                        .bg(palette.scroll_track)
+                        .group("log-vscrollbar")
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -1710,14 +1726,17 @@ impl Render for LogView {
                             div()
                                 .absolute()
                                 .top(px(thumb_off))
-                                .left_0()
-                                .right_0()
+                                .right(px(4.))
+                                .w(px(4.))
                                 .h(px(thumb_len))
                                 .rounded_sm()
                                 .bg(if self.drag_grab.is_some() {
                                     palette.scroll_thumb_hover
                                 } else {
                                     palette.scroll_thumb
+                                })
+                                .group_hover("log-vscrollbar", |style| {
+                                    style.right(px(2.)).w(px(8.)).bg(palette.scroll_thumb_hover)
                                 }),
                         ),
                 )
@@ -1736,7 +1755,7 @@ impl Render for LogView {
                         .bottom_0()
                         .h(px(theme::SCROLLBAR_W))
                         .cursor_default()
-                        .bg(palette.scroll_track)
+                        .group("log-hscrollbar")
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -1753,14 +1772,17 @@ impl Render for LogView {
                             div()
                                 .absolute()
                                 .left(px(h_thumb_off))
-                                .top_0()
-                                .bottom_0()
+                                .bottom(px(4.))
+                                .h(px(4.))
                                 .w(px(h_thumb_len))
                                 .rounded_sm()
                                 .bg(if self.h_drag_grab.is_some() {
                                     palette.scroll_thumb_hover
                                 } else {
                                     palette.scroll_thumb
+                                })
+                                .group_hover("log-hscrollbar", |style| {
+                                    style.bottom(px(2.)).h(px(8.)).bg(palette.scroll_thumb_hover)
                                 }),
                         ),
                 )

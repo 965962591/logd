@@ -824,6 +824,19 @@ pub fn parse_time_value(s: &str, base: Option<Ts>) -> Option<Ts> {
     // 带日期的直接复用行解析器的时间戳分支
     if let Some((ts, used)) = try_parse_dated(s) {
         if used == s.len() {
+            // A month/day value has no year in threadtime logs. When the
+            // caller knows the file's date context, use its year so the same
+            // query also works with logs that include an explicit year.
+            if is_month_day_value(s) {
+                if let Some(base) = base {
+                    let dated = format!("{}-{s}", base.year());
+                    if let Some((ts, used)) = try_parse_dated(&dated) {
+                        if used == dated.len() {
+                            return Some(ts);
+                        }
+                    }
+                }
+            }
             return Some(ts);
         }
     }
@@ -835,6 +848,11 @@ pub fn parse_time_value(s: &str, base: Option<Ts>) -> Option<Ts> {
     let time = (h as i64 * 3600 + m as i64 * 60 + sec as i64)
         .checked_mul(1_000_000_000)?;
     Some(Ts(date.checked_add(time)?.checked_add(ns as i64)?))
+}
+
+fn is_month_day_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.get(2) == Some(&b'-') && bytes.get(5) == Some(&b' ')
 }
 
 fn try_parse_dated(s: &str) -> Option<(Ts, usize)> {
@@ -1174,6 +1192,31 @@ mod tests {
         assert!(hit(&query, "05-09 21:41:07:788638188  1 2 I T: first"));
         assert!(hit(&query, "05-09 21:41:08:001129178  1 2 I T: last"));
         assert!(!hit(&query, "05-09 21:41:08:001129179  1 2 I T: after"));
+    }
+
+    #[test]
+    fn dot_millisecond_time_range_is_exact() {
+        let query = q(r#"time>="06-17 04:18:19.809" and time<="06-17 04:28:39.571""#);
+        assert!(!hit(&query, "06-17 04:18:19.808  1 2 I T: before"));
+        assert!(hit(&query, "06-17 04:18:19.809  1 2 I T: first"));
+        assert!(hit(&query, "06-17 04:28:39.571  1 2 I T: last"));
+        assert!(!hit(&query, "06-17 04:28:39.572  1 2 I T: after"));
+    }
+
+    #[test]
+    fn month_day_time_range_uses_explicit_year_context() {
+        let base = parse_time_value("2025-06-17 00:00:00", None).unwrap();
+        assert_eq!(base.year(), 2025);
+        let query = Query::parse(
+            r#"time>="06-17 04:18:19.809" and time<="06-17 04:28:39.571""#,
+            CompileOptions {
+                base_date: Some(base),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(hit(&query, "2025-06-17 04:18:19.809  1 2 I T: first"));
+        assert!(!hit(&query, "2024-06-17 04:18:19.809  1 2 I T: wrong year"));
     }
 
     #[test]

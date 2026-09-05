@@ -85,6 +85,20 @@ impl Ts {
     pub const MIN: Ts = Ts(i64::MIN);
     pub const MAX: Ts = Ts(i64::MAX);
 
+    /// Calendar year represented by this timestamp.
+    pub fn year(self) -> i32 {
+        let days = self.0.div_euclid(86_400_000_000_000) + 719_468;
+        let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+        let day_of_era = days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_part = (5 * day_of_year + 2) / 153;
+        let month = month_part + if month_part < 10 { 3 } else { -9 };
+        (year + if month <= 2 { 1 } else { 0 }) as i32
+    }
+
     fn from_parts(
         year: i32,
         mon: u32,
