@@ -32,6 +32,7 @@ use crate::theme;
 const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 32.0;
 const LINE_HEIGHT_PADDING: f32 = 5.0;
+const SEARCH_RESULT_FLASH_DURATION: Duration = Duration::from_millis(1_200);
 
 /// 打开文件的**易错部分**：mmap + 编码探测 + 首屏索引。
 ///
@@ -59,6 +60,9 @@ pub struct LogView {
     search_query: Arc<Query>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
+    search_result_flash: Option<(u64, u64)>,
+    search_result_flash_epoch: u64,
+    search_result_flash_task: Option<Task<()>>,
     /// 每次发起筛选自增。回调里对不上就说明结果已经过期，直接丢弃。
     scan_gen: u64,
     search_scan_gen: u64,
@@ -180,6 +184,9 @@ impl LogView {
             search_query,
             search_matches: None,
             search_scanning: None,
+            search_result_flash: None,
+            search_result_flash_epoch: 0,
+            search_result_flash_task: None,
             scan_gen: 0,
             search_scan_gen: 0,
             dirty: false,
@@ -554,6 +561,26 @@ impl LogView {
         self.selection = None;
         self.selecting = false;
         self.doc.goto_file_line(file_line, ScrollTo::Center);
+        cx.notify();
+    }
+
+    pub fn reveal_search_result(&mut self, file_line: u64, cx: &mut Context<Self>) {
+        self.goto_file_line(file_line, cx);
+        self.search_result_flash_epoch = self.search_result_flash_epoch.wrapping_add(1);
+        let epoch = self.search_result_flash_epoch;
+        self.search_result_flash = Some((file_line, epoch));
+        self.search_result_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SEARCH_RESULT_FLASH_DURATION)
+                .await;
+            this.update(cx, |this, cx| {
+                if this.search_result_flash == Some((file_line, epoch)) {
+                    this.search_result_flash = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -1322,6 +1349,28 @@ impl LogView {
                 )
             })
             .child(input);
+        let line_content = if let Some((_, epoch)) = self
+            .search_result_flash
+            .filter(|(file_line, _)| *file_line == row.file_line)
+        {
+            let flash = palette.search_foreground;
+            line_content
+                .with_animation(
+                    ElementId::NamedInteger("search-result-flash".into(), epoch),
+                    Animation::new(SEARCH_RESULT_FLASH_DURATION),
+                    move |line, phase| {
+                        let fade = if phase < 0.2 {
+                            1.0
+                        } else {
+                            1.0 - (phase - 0.2) / 0.8
+                        };
+                        line.bg(flash.opacity(0.45 * fade.clamp(0.0, 1.0)))
+                    },
+                )
+                .into_any_element()
+        } else {
+            line_content.into_any_element()
+        };
 
         div()
             .id(("log-row", view_row as usize))

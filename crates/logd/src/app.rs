@@ -664,7 +664,7 @@ impl LogdApp {
         }
         self.set_active(tab_index, cx);
         let view = self.tabs[tab_index].view.clone();
-        view.update(cx, |view, cx| view.goto_file_line(file_line, cx));
+        view.update(cx, |view, cx| view.reveal_search_result(file_line, cx));
     }
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
