@@ -1,6 +1,6 @@
 //! Dock panel adapters. Business state remains owned by `LogdApp`.
 
-use std::{rc::Rc, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
 
 use gpui::*;
 use gpui_component::dock::{
@@ -335,6 +335,8 @@ pub struct SearchResultsPanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    collapsed_files: HashSet<PathBuf>,
+    content_width: f32,
     visible: bool,
 }
 
@@ -344,6 +346,8 @@ impl SearchResultsPanel {
             app,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            collapsed_files: HashSet::new(),
+            content_width: 720.0,
             visible: true,
         }
     }
@@ -359,8 +363,30 @@ impl SearchResultsPanel {
         }
     }
 
-    pub fn reset_scroll(&self) {
+    pub fn reset_scroll(&mut self) {
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
+        self.collapsed_files.clear();
+        self.content_width = 720.0;
+    }
+
+    pub(crate) fn toggle_file(&mut self, path: PathBuf, row: usize, cx: &mut Context<Self>) {
+        if !self.collapsed_files.remove(&path) {
+            self.collapsed_files.insert(path);
+        }
+        self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    pub(crate) fn observe_content_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if width > self.content_width {
+            self.content_width = width;
+            cx.notify();
+        }
     }
 }
 
@@ -405,9 +431,20 @@ impl Focusable for SearchResultsPanel {
 
 impl Render for SearchResultsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
         self.app
             .upgrade()
-            .map(|app| LogdApp::render_search_results(&app, &self.scroll, window, cx))
+            .map(|app| {
+                LogdApp::render_search_results(
+                    &app,
+                    &self.scroll,
+                    &self.collapsed_files,
+                    self.content_width,
+                    panel,
+                    window,
+                    cx,
+                )
+            })
             .unwrap_or_else(|| div().into_any_element())
     }
 }

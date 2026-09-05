@@ -893,10 +893,16 @@ impl LogView {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let lh = theme::LINE_HEIGHT;
-        let (dx, dy) = match ev.delta {
+        let (mut dx, mut dy) = match ev.delta {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
             ScrollDelta::Lines(l) => (l.x * lh, l.y * lh * theme::WHEEL_LINES),
         };
+        // Windows already translates Shift+wheel into an X delta. Keep this
+        // fallback for platforms that leave it as a vertical wheel event.
+        if ev.modifiers.shift && dx == 0.0 {
+            dx = dy;
+            dy = 0.0;
+        }
         // gpui 的 dy 是「内容跟随手指」的方向，视口位移要取反
         let vp = self.doc.viewport_mut();
         vp.scroll_by_pixels(-dy);

@@ -4,13 +4,15 @@
 //! tab is rescanned immediately after a filter edit; inactive tabs are marked
 //! dirty until activated. Title-bar searches are temporary and scan every tab.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
@@ -18,7 +20,9 @@ use gpui_component::dock::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
-use gpui_component::{h_flex, v_flex, InteractiveElementExt as _, Root, Selectable as _, Sizable};
+use gpui_component::{
+    h_flex, v_flex, Icon, IconName, InteractiveElementExt as _, Root, Selectable as _, Sizable,
+};
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 
 use crate::i18n::{text, Key, Language};
@@ -38,11 +42,12 @@ struct Tab {
 #[derive(Clone)]
 struct SearchResultFile {
     tab_index: usize,
-    title: String,
+    path: PathBuf,
     full_path: String,
     view: Entity<LogView>,
     lines: Arc<Vec<u64>>,
     start: usize,
+    expanded: bool,
 }
 
 const DOCK_LAYOUT_VERSION: usize = 2;
@@ -1390,13 +1395,21 @@ impl LogdApp {
                     .border_b_1()
                     .border_color(theme::c(theme::BORDER))
                     .child(
-                        Button::new("filter-add")
+                        ButtonGroup::new("filter-toolbar")
+                            .compact()
                             .xsmall()
-                            .label("+")
-                            .tooltip(text(Key::AddFilter, lang))
-                            .on_click(window.listener_for(&add_app, |this, _, window, cx| {
-                                this.begin_add_filter(window, cx)
-                            })),
+                            .outline()
+                            .child(
+                                Button::new("filter-add")
+                                    .icon(IconName::Plus)
+                                    .accessibility_label(text(Key::AddFilter, lang))
+                                    .tooltip(text(Key::AddFilter, lang))
+                                    .on_click(
+                                        window.listener_for(&add_app, |this, _, window, cx| {
+                                            this.begin_add_filter(window, cx)
+                                        }),
+                                    ),
+                            ),
                     )
                     .child(div().flex_1()),
             )
@@ -1410,17 +1423,32 @@ impl LogdApp {
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
                         .child(
-                            Button::new("filter-scope")
+                            ButtonGroup::new("filter-editor-scope")
+                                .compact()
                                 .xsmall()
-                                .label(filter_scope_label(filter_scope, lang))
-                                .tooltip(text(Key::FilterScope, lang))
-                                .on_click(window.listener_for(app, |this, _, _, cx| {
-                                    this.filter_scope = match this.filter_scope {
-                                        FilterScope::AllFiles => FilterScope::CurrentFile,
-                                        FilterScope::CurrentFile => FilterScope::AllFiles,
-                                    };
-                                    cx.notify();
-                                })),
+                                .outline()
+                                .child(
+                                    Button::new("filter-scope")
+                                        .icon(IconName::Globe)
+                                        .selected(filter_scope == FilterScope::AllFiles)
+                                        .accessibility_label(format!(
+                                            "{}: {}",
+                                            text(Key::FilterScope, lang),
+                                            filter_scope_label(filter_scope, lang)
+                                        ))
+                                        .tooltip(format!(
+                                            "{}: {}",
+                                            text(Key::FilterScope, lang),
+                                            filter_scope_label(filter_scope, lang)
+                                        ))
+                                        .on_click(window.listener_for(app, |this, _, _, cx| {
+                                            this.filter_scope = match this.filter_scope {
+                                                FilterScope::AllFiles => FilterScope::CurrentFile,
+                                                FilterScope::CurrentFile => FilterScope::AllFiles,
+                                            };
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -1445,32 +1473,38 @@ impl LogdApp {
                                 ),
                         )
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("filter-editor-cancel")
-                                        .xsmall()
-                                        .label(text(Key::Cancel, lang))
-                                        .on_click(window.listener_for(
-                                            &cancel_app,
-                                            |this, _, _, cx| {
-                                                this.filter_editor_open = false;
-                                                this.editing_filter = None;
-                                                cx.notify();
-                                            },
-                                        )),
-                                )
-                                .child(
-                                    Button::new("filter-editor-save")
-                                        .xsmall()
-                                        .label(text(Key::SaveFilter, lang))
-                                        .on_click(
-                                            window.listener_for(app, |this, _, window, cx| {
-                                                this.commit_filter(window, cx)
-                                            }),
-                                        ),
-                                ),
+                            h_flex().justify_end().child(
+                                ButtonGroup::new("filter-editor-actions")
+                                    .compact()
+                                    .xsmall()
+                                    .outline()
+                                    .child(
+                                        Button::new("filter-editor-cancel")
+                                            .icon(IconName::Close)
+                                            .accessibility_label(text(Key::Cancel, lang))
+                                            .tooltip(text(Key::Cancel, lang))
+                                            .on_click(window.listener_for(
+                                                &cancel_app,
+                                                |this, _, _, cx| {
+                                                    this.filter_editor_open = false;
+                                                    this.editing_filter = None;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("filter-editor-save")
+                                            .icon(IconName::Check)
+                                            .accessibility_label(text(Key::SaveFilter, lang))
+                                            .tooltip(text(Key::SaveFilter, lang))
+                                            .on_click(window.listener_for(
+                                                app,
+                                                |this, _, window, cx| {
+                                                    this.commit_filter(window, cx)
+                                                },
+                                            )),
+                                    ),
+                            ),
                         ),
                 )
             })
@@ -1496,15 +1530,19 @@ impl LogdApp {
 
     pub fn render_search_results(
         app: &Entity<Self>,
-        scroll: &UniformListScrollHandle,
+        vertical_scroll: &UniformListScrollHandle,
+        collapsed_files: &HashSet<PathBuf>,
+        remembered_content_width: f32,
+        panel_handle: WeakEntity<SearchResultsPanel>,
         _window: &mut Window,
         cx: &mut Context<SearchResultsPanel>,
     ) -> AnyElement {
-        let (has_search, files, total, scanning, file_count, lang) = {
+        let (has_search, files, total_matches, tree_rows, scanning, file_count, lang) = {
             let state = app.read(cx);
             let has_search = !state.search_filters.is_empty();
             let mut files = Vec::new();
-            let mut total = 0usize;
+            let mut total_matches = 0usize;
+            let mut tree_rows = 0usize;
             let mut scanning = 0usize;
             for (tab_index, tab) in state.tabs.iter().enumerate() {
                 let view = tab.view.read(cx);
@@ -1520,20 +1558,26 @@ impl LogdApp {
                 if lines.is_empty() {
                     continue;
                 }
+                let expanded = !collapsed_files.contains(&tab.path);
+                let start = tree_rows;
+                tree_rows =
+                    tree_rows.saturating_add(search_tree_file_row_count(lines.len(), expanded));
+                total_matches = total_matches.saturating_add(lines.len());
                 files.push(SearchResultFile {
                     tab_index,
-                    title: tab.title.clone(),
+                    path: tab.path.clone(),
                     full_path: tab.path.display().to_string(),
                     view: tab.view.clone(),
                     lines,
-                    start: total,
+                    start,
+                    expanded,
                 });
-                total = total.saturating_add(files.last().unwrap().lines.len());
             }
             (
                 has_search,
                 Arc::new(files),
-                total,
+                total_matches,
+                tree_rows,
                 scanning,
                 state.tabs.len(),
                 state.language,
@@ -1542,12 +1586,12 @@ impl LogdApp {
 
         let summary = format!(
             "{} {}  |  {} {}",
-            group(total as u64),
+            group(total_matches as u64),
             text(Key::Matches, lang),
             group(files.len() as u64),
             text(Key::Files, lang)
         );
-        let mut panel =
+        let panel =
             v_flex()
                 .size_full()
                 .min_h_0()
@@ -1588,7 +1632,7 @@ impl LogdApp {
                 )
                 .into_any_element();
         }
-        if total == 0 {
+        if total_matches == 0 {
             let message = if scanning > 0 {
                 text(Key::SearchInProgress, lang)
             } else {
@@ -1606,37 +1650,73 @@ impl LogdApp {
                 .into_any_element();
         }
 
-        panel = panel.child(
-            h_flex()
-                .h(px(24.))
-                .flex_none()
-                .bg(theme::c(theme::GUTTER_BG))
-                .border_b_1()
-                .border_color(theme::c(theme::BORDER))
-                .text_color(theme::c(theme::MUTED))
-                .child(div().w(px(190.)).px_2().child(text(Key::Files, lang)))
-                .child(
-                    div()
-                        .w(px(76.))
-                        .px_2()
-                        .text_right()
-                        .child(text(Key::Lines, lang)),
-                )
-                .child(div().flex_1().px_2().child(text(Key::Content, lang))),
-        );
-
         let row_app = app.clone();
+        let row_panel = panel_handle.clone();
+        let path_width = files
+            .iter()
+            .map(|file| estimated_search_text_width(&file.full_path) + 150.0)
+            .fold(0.0, f32::max);
+        let content_width = remembered_content_width.max(path_width).max(720.0);
+        let observed_content_width = content_width;
         let rows = uniform_list(
             "multi-file-search-results",
-            total,
+            tree_rows,
             move |range, window, cx| {
                 let mut elements = Vec::with_capacity(range.len());
+                let mut widest = observed_content_width;
                 for result_index in range {
                     let file_index = files
                         .partition_point(|file| file.start <= result_index)
                         .saturating_sub(1);
                     let file = &files[file_index];
-                    let line_index = result_index - file.start;
+                    if result_index == file.start {
+                        let target_panel = row_panel.clone();
+                        let path = file.path.clone();
+                        let expanded = file.expanded;
+                        let match_count = file.lines.len();
+                        let count = search_file_match_count(match_count, lang);
+                        elements.push(
+                            h_flex()
+                                .id(("search-result-file", result_index))
+                                .h(px(24.))
+                                .w(px(content_width))
+                                .flex_none()
+                                .px_2()
+                                .gap_1()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .bg(theme::c(theme::GUTTER_BG))
+                                .border_b_1()
+                                .border_color(theme::c(theme::BORDER))
+                                .hover(|row| row.bg(theme::c(theme::CONTROL_HOVER)))
+                                .on_click(move |_, _, cx| {
+                                    target_panel
+                                        .update(cx, |panel, cx| {
+                                            panel.toggle_file(path.clone(), result_index, cx)
+                                        })
+                                        .ok();
+                                })
+                                .child(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .xsmall()
+                                    .text_color(theme::c(theme::MUTED)),
+                                )
+                                .child(
+                                    Icon::new(IconName::FileText)
+                                        .xsmall()
+                                        .text_color(theme::c(theme::MUTED)),
+                                )
+                                .child(file.full_path.clone())
+                                .child(div().text_color(theme::c(theme::MUTED)).child(count)),
+                        );
+                        continue;
+                    }
+
+                    let line_index = result_index - file.start - 1;
                     let Some(&file_line) = file.lines.get(line_index) else {
                         continue;
                     };
@@ -1646,13 +1726,14 @@ impl LogdApp {
                         .doc()
                         .line_text(file_line)
                         .unwrap_or_default();
+                    widest = widest.max(estimated_search_text_width(&line_text) + 142.0);
                     let target_app = row_app.clone();
                     let tab_index = file.tab_index;
-                    let tooltip = file.full_path.clone();
                     elements.push(
                         h_flex()
                             .id(("search-result", result_index))
                             .h(px(24.))
+                            .w(px(content_width))
                             .flex_none()
                             .items_center()
                             .border_b_1()
@@ -1663,42 +1744,44 @@ impl LogdApp {
                             }))
                             .child(
                                 div()
-                                    .id(("search-result-file", result_index))
-                                    .w(px(190.))
-                                    .px_2()
-                                    .overflow_hidden()
-                                    .text_ellipsis_middle()
-                                    .child(file.title.clone())
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
-                                            .build(window, cx)
-                                    }),
+                                    .w(px(34.))
+                                    .h_full()
+                                    .flex_none()
+                                    .border_r_1()
+                                    .border_color(theme::c(theme::BORDER)),
                             )
                             .child(
                                 div()
-                                    .w(px(76.))
+                                    .w(px(98.))
+                                    .flex_none()
                                     .px_2()
                                     .text_right()
                                     .text_color(theme::c(theme::MUTED))
-                                    .child(group(file_line + 1)),
+                                    .child(search_line_label(file_line + 1, lang)),
                             )
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .px_2()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
                                     .whitespace_nowrap()
                                     .child(line_text),
                             ),
                     );
                 }
+                if widest > observed_content_width {
+                    row_panel
+                        .update(cx, |panel, cx| panel.observe_content_width(widest, cx))
+                        .ok();
+                }
                 elements
             },
         )
         .size_full()
-        .track_scroll(scroll);
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .track_scroll(vertical_scroll);
+
+        let scrollbar_width = Scrollbar::width();
 
         panel
             .child(
@@ -1706,8 +1789,43 @@ impl LogdApp {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(rows)
-                    .vertical_scrollbar(scroll),
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right(scrollbar_width)
+                            .bottom(scrollbar_width)
+                            .child(rows),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom(scrollbar_width)
+                            .w(scrollbar_width)
+                            .child(
+                                Scrollbar::vertical(vertical_scroll)
+                                    .id("search-results-vscrollbar")
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right(scrollbar_width)
+                            .bottom_0()
+                            .h(scrollbar_width)
+                            .child(
+                                Scrollbar::horizontal(vertical_scroll)
+                                    .id("search-results-hscrollbar")
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -1848,70 +1966,94 @@ fn render_filter_row(
             }),
         )
         .child(
-            Button::new(("filter-enabled", index))
+            Checkbox::new(("filter-enabled", index))
                 .xsmall()
-                .label(if filter.enabled { "[x]" } else { "[ ]" })
-                .on_click(window.listener_for(&enable_app, move |this, _, _, cx| {
-                    this.filters[index].enabled = !this.filters[index].enabled;
-                    this.filters_changed(cx);
-                })),
+                .checked(filter.enabled)
+                .accessibility_label(text(Key::FilterEnabled, lang))
+                .tooltip(text(Key::FilterEnabled, lang))
+                .on_click(
+                    window.listener_for(&enable_app, move |this, checked, _, cx| {
+                        this.filters[index].enabled = *checked;
+                        this.filters_changed(cx);
+                    }),
+                ),
         )
         .child(
-            Button::new(("filter-exclude", index))
+            ButtonGroup::new(("filter-options", index))
+                .compact()
                 .xsmall()
-                .label(if filter.excluding { "-" } else { "+" })
-                .on_click(window.listener_for(&exclude_app, move |this, _, _, cx| {
-                    this.filters[index].excluding = !this.filters[index].excluding;
-                    this.filters_changed(cx);
-                })),
-        )
-        .child(
-            Button::new(("filter-mode", index))
-                .xsmall()
-                .label(match filter.mode {
-                    HighlightMode::Field => "Aa",
-                    HighlightMode::Line => "Ln",
-                })
-                .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
-                    this.filters[index].mode = match this.filters[index].mode {
-                        HighlightMode::Field => HighlightMode::Line,
-                        HighlightMode::Line => HighlightMode::Field,
-                    };
-                    this.filters_changed(cx);
-                })),
-        )
-        .child(
-            Button::new(("filter-regex", index))
-                .xsmall()
-                .label(".*")
-                .selected(filter.regex)
-                .on_click(window.listener_for(&regex_app, move |this, _, _, cx| {
-                    this.filters[index].regex = !this.filters[index].regex;
-                    this.filters_changed(cx);
-                })),
-        )
-        .child(
-            Button::new(("filter-case", index))
-                .xsmall()
-                .label("Aa")
-                .selected(filter.case_sensitive)
-                .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
-                    this.filters[index].case_sensitive = !this.filters[index].case_sensitive;
-                    this.filters_changed(cx);
-                })),
-        )
-        .child(
-            Button::new(("filter-scope", index))
-                .xsmall()
-                .label(filter_scope_label(filter.scope, lang))
-                .tooltip(text(Key::FilterScope, lang))
-                .on_click(window.listener_for(&scope_app, move |this, _, _, cx| {
-                    this.filters[index].scope = match this.filters[index].scope {
-                        FilterScope::AllFiles => FilterScope::CurrentFile,
-                        FilterScope::CurrentFile => FilterScope::AllFiles,
-                    };
-                    this.filters_changed(cx);
-                })),
+                .outline()
+                .multiple(true)
+                .child(
+                    Button::new(("filter-exclude", index))
+                        .icon(IconName::Minus)
+                        .selected(filter.excluding)
+                        .accessibility_label(text(Key::FilterExcluding, lang))
+                        .tooltip(text(Key::FilterExcluding, lang))
+                        .on_click(window.listener_for(&exclude_app, move |this, _, _, cx| {
+                            this.filters[index].excluding = !this.filters[index].excluding;
+                            this.filters_changed(cx);
+                        })),
+                )
+                .child(
+                    Button::new(("filter-mode", index))
+                        .icon(IconName::GalleryVerticalEnd)
+                        .selected(filter.mode == HighlightMode::Line)
+                        .accessibility_label(text(Key::FilterHighlightLine, lang))
+                        .tooltip(text(Key::FilterHighlightLine, lang))
+                        .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
+                            this.filters[index].mode = match this.filters[index].mode {
+                                HighlightMode::Field => HighlightMode::Line,
+                                HighlightMode::Line => HighlightMode::Field,
+                            };
+                            this.filters_changed(cx);
+                        })),
+                )
+                .child(
+                    Button::new(("filter-regex", index))
+                        .icon(IconName::Asterisk)
+                        .selected(filter.regex)
+                        .accessibility_label(text(Key::FilterRegex, lang))
+                        .tooltip(text(Key::FilterRegex, lang))
+                        .on_click(window.listener_for(&regex_app, move |this, _, _, cx| {
+                            this.filters[index].regex = !this.filters[index].regex;
+                            this.filters_changed(cx);
+                        })),
+                )
+                .child(
+                    Button::new(("filter-case", index))
+                        .icon(IconName::CaseSensitive)
+                        .selected(filter.case_sensitive)
+                        .accessibility_label(text(Key::FilterCaseSensitive, lang))
+                        .tooltip(text(Key::FilterCaseSensitive, lang))
+                        .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
+                            this.filters[index].case_sensitive =
+                                !this.filters[index].case_sensitive;
+                            this.filters_changed(cx);
+                        })),
+                )
+                .child(
+                    Button::new(("filter-scope", index))
+                        .icon(IconName::Globe)
+                        .selected(filter.scope == FilterScope::AllFiles)
+                        .accessibility_label(format!(
+                            "{}: {}",
+                            text(Key::FilterScope, lang),
+                            filter_scope_label(filter.scope, lang)
+                        ))
+                        .tooltip(format!(
+                            "{}: {}",
+                            text(Key::FilterScope, lang),
+                            filter_scope_label(filter.scope, lang)
+                        ))
+                        .on_click(window.listener_for(&scope_app, move |this, _, _, cx| {
+                            this.filters[index].scope = match this.filters[index].scope {
+                                FilterScope::AllFiles => FilterScope::CurrentFile,
+                                FilterScope::CurrentFile => FilterScope::AllFiles,
+                            };
+                            this.filters_changed(cx);
+                        })),
+                ),
         )
         .child(v_flex().min_w_0().flex_1().child(filter.text.clone()).when(
             !filter.description.is_empty(),
@@ -1960,6 +2102,32 @@ fn set_picker_color(
 
 fn hsla_to_rgb(color: Hsla) -> u32 {
     u32::from(color.to_rgb()) >> 8
+}
+
+fn estimated_search_text_width(value: &str) -> f32 {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii() { 0.62 } else { 1.0 })
+        .sum::<f32>()
+        * 12.0
+}
+
+fn search_tree_file_row_count(matches: usize, expanded: bool) -> usize {
+    1usize.saturating_add(if expanded { matches } else { 0 })
+}
+
+fn search_file_match_count(count: usize, lang: Language) -> String {
+    match lang {
+        Language::ZhCn => format!("（匹配 {} 次）", group(count as u64)),
+        Language::EnUs => format!("({} matches)", group(count as u64)),
+    }
+}
+
+fn search_line_label(line: u64, lang: Language) -> String {
+    match lang {
+        Language::ZhCn => format!("行 {}:", group(line)),
+        Language::EnUs => format!("Ln {}:", group(line)),
+    }
 }
 
 fn group(number: u64) -> String {
@@ -2014,7 +2182,7 @@ pub fn run(initial: Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{group, split_search_keywords};
+    use super::{group, search_tree_file_row_count, split_search_keywords};
 
     #[test]
     fn groups_thousands() {
@@ -2031,5 +2199,11 @@ mod tests {
             vec!["first", "second", "third"]
         );
         assert!(split_search_keywords(" | ").is_empty());
+    }
+
+    #[test]
+    fn collapsed_search_file_keeps_only_its_header_row() {
+        assert_eq!(search_tree_file_row_count(1_314, true), 1_315);
+        assert_eq!(search_tree_file_row_count(1_314, false), 1);
     }
 }
