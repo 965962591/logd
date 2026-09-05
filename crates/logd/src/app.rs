@@ -96,6 +96,7 @@ pub struct LogdApp {
     /// Temporary title-bar search terms. They are applied to every tab but
     /// are intentionally kept out of the persisted/configured filter list.
     search_filters: Vec<FilterSpec>,
+    search_query: String,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
@@ -227,9 +228,10 @@ impl LogdApp {
             active: 0,
             filters: Vec::new(),
             search_filters: Vec::new(),
+            search_query: String::new(),
             show_only_filtered: false,
             tat_path: None,
-            recent_files: Vec::new(),
+            recent_files: crate::settings::load_recent_files(),
             keyword,
             filter_text,
             filter_description,
@@ -348,6 +350,7 @@ impl LogdApp {
         self.recent_files.retain(|item| item != path);
         self.recent_files.insert(0, path.to_path_buf());
         self.recent_files.truncate(10);
+        let _ = crate::settings::save_recent_files(&self.recent_files);
     }
 
     fn open_log(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -409,8 +412,8 @@ impl LogdApp {
     }
 
     fn apply_search_to_view(&self, view: &Entity<LogView>, cx: &mut App) {
-        let filters = self.search_filters.clone();
-        view.update(cx, |view, cx| view.apply_search(filters, cx));
+        let query = self.search_query.clone();
+        view.update(cx, |view, cx| view.apply_search(query, cx));
     }
 
     fn observe_log_view(&self, view: &Entity<LogView>, cx: &mut Context<Self>) {
@@ -647,7 +650,10 @@ impl LogdApp {
     }
 
     fn set_global_search(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_filters = split_search_keywords(&value)
+        let expression = parse_search_expression(&value);
+        self.search_query = expression.query;
+        self.search_filters = expression
+            .keywords
             .into_iter()
             .map(|keyword| FilterSpec {
                 text: keyword,
@@ -697,6 +703,27 @@ impl LogdApp {
             .update(cx, |picker, cx| picker.clear_value(window, cx));
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
         self.show_filter_panel(true, window, cx);
+    }
+
+    fn begin_add_filter_from_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(value) = self
+            .active_view()
+            .and_then(|view| view.read(cx).selected_text(cx))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        self.begin_add_filter(window, cx);
+        self.filter_text
+            .update(cx, |state, cx| state.set_value(value, window, cx));
+    }
+
+    fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.keyword.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.keyword
+            .update(cx, |state, cx| state.select_all(window, cx));
     }
 
     fn begin_edit_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -775,10 +802,13 @@ impl LogdApp {
         self.filters_changed(cx);
     }
 
-    fn set_show_only(&mut self, only: bool, cx: &mut Context<Self>) {
+    fn set_show_only(&mut self, only: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.show_only_filtered = only;
         if let Some(view) = self.active_view().cloned() {
-            view.update(cx, |view, cx| view.set_show_only_filtered(only, cx));
+            let pointer_y = f32::from(window.mouse_position().y);
+            view.update(cx, |view, cx| {
+                view.set_show_only_filtered_at_pointer(only, pointer_y, cx)
+            });
         }
         cx.notify();
     }
@@ -791,9 +821,9 @@ impl LogdApp {
             return;
         }
         let filters = self.filters_for_tab(self.active);
-        let search_filters = self.search_filters.clone();
+        let search_query = self.search_query.clone();
         view.update(cx, |view, cx| {
-            view.set_encoding(encoding, filters, search_filters, cx)
+            view.set_encoding(encoding, filters, search_query, cx)
         });
         cx.notify();
     }
@@ -892,8 +922,8 @@ impl LogdApp {
                     view.update(cx, |view, cx| view.copy_selection(cx));
                 }
             }
-            MenuCommand::ShowAll => self.set_show_only(false, cx),
-            MenuCommand::ShowOnlyFiltered => self.set_show_only(true, cx),
+            MenuCommand::ShowAll => self.set_show_only(false, window, cx),
+            MenuCommand::ShowOnlyFiltered => self.set_show_only(true, window, cx),
             MenuCommand::ToggleFilters => {
                 let visible = self.filter_panel.read(cx).visible();
                 self.show_filter_panel(!visible, window, cx)
@@ -914,19 +944,33 @@ impl LogdApp {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !crate::platform::primary_modifier(&event.keystroke.modifiers) {
+        let modifiers = &event.keystroke.modifiers;
+        if !crate::platform::primary_modifier(modifiers) || modifiers.alt || modifiers.function {
             return;
         }
-        match event.keystroke.key.as_str() {
-            "o" => self.dispatch(MenuCommand::Open, window, cx),
-            "r" => self.dispatch(MenuCommand::Refresh, window, cx),
-            "s" => self.dispatch(MenuCommand::SaveFilters, window, cx),
-            "tab" if !self.tabs.is_empty() => {
-                self.set_active((self.active + 1) % self.tabs.len(), cx)
+        let shift = modifiers.shift;
+        match (event.keystroke.key.as_str(), shift) {
+            ("o", false) => self.dispatch(MenuCommand::Open, window, cx),
+            ("r", false) => self.dispatch(MenuCommand::Refresh, window, cx),
+            ("s", false) => self.dispatch(MenuCommand::SaveFilters, window, cx),
+            ("s", true) => self.dispatch(MenuCommand::SaveEditedCopy, window, cx),
+            ("f", false) => self.focus_search(window, cx),
+            ("f", true) => self.begin_add_filter_from_selection(window, cx),
+            ("n", false) => self.begin_add_filter(window, cx),
+            ("e", false) => self.begin_edit_filter(window, cx),
+            ("b", false) => self.dispatch(MenuCommand::ToggleFilters, window, cx),
+            ("b", true) => self.dispatch(MenuCommand::ToggleSearchResults, window, cx),
+            ("l", true) => self.set_show_only(!self.show_only_filtered, window, cx),
+            ("tab", false) if !self.tabs.is_empty() => {
+                self.set_active((self.active + 1) % self.tabs.len(), cx);
             }
-            "w" => self.close_tab(self.active, cx),
-            _ => {}
+            ("tab", true) if !self.tabs.is_empty() => {
+                self.set_active((self.active + self.tabs.len() - 1) % self.tabs.len(), cx);
+            }
+            ("w", false) => self.close_tab(self.active, cx),
+            _ => return,
         }
+        cx.stop_propagation();
     }
 
     fn menu_button(
@@ -2296,13 +2340,47 @@ fn group(number: u64) -> String {
     output
 }
 
-fn split_search_keywords(value: &str) -> Vec<String> {
-    value
+#[derive(Debug, PartialEq, Eq)]
+struct SearchExpression {
+    keywords: Vec<String>,
+    query: String,
+}
+
+fn parse_search_expression(value: &str) -> SearchExpression {
+    let groups = value
         .split('|')
-        .map(str::trim)
-        .filter(|keyword| !keyword.is_empty())
-        .map(str::to_owned)
-        .collect()
+        .map(|group| {
+            group
+                .split('&')
+                .map(str::trim)
+                .filter(|keyword| !keyword.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| !group.is_empty())
+        .collect::<Vec<_>>();
+    let keywords = groups.iter().flatten().cloned().collect();
+    let query = groups
+        .iter()
+        .map(|group| {
+            let terms = group
+                .iter()
+                .map(|keyword| quote_query_literal(keyword))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            if group.len() > 1 {
+                format!("({terms})")
+            } else {
+                terms
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" or ");
+    SearchExpression { keywords, query }
+}
+
+fn quote_query_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn filter_scope_label(scope: FilterScope, lang: Language) -> &'static str {
@@ -2336,7 +2414,7 @@ pub fn run(initial: Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{group, search_tree_file_row_count, split_search_keywords};
+    use super::{group, parse_search_expression, search_tree_file_row_count, SearchExpression};
 
     #[test]
     fn groups_thousands() {
@@ -2347,12 +2425,29 @@ mod tests {
     }
 
     #[test]
-    fn splits_search_keywords_on_pipe() {
+    fn parses_and_or_search_expression() {
         assert_eq!(
-            split_search_keywords("  first | second|| third |  "),
-            vec!["first", "second", "third"]
+            parse_search_expression("  first & second | third||  "),
+            SearchExpression {
+                keywords: vec!["first".into(), "second".into(), "third".into()],
+                query: "(\"first\" and \"second\") or \"third\"".into(),
+            }
         );
-        assert!(split_search_keywords(" | ").is_empty());
+        assert_eq!(
+            parse_search_expression(" | "),
+            SearchExpression {
+                keywords: Vec::new(),
+                query: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn search_expression_quotes_literal_query_syntax() {
+        assert_eq!(
+            parse_search_expression(r#"say "hi" & C:\logs"#).query,
+            r#"("say \"hi\"" and "C:\\logs")"#
+        );
     }
 
     #[test]

@@ -21,3 +21,6 @@ parking_lot.workspace = true
 rayon.workspace = true
 dirs.workspace = true
 serde_json.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.11"

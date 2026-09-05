@@ -128,10 +128,10 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::ImportFilters, Language::ZhCn) => "导入 .tat 过滤器",
         (Key::ImportFilters, Language::EnUs) => "Import .tat Filters",
         (Key::SearchPlaceholder, Language::ZhCn) => {
-            "搜索所有已导入文件（关键字用 | 分隔），回车搜索"
+            "搜索所有已导入文件（& 同时满足，| 任一满足），回车搜索"
         }
         (Key::SearchPlaceholder, Language::EnUs) => {
-            "Search all imported files (use | between keywords), press Enter"
+            "Search all imported files (& means AND, | means OR), press Enter"
         }
         (Key::FilterTextPlaceholder, Language::ZhCn) => "过滤关键字（必填）",
         (Key::FilterTextPlaceholder, Language::EnUs) => "Filter keyword (required)",

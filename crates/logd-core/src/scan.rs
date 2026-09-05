@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use crate::index::{ChunkIndex, LineIndex};
 use crate::matcher::MatcherSet;
 use crate::progress::Progress;
+use crate::query::{Query, QueryScratch};
 
 /// 多少行检查一次取消信号。
 const CANCEL_CHECK_LINES: u64 = 4096;
@@ -47,10 +48,58 @@ pub fn scan_all(
         return Some(ScanOutcome::AllVisible);
     }
 
+    scan_matching(data, index, progress, |line, _| matcher.is_visible(line))
+}
+
+/// Scan all lines with a compiled boolean query. Returns `None` when cancelled.
+pub fn scan_query_all(
+    data: &[u8],
+    index: &LineIndex,
+    query: &Query,
+    progress: &Progress,
+) -> Option<ScanOutcome> {
+    progress.set_total(index.indexed_bytes.max(1));
+
+    if query.is_empty() {
+        progress.add(index.indexed_bytes);
+        return Some(ScanOutcome::AllVisible);
+    }
+
+    scan_matching(data, index, progress, |line, scratch| {
+        query.matches(line, scratch)
+    })
+}
+
+/// Apply the configured filter set and a temporary search query together.
+pub fn scan_all_with_query(
+    data: &[u8],
+    index: &LineIndex,
+    matcher: &MatcherSet,
+    query: &Query,
+    progress: &Progress,
+) -> Option<ScanOutcome> {
+    progress.set_total(index.indexed_bytes.max(1));
+
+    if matcher.is_noop() && query.is_empty() {
+        progress.add(index.indexed_bytes);
+        return Some(ScanOutcome::AllVisible);
+    }
+
+    scan_matching(data, index, progress, |line, scratch| {
+        matcher.is_visible(line) && query.matches(line, scratch)
+    })
+}
+
+fn scan_matching(
+    data: &[u8],
+    index: &LineIndex,
+    progress: &Progress,
+    predicate: impl Fn(&[u8], &mut QueryScratch) -> bool + Sync,
+) -> Option<ScanOutcome> {
     let parts: Vec<Vec<u64>> = index
         .chunks
         .par_iter()
-        .map(|c| scan_chunk(data, c, matcher, progress))
+        .map(|chunk| scan_chunk(data, chunk, progress, &predicate))
         .collect();
 
     if progress.is_cancelled() {
@@ -68,12 +117,13 @@ pub fn scan_all(
 fn scan_chunk(
     data: &[u8],
     c: &ChunkIndex,
-    matcher: &MatcherSet,
     progress: &Progress,
+    predicate: &(impl Fn(&[u8], &mut QueryScratch) -> bool + Sync),
 ) -> Vec<u64> {
     let end = (c.end_byte as usize).min(data.len());
     let mut pos = c.start_byte as usize;
     let mut out = Vec::new();
+    let mut scratch = QueryScratch::default();
 
     for i in 0..c.line_count {
         if pos >= end {
@@ -88,7 +138,7 @@ fn scan_chunk(
         if e > pos && data[e - 1] == b'\r' {
             e -= 1;
         }
-        if matcher.is_visible(&data[pos..e]) {
+        if predicate(&data[pos..e], &mut scratch) {
             out.push(c.start_line + i);
         }
         pos = next;
@@ -106,6 +156,7 @@ fn scan_chunk(
 mod tests {
     use super::*;
     use crate::matcher::FilterSpec;
+    use crate::query::{CompileOptions, Query};
     use crate::source::Encoding;
 
     fn build(text: &str) -> (Vec<u8>, LineIndex) {
@@ -229,5 +280,44 @@ mod tests {
             panic!()
         };
         assert_eq!(v, vec![0]);
+    }
+
+    #[test]
+    fn boolean_query_requires_all_and_terms() {
+        let (data, idx) = build("alpha beta\nalpha\nbeta gamma\ngamma\n");
+        let query = Query::parse(
+            "\"alpha\" and \"beta\" or \"gamma\"",
+            CompileOptions::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Matched(lines) =
+            scan_query_all(&data, &idx, &query, &Progress::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(lines, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn configured_excludes_still_apply_to_boolean_search() {
+        let (data, idx) = build("alpha beta\nalpha beta noise\nalpha\n");
+        let matcher = matcher(vec![
+            FilterSpec {
+                text: "alpha".into(),
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "noise".into(),
+                excluding: true,
+                ..Default::default()
+            },
+        ]);
+        let query = Query::parse("\"alpha\" and \"beta\"", CompileOptions::default()).unwrap();
+        let ScanOutcome::Matched(lines) =
+            scan_all_with_query(&data, &idx, &matcher, &query, &Progress::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(lines, vec![0]);
     }
 }

@@ -5,6 +5,8 @@ use gpui_component::dock::{DockAreaState, DockPlacement};
 
 const FILTER_PLACEMENT_KEY: &str = "filter_placement";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
+const RECENT_FILES_FILE: &str = "recent-files.json";
+const MAX_RECENT_FILES: usize = 10;
 
 pub fn load_filter_placement() -> DockPlacement {
     settings_path()
@@ -29,12 +31,34 @@ pub fn save_dock_layout(state: &DockAreaState) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
+pub fn load_recent_files() -> Vec<PathBuf> {
+    recent_files_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|contents| parse_recent_files(&contents))
+        .unwrap_or_default()
+}
+
+pub fn save_recent_files(paths: &[PathBuf]) -> io::Result<()> {
+    let path = recent_files_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "local data directory not found"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(paths)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    std::fs::write(path, contents)
+}
+
 fn settings_path() -> Option<PathBuf> {
     app_data_dir().map(|path| path.join("settings.conf"))
 }
 
 fn dock_layout_path() -> Option<PathBuf> {
     app_data_dir().map(|path| path.join(DOCK_LAYOUT_FILE))
+}
+
+fn recent_files_path() -> Option<PathBuf> {
+    app_data_dir().map(|path| path.join(RECENT_FILES_FILE))
 }
 
 fn app_data_dir() -> Option<PathBuf> {
@@ -54,6 +78,21 @@ fn parse_filter_placement(contents: &str) -> Option<DockPlacement> {
             _ => None,
         }
     })
+}
+
+fn parse_recent_files(contents: &str) -> Vec<PathBuf> {
+    let mut paths = serde_json::from_str::<Vec<PathBuf>>(contents).unwrap_or_default();
+    paths.retain(|path| !path.as_os_str().is_empty());
+    let mut unique = Vec::with_capacity(paths.len().min(MAX_RECENT_FILES));
+    for path in paths {
+        if !unique.contains(&path) {
+            unique.push(path);
+            if unique.len() == MAX_RECENT_FILES {
+                break;
+            }
+        }
+    }
+    unique
 }
 
 #[cfg(test)]
@@ -88,5 +127,26 @@ mod tests {
         let restored: DockAreaState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn recent_files_round_trip_and_are_normalized() {
+        let paths = parse_recent_files(
+            r#"["C:\\logs\\first.log", "", "C:\\logs\\first.log", "D:\\second.log"]"#,
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\logs\first.log"),
+                PathBuf::from(r"D:\second.log")
+            ]
+        );
+        let json = serde_json::to_string(&paths).unwrap();
+        assert_eq!(parse_recent_files(&json), paths);
+    }
+
+    #[test]
+    fn invalid_recent_files_json_is_ignored() {
+        assert!(parse_recent_files("not json").is_empty());
     }
 }

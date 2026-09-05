@@ -82,8 +82,12 @@ impl Viewport {
     }
 
     pub fn set_line_height(&mut self, h: f32) {
+        let old_height = self.line_height.max(1.0);
+        let row_fraction = self.pixel_offset / old_height;
         self.line_height = h.max(1.0);
-        self.pixel_offset = self.pixel_offset.min(self.line_height - 0.001).max(0.0);
+        self.pixel_offset = (row_fraction * self.line_height)
+            .min(self.line_height - 0.001)
+            .max(0.0);
         self.clamp();
     }
 
@@ -530,6 +534,15 @@ mod tests {
         // 内容变窄后要收回来
         v.set_max_h_scroll(300.0);
         assert_eq!(v.h_scroll(), 300.0);
+    }
+
+    #[test]
+    fn changing_line_height_preserves_fractional_row_offset() {
+        let mut v = huge();
+        v.scroll_by_pixels(9.0);
+        v.set_line_height(28.0);
+        assert_eq!(v.anchor_line(), 0);
+        assert!((v.pixel_offset() - 14.0).abs() < 0.001);
     }
 
     #[test]

@@ -22,11 +22,16 @@ use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
-    cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
-    MatcherSet, Progress, RenderRow, ScanOutcome, ScrollTo,
+    cache, index::HEAD_BYTES, scan_all, scan_all_with_query, scan_query_all, CompileOptions,
+    Document, Encoding, FileSource, FilterSpec, LineIndex, MatcherSet, Progress, Query, RenderRow,
+    ScanOutcome, ScrollTo,
 };
 
 use crate::theme;
+
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 32.0;
+const LINE_HEIGHT_PADDING: f32 = 5.0;
 
 /// 打开文件的**易错部分**：mmap + 编码探测 + 首屏索引。
 ///
@@ -50,7 +55,7 @@ pub struct LogView {
     h_drag_grab: Option<f32>,
     indexing: Option<Arc<Progress>>,
     scanning: Option<Arc<Progress>>,
-    search_matcher: Arc<MatcherSet>,
+    search_query: Arc<Query>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
     /// 每次发起筛选自增。回调里对不上就说明结果已经过期，直接丢弃。
@@ -76,6 +81,8 @@ pub struct LogView {
     line_inputs: BTreeMap<u64, Entity<InputState>>,
     active_input_line: Option<u64>,
     editing_changed: bool,
+    font_size: f32,
+    line_height: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -158,10 +165,7 @@ impl LogView {
 
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let complete = loaded.index.complete;
-        let search_matcher = Arc::new(
-            MatcherSet::new(Vec::new(), loaded.source.encoding())
-                .expect("an empty search matcher is always valid"),
-        );
+        let search_query = Arc::new(Query::always_true());
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
@@ -171,7 +175,7 @@ impl LogView {
             h_drag_grab: None,
             indexing: None,
             scanning: None,
-            search_matcher,
+            search_query,
             search_matches: None,
             search_scanning: None,
             scan_gen: 0,
@@ -190,6 +194,8 @@ impl LogView {
             line_inputs: BTreeMap::new(),
             active_input_line: None,
             editing_changed: false,
+            font_size: theme::FONT_SIZE,
+            line_height: theme::LINE_HEIGHT,
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -257,7 +263,7 @@ impl LogView {
                     if !this.doc.matcher().is_noop() {
                         this.start_scan(cx);
                     }
-                    if !this.search_matcher.is_noop() {
+                    if !this.search_query.is_empty() {
                         this.start_search_scan(cx);
                     }
                 }
@@ -333,23 +339,79 @@ impl LogView {
         cx.notify();
     }
 
+    pub fn set_show_only_filtered_at_pointer(
+        &mut self,
+        on: bool,
+        pointer_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.doc.show_only_filtered() || on {
+            self.set_show_only_filtered(on, cx);
+            return;
+        }
+
+        let anchor = self.doc.viewport().anchor_line();
+        let pixel_offset = self.doc.viewport().pixel_offset();
+        let row_to_anchor = |row| {
+            self.doc
+                .row_to_file_line(row)
+                .map(|file_line| (file_line, row.saturating_sub(anchor)))
+        };
+        let pointer_line = self
+            .row_at_y(pointer_y)
+            .and_then(row_to_anchor)
+            .or_else(|| {
+                self.active_input_line
+                    .filter(|file_line| self.line_inputs.contains_key(file_line))
+                    .map(|file_line| {
+                        let row = self.doc.file_line_to_row(file_line);
+                        (file_line, row.saturating_sub(anchor))
+                    })
+            })
+            .or_else(|| {
+                self.selection
+                    .and_then(|selection| row_to_anchor(selection.active_row))
+            });
+
+        self.clear_text_selection(cx);
+        self.selection = None;
+        self.selecting = false;
+        self.doc.set_show_only_filtered(on);
+        if let Some((file_line, row_offset)) = pointer_line {
+            let new_row = self.doc.file_line_to_row(file_line);
+            let new_anchor = new_row.saturating_sub(row_offset);
+            let viewport = self.doc.viewport_mut();
+            viewport.scroll_to_line(new_anchor, ScrollTo::Top);
+            viewport.scroll_by_pixels(pixel_offset);
+        }
+        cx.notify();
+    }
+
     pub fn set_encoding(
         &mut self,
         enc: Encoding,
         filters: Vec<FilterSpec>,
-        search_filters: Vec<FilterSpec>,
+        search_query: String,
         cx: &mut Context<Self>,
     ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
         self.apply_filters(filters, cx);
-        self.apply_search(search_filters, cx);
+        self.apply_search(search_query, cx);
     }
 
-    pub fn apply_search(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
-        match MatcherSet::new(filters, self.doc.encoding()) {
-            Ok(matcher) => {
-                self.search_matcher = Arc::new(matcher);
+    pub fn apply_search(&mut self, query_source: String, cx: &mut Context<Self>) {
+        let query = Query::parse(
+            &query_source,
+            CompileOptions {
+                encoding: Some(self.doc.encoding()),
+                ..Default::default()
+            },
+        );
+        match query {
+            Ok(query) => {
+                self.search_query = Arc::new(query);
+                self.start_scan(cx);
                 self.start_search_scan(cx);
             }
             Err(error) => {
@@ -364,7 +426,7 @@ impl LogView {
         if let Some(p) = self.scanning.take() {
             p.cancel();
         }
-        if self.doc.matcher().is_noop() {
+        if self.doc.matcher().is_noop() && self.search_query.is_empty() {
             self.doc.set_matches(None);
             cx.notify();
             return;
@@ -375,13 +437,20 @@ impl LogView {
         let source = self.doc.source().clone();
         let index = self.doc.index().clone();
         let matcher = self.doc.matcher().clone();
+        let query = self.search_query.clone();
         let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
         self.scanning = Some(progress.clone());
 
         cx.spawn(async move |this, cx| {
             let out = cx
                 .background_executor()
-                .spawn(async move { scan_all(source.data(), &index, &matcher, &progress) })
+                .spawn(async move {
+                    if query.is_empty() {
+                        scan_all(source.data(), &index, &matcher, &progress)
+                    } else {
+                        scan_all_with_query(source.data(), &index, &matcher, &query, &progress)
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 // 结果过期了（用户又改了过滤器）就丢掉
@@ -410,21 +479,21 @@ impl LogView {
         self.search_matches = None;
         self.search_scan_gen += 1;
         let generation = self.search_scan_gen;
-        if self.search_matcher.is_noop() {
+        if self.search_query.is_empty() {
             cx.notify();
             return;
         }
 
         let source = self.doc.source().clone();
         let index = self.doc.index().clone();
-        let matcher = self.search_matcher.clone();
+        let query = self.search_query.clone();
         let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
         self.search_scanning = Some(progress.clone());
 
         cx.spawn(async move |this, cx| {
             let out = cx
                 .background_executor()
-                .spawn(async move { scan_all(source.data(), &index, &matcher, &progress) })
+                .spawn(async move { scan_query_all(source.data(), &index, &query, &progress) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.search_scan_gen != generation {
@@ -457,7 +526,7 @@ impl LogView {
 
     // ---- 输入 ----
 
-    pub fn copy_selection(&self, cx: &mut App) {
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
         if let Some(selection) = self
             .text_selection
             .filter(|selection| !selection.is_empty())
@@ -482,8 +551,7 @@ impl LogView {
                 }
                 output.push_str(&text[range]);
             }
-            cx.write_to_clipboard(output.into());
-            return;
+            return (!output.is_empty()).then_some(output);
         }
 
         if let Some(input) = self
@@ -493,13 +561,12 @@ impl LogView {
             let input = input.read(cx);
             let range = input.selected_range();
             if !range.is_empty() {
-                cx.write_to_clipboard(input.selected_value().to_string().into());
-                return;
+                return Some(input.selected_value().to_string());
             }
         }
 
         let Some(selection) = self.selection else {
-            return;
+            return None;
         };
         let mut output = String::new();
         for row in selection.range() {
@@ -515,7 +582,11 @@ impl LogView {
                 output.push_str(&text);
             }
         }
-        if !output.is_empty() {
+        (!output.is_empty()).then_some(output)
+    }
+
+    pub fn copy_selection(&self, cx: &mut App) {
+        if let Some(output) = self.selected_text(cx) {
             cx.write_to_clipboard(output.into());
         }
     }
@@ -629,7 +700,7 @@ impl LogView {
                     + self.doc.viewport().h_scroll();
             window
                 .text_system()
-                .shape_line(text, px(theme::FONT_SIZE), &[run], None)
+                .shape_line(text, px(self.font_size), &[run], None)
                 .closest_index_for_x(px(local_x))
         };
         let Some(selection) = &mut self.text_selection else {
@@ -872,7 +943,7 @@ impl LogView {
         if local < 0. || local > f32::from(area.size.height) {
             return None;
         }
-        let visible_offset = ((local + self.doc.viewport().pixel_offset()) / theme::LINE_HEIGHT)
+        let visible_offset = ((local + self.doc.viewport().pixel_offset()) / self.line_height)
             .floor()
             .max(0.) as u64;
         let row = self.doc.viewport().anchor_line() + visible_offset;
@@ -892,11 +963,24 @@ impl LogView {
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let lh = theme::LINE_HEIGHT;
+        let lh = self.line_height;
         let (mut dx, mut dy) = match ev.delta {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
             ScrollDelta::Lines(l) => (l.x * lh, l.y * lh * theme::WHEEL_LINES),
         };
+        if crate::platform::primary_modifier(&ev.modifiers) {
+            let step = if dy > 0.0 {
+                1.0
+            } else if dy < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            if step != 0.0 {
+                self.set_font_size(self.font_size + step, cx);
+            }
+            return;
+        }
         // Windows already translates Shift+wheel into an X delta. Keep this
         // fallback for platforms that leave it as a vertical wheel event.
         if ev.modifiers.shift && dx == 0.0 {
@@ -912,6 +996,18 @@ impl LogView {
         cx.notify();
     }
 
+    fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_size = size;
+        self.line_height = size + LINE_HEIGHT_PADDING;
+        self.doc.viewport_mut().set_line_height(self.line_height);
+        self.max_line_width = 0.0;
+        cx.notify();
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let primary = crate::platform::primary_modifier(&ks.modifiers);
@@ -920,6 +1016,11 @@ impl LogView {
             .and_then(|file_line| self.line_inputs.get(&file_line))
             .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(_window));
         if input_focused {
+            if primary && ks.modifiers.shift && ks.key == "f" {
+                // Let the app-level "selection to filter" shortcut inspect
+                // the selection before ordinary input handling clears it.
+                return;
+            }
             if primary
                 && ks.key == "c"
                 && self
@@ -1094,7 +1195,7 @@ impl LogView {
                 let shaped =
                     window
                         .text_system()
-                        .shape_line(text, px(theme::FONT_SIZE), &[run], None);
+                        .shape_line(text, px(self.font_size), &[run], None);
                 let start_x = f32::from(shaped.x_for_index(range.start));
                 let end_x = f32::from(shaped.x_for_index(range.end));
                 Some((8.0 + start_x - h_scroll, (end_x - start_x).max(1.0)))
@@ -1143,8 +1244,8 @@ impl LogView {
             .focus_bordered(false)
             .readonly(!is_editing)
             .px_0()
-            .text_size(px(theme::FONT_SIZE))
-            .line_height(px(theme::LINE_HEIGHT));
+            .text_size(px(self.font_size))
+            .line_height(px(self.line_height));
         input.style().size.height = Some(relative(1.).into());
         let input = if is_editing {
             input
@@ -1193,12 +1294,15 @@ impl LogView {
             .id(("log-row", view_row as usize))
             .flex()
             .flex_row()
-            .h(px(theme::LINE_HEIGHT))
+            .h(px(self.line_height))
             .w_full()
             .min_w_0()
             .overflow_hidden()
             .when_some(line_spec.and_then(|f| f.back), |el, c| el.bg(theme::c(c)))
-            .when(selected, |el| el.bg(theme::c(theme::SELECTION)))
+            .when(
+                selected && line_spec.and_then(|filter| filter.back).is_none(),
+                |el| el.bg(theme::c(theme::SELECTION)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1235,7 +1339,7 @@ impl LogView {
     /// 行号槽宽度按总行数的位数算，别让它随滚动跳来跳去。
     fn gutter_width(&self) -> f32 {
         let digits = (self.doc.total_file_lines().max(1) as f64).log10().floor() as usize + 1;
-        (digits.max(4) as f32) * (theme::FONT_SIZE * 0.62) + 20.0
+        (digits.max(4) as f32) * (self.font_size * 0.62) + 20.0
     }
 }
 
@@ -1305,7 +1409,7 @@ impl Render for LogView {
                 text.chars()
                     .map(|ch| if ch.is_ascii() { 0.62 } else { 1.0 })
                     .sum::<f32>()
-                    * theme::FONT_SIZE
+                    * self.font_size
             })
             .fold(0.0, f32::max);
         // Rendered text has the same left padding as `line_content` below.
@@ -1375,8 +1479,8 @@ impl Render for LogView {
             .bg(theme::c(theme::BG))
             .text_color(theme::c(theme::FG))
             .font_family(theme::MONO)
-            .text_size(px(theme::FONT_SIZE))
-            .line_height(px(theme::LINE_HEIGHT))
+            .text_size(px(self.font_size))
+            .line_height(px(self.line_height))
             .capture_action(cx.listener(|this, _: &Copy, _window, cx| {
                 if this
                     .text_selection
