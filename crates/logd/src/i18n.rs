@@ -52,6 +52,9 @@ pub enum Key {
     DontSave,
     ImportFilters,
     SearchPlaceholder,
+    SearchHistory,
+    NoSearchHistory,
+    ClearSearchHistory,
     FilterTextPlaceholder,
     FilterDescriptionPlaceholder,
     ForegroundColor,
@@ -146,6 +149,12 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::SearchPlaceholder, Language::EnUs) => {
             "Search all imported files (& means AND, | means OR), press Enter"
         }
+        (Key::SearchHistory, Language::ZhCn) => "搜索历史",
+        (Key::SearchHistory, Language::EnUs) => "Search history",
+        (Key::NoSearchHistory, Language::ZhCn) => "暂无搜索历史",
+        (Key::NoSearchHistory, Language::EnUs) => "No search history",
+        (Key::ClearSearchHistory, Language::ZhCn) => "清空搜索历史",
+        (Key::ClearSearchHistory, Language::EnUs) => "Clear search history",
         (Key::FilterTextPlaceholder, Language::ZhCn) => "过滤关键字（必填）",
         (Key::FilterTextPlaceholder, Language::EnUs) => "Filter keyword (required)",
         (Key::FilterDescriptionPlaceholder, Language::ZhCn) => "描述（可选）",

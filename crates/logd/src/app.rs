@@ -105,6 +105,7 @@ pub struct LogdApp {
     filters_dirty: bool,
     filter_save_prompt_open: bool,
     recent_files: Vec<PathBuf>,
+    search_history: Vec<String>,
     keyword: Entity<InputState>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
@@ -245,6 +246,7 @@ impl LogdApp {
             filters_dirty: false,
             filter_save_prompt_open: false,
             recent_files: crate::settings::load_recent_files(),
+            search_history: crate::settings::load_search_history(),
             keyword,
             filter_text,
             filter_description,
@@ -364,6 +366,20 @@ impl LogdApp {
         self.recent_files.insert(0, path.to_path_buf());
         self.recent_files.truncate(10);
         let _ = crate::settings::save_recent_files(&self.recent_files);
+    }
+
+    fn remember_search(&mut self, query: &str) {
+        self.search_history.retain(|item| item != query);
+        self.search_history.insert(0, query.to_string());
+        self.search_history
+            .truncate(crate::settings::MAX_SEARCH_HISTORY);
+        let _ = crate::settings::save_search_history(&self.search_history);
+    }
+
+    fn clear_search_history(&mut self, cx: &mut Context<Self>) {
+        self.search_history.clear();
+        let _ = crate::settings::save_search_history(&self.search_history);
+        cx.notify();
     }
 
     fn open_log(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -664,6 +680,10 @@ impl LogdApp {
     }
 
     fn set_global_search(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            self.remember_search(&value);
+        }
         let expression = parse_search_expression(&value);
         self.search_query = expression.query;
         self.search_filters = expression
@@ -1383,6 +1403,9 @@ impl LogdApp {
 
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette(cx);
+        let app = cx.entity();
+        let search_history = self.search_history.clone();
+        let lang = self.language;
         let left = h_flex()
             .h_full()
             .items_center()
@@ -1394,19 +1417,75 @@ impl LogdApp {
                     .h_full()
                     .items_center()
                     .gap_1()
-                    .font_weight(FontWeight::SEMIBOLD)
                     .px_1()
                     .window_control_area(WindowControlArea::Drag)
-                    .child(title_bar::app_icon())
-                    .child("logd"),
+                    .child(title_bar::app_icon()),
             )
             .child(self.menu_button(Key::File, window, cx))
             .child(self.menu_button(Key::View, window, cx))
             .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
             .into_any_element();
-        let center = div()
+        let search_history_button = Button::new("search-history")
+            .xsmall()
+            .ghost()
+            .compact()
+            .h_full()
+            .icon(IconName::ChevronDown)
+            .tooltip(text(Key::SearchHistory, lang))
+            .dropdown_menu(move |menu, window, _| {
+                if search_history.is_empty() {
+                    return menu
+                        .item(PopupMenuItem::new(text(Key::NoSearchHistory, lang)).disabled(true));
+                }
+
+                let history_app = app.clone();
+                let menu = search_history.iter().enumerate().fold(
+                    menu.max_w(px(480.)).scrollable(true),
+                    |menu, (index, query)| {
+                        let selected_query = query.clone();
+                        let selected_app = history_app.clone();
+                        let label = query.clone();
+                        let tooltip = query.clone();
+                        menu.item(
+                            PopupMenuItem::element(move |_, _| {
+                                let tooltip = tooltip.clone();
+                                div()
+                                    .id(("search-history-label", index))
+                                    .w(px(440.))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(label.clone())
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                            .build(window, cx)
+                                    })
+                            })
+                            .on_click(window.listener_for(
+                                &selected_app,
+                                move |this, _, window, cx| {
+                                    this.keyword.update(cx, |state, cx| {
+                                        state.set_value(selected_query.clone(), window, cx)
+                                    });
+                                    this.set_global_search(selected_query.clone(), window, cx);
+                                },
+                            )),
+                        )
+                    },
+                );
+                let clear_app = history_app;
+                menu.separator().item(
+                    PopupMenuItem::new(text(Key::ClearSearchHistory, lang)).on_click(
+                        window.listener_for(&clear_app, |this, _, _, cx| {
+                            this.clear_search_history(cx)
+                        }),
+                    ),
+                )
+            });
+        let center = h_flex()
             .w_full()
+            .h_full()
+            .min_w_0()
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 window.prevent_default();
                 cx.stop_propagation();
@@ -1416,7 +1495,13 @@ impl LogdApp {
             .border_color(palette.border)
             .rounded(px(4.))
             .text_color(palette.foreground)
-            .child(Input::new(&self.keyword).small().appearance(false))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&self.keyword).small().appearance(false)),
+            )
+            .child(search_history_button)
             .into_any_element();
         let close_app = cx.weak_entity();
         title_bar::render(

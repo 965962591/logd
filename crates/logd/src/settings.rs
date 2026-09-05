@@ -8,8 +8,10 @@ const FILTER_PLACEMENT_KEY: &str = "filter_placement";
 const SETTINGS_FILE: &str = "settings.conf";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
 const RECENT_FILES_FILE: &str = "recent-files.json";
+const SEARCH_HISTORY_FILE: &str = "search-history.json";
 const THEME_FILE: &str = "theme.conf";
 const MAX_RECENT_FILES: usize = 10;
+pub const MAX_SEARCH_HISTORY: usize = 20;
 
 pub fn load_filter_placement() -> DockPlacement {
     read_cache_file(SETTINGS_FILE)
@@ -54,6 +56,27 @@ pub fn save_recent_files(paths: &[PathBuf]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let contents = serde_json::to_string_pretty(paths)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    std::fs::write(path, contents)
+}
+
+pub fn load_search_history() -> Vec<String> {
+    read_cache_file(SEARCH_HISTORY_FILE)
+        .map(|contents| parse_search_history(&contents))
+        .unwrap_or_default()
+}
+
+pub fn save_search_history(queries: &[String]) -> io::Result<()> {
+    let path = cache_file_path(SEARCH_HISTORY_FILE).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "executable cache directory not found",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(queries)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     std::fs::write(path, contents)
 }
@@ -144,6 +167,21 @@ fn parse_recent_files(contents: &str) -> Vec<PathBuf> {
     unique
 }
 
+fn parse_search_history(contents: &str) -> Vec<String> {
+    let queries = serde_json::from_str::<Vec<String>>(contents).unwrap_or_default();
+    let mut unique = Vec::with_capacity(queries.len().min(MAX_SEARCH_HISTORY));
+    for query in queries {
+        let query = query.trim();
+        if !query.is_empty() && !unique.iter().any(|item| item == query) {
+            unique.push(query.to_string());
+            if unique.len() == MAX_SEARCH_HISTORY {
+                break;
+            }
+        }
+    }
+    unique
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +235,33 @@ mod tests {
     #[test]
     fn invalid_recent_files_json_is_ignored() {
         assert!(parse_recent_files("not json").is_empty());
+    }
+
+    #[test]
+    fn search_history_is_trimmed_deduplicated_and_limited() {
+        let queries = (0..=MAX_SEARCH_HISTORY)
+            .map(|index| format!("query {index}"))
+            .collect::<Vec<_>>();
+        let mut json_queries = vec!["  first & second  ".to_string(), String::new()];
+        json_queries.push("first & second".to_string());
+        json_queries.extend(queries);
+
+        let history = parse_search_history(&serde_json::to_string(&json_queries).unwrap());
+
+        assert_eq!(history.first().map(String::as_str), Some("first & second"));
+        assert_eq!(history.len(), MAX_SEARCH_HISTORY);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|query| query.as_str() == "first & second")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_search_history_json_is_ignored() {
+        assert!(parse_search_history("not json").is_empty());
     }
 
     #[test]
