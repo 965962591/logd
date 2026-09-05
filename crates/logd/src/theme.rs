@@ -25,6 +25,7 @@ pub struct Palette {
     pub tab_active: Hsla,
     pub tab_foreground: Hsla,
     pub tab_active_foreground: Hsla,
+    pub tab_active_indicator: Hsla,
     pub search_foreground: Hsla,
 }
 
@@ -48,9 +49,10 @@ pub fn palette(cx: &App) -> Palette {
         scroll_thumb_hover: active.scrollbar_thumb_hover,
         tab_bar: active.tab_bar,
         tab: active.tab,
-        tab_active: active.tab_active,
+        tab_active: active.accent.opacity(0.18),
         tab_foreground: active.tab_foreground,
         tab_active_foreground: active.tab_active_foreground,
+        tab_active_indicator: active.accent,
         search_foreground: active.yellow,
     }
 }

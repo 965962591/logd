@@ -777,7 +777,7 @@ impl Compiler {
             ),
             "time" | "ts" => {
                 let ts = parse_time_value(value, self.opts.base_date)
-                    .ok_or_else(|| anyhow!("认不出时间 {value:?}，用 `MM-DD HH:MM:SS[.mmm]` 或 `HH:MM:SS`"))?;
+                    .ok_or_else(|| anyhow!("认不出时间 {value:?}，用 `MM-DD HH:MM:SS[.fffffffff]`、`MM-DD HH:MM:SS:fffffffff` 或 `HH:MM:SS`"))?;
                 FieldTerm::Time(cmp(op)?, ts)
             }
             "tag" => FieldTerm::Tag(self.str_op(op, value, is_regex, name)?, op == "!=" || op == "!~"),
@@ -815,7 +815,8 @@ impl Compiler {
     }
 }
 
-/// 时间值。接受 `YYYY-MM-DD HH:MM[:SS[.mmm]]` / `MM-DD HH:MM[...]` / `HH:MM[...]`。
+/// 时间值。接受 `YYYY-MM-DD HH:MM[:SS[.fffffffff]]`、
+/// `MM-DD HH:MM[...]`、`HH:MM[...]`，小数秒分隔符也可以使用冒号。
 ///
 /// 只给时分秒时按 `base` 那一天算——UI 通常把文件第一行的时间戳传进来。
 pub fn parse_time_value(s: &str, base: Option<Ts>) -> Option<Ts> {
@@ -827,12 +828,13 @@ pub fn parse_time_value(s: &str, base: Option<Ts>) -> Option<Ts> {
         }
     }
     // 纯时分秒：拿 base 的日期补上
-    let (h, m, sec, ms) = parse_hms(s)?;
-    let day_ms = 86_400_000i64;
-    let base_day = base.map(|b| b.0.div_euclid(day_ms)).unwrap_or(0);
-    Some(Ts(
-        base_day * day_ms + (h as i64 * 3600 + m as i64 * 60 + sec as i64) * 1000 + ms as i64,
-    ))
+    let (h, m, sec, ns) = parse_hms(s)?;
+    let day_ns = 86_400_000_000_000i64;
+    let base_day = base.map(|b| b.0.div_euclid(day_ns)).unwrap_or(0);
+    let date = base_day.checked_mul(day_ns)?;
+    let time = (h as i64 * 3600 + m as i64 * 60 + sec as i64)
+        .checked_mul(1_000_000_000)?;
+    Some(Ts(date.checked_add(time)?.checked_add(ns as i64)?))
 }
 
 fn try_parse_dated(s: &str) -> Option<(Ts, usize)> {
@@ -843,27 +845,37 @@ fn try_parse_dated(s: &str) -> Option<(Ts, usize)> {
 }
 
 fn parse_hms(s: &str) -> Option<(u32, u32, u32, u32)> {
-    let (time, frac) = match s.split_once('.') {
-        Some((t, f)) => (t, f),
-        None => (s, ""),
-    };
-    let mut it = time.split(':');
-    let h: u32 = it.next()?.parse().ok()?;
-    let m: u32 = it.next()?.parse().ok()?;
-    let sec: u32 = it.next().map_or(Ok(0), str::parse).ok()?;
-    if it.next().is_some() || h > 23 || m > 59 || sec > 60 {
+    let mut parts = s.split(':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let sec_and_fraction = parts.next();
+    let colon_fraction = parts.next();
+    if parts.next().is_some() {
         return None;
     }
-    let mut ms = 0u32;
-    for (i, c) in frac.chars().take(3).enumerate() {
-        ms = ms * 10 + c.to_digit(10)?;
-        if i == frac.len().min(3) - 1 {
-            for _ in frac.len()..3 {
-                ms *= 10;
-            }
-        }
+    let (sec, dot_fraction) = match sec_and_fraction.unwrap_or("0").split_once('.') {
+        Some((sec, fraction)) => (sec, Some(fraction)),
+        None => (sec_and_fraction.unwrap_or("0"), None),
+    };
+    if dot_fraction.is_some() && colon_fraction.is_some() {
+        return None;
     }
-    Some((h, m, sec, ms))
+    let sec: u32 = sec.parse().ok()?;
+    if h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    let fraction = dot_fraction.or(colon_fraction).unwrap_or("");
+    if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut ns = 0u32;
+    for digit in fraction.bytes() {
+        ns = ns * 10 + (digit - b'0') as u32;
+    }
+    for _ in fraction.len()..9 {
+        ns *= 10;
+    }
+    Some((h, m, sec, ns))
 }
 
 #[cfg(test)]
@@ -1139,11 +1151,13 @@ mod tests {
     #[test]
     fn parse_time_value_forms() {
         assert!(parse_time_value("01-02 03:04:05.678", None).is_some());
+        assert!(parse_time_value("05-09 21:41:07:788638188", None).is_some());
         assert!(parse_time_value("2024-01-02 03:04:05", None).is_some());
         assert!(parse_time_value("03:04", None).is_some());
         assert!(parse_time_value("03:04:05.5", None).is_some());
         assert_eq!(parse_time_value("garbage", None), None);
         assert_eq!(parse_time_value("25:00", None), None);
+        assert_eq!(parse_time_value("9999-01-01 00:00:00", None), None);
     }
 
     #[test]
@@ -1151,6 +1165,15 @@ mod tests {
         let a = parse_time_value("03:04:05.5", None).unwrap();
         let b = parse_time_value("03:04:05.500", None).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn nanosecond_time_range_is_exact() {
+        let query = q(r#"time>="05-09 21:41:07:788638188" and time<="05-09 21:41:08:001129178""#);
+        assert!(!hit(&query, "05-09 21:41:07:788638187  1 2 I T: before"));
+        assert!(hit(&query, "05-09 21:41:07:788638188  1 2 I T: first"));
+        assert!(hit(&query, "05-09 21:41:08:001129178  1 2 I T: last"));
+        assert!(!hit(&query, "05-09 21:41:08:001129179  1 2 I T: after"));
     }
 
     #[test]

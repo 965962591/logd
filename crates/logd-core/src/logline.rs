@@ -74,7 +74,7 @@ impl Level {
     }
 }
 
-/// 归一化时间戳：自 Unix 纪元的毫秒数。
+/// 归一化时间戳：自 Unix 纪元的纳秒数。
 ///
 /// threadtime 不带年份，这时按 1970 年折算——**同一份日志内单调可比**，
 /// 这正是时间区间筛选需要的。绝对日期不准，也跨不了年（已知局限，见 doc/PLAN.md）。
@@ -85,9 +85,20 @@ impl Ts {
     pub const MIN: Ts = Ts(i64::MIN);
     pub const MAX: Ts = Ts(i64::MAX);
 
-    fn from_parts(year: i32, mon: u32, day: u32, h: u32, m: u32, s: u32, ms: u32) -> Ts {
+    fn from_parts(
+        year: i32,
+        mon: u32,
+        day: u32,
+        h: u32,
+        m: u32,
+        s: u32,
+        ns: u32,
+    ) -> Option<Ts> {
         let days = days_from_civil(year, mon, day);
-        Ts(days * 86_400_000 + (h as i64 * 3600 + m as i64 * 60 + s as i64) * 1000 + ms as i64)
+        let date = days.checked_mul(86_400_000_000_000)?;
+        let time = (h as i64 * 3600 + m as i64 * 60 + s as i64)
+            .checked_mul(1_000_000_000)?;
+        Some(Ts(date.checked_add(time)?.checked_add(ns as i64)?))
     }
 }
 
@@ -242,15 +253,16 @@ fn parse_timestamp(line: &[u8]) -> Option<(Ts, usize)> {
     let s = two(line, p + 6)?;
     p += 8;
 
-    // 小数秒可有可无，位数不定（Android 13+ 会打 6 位）
-    let mut ms = 0u32;
-    if line.get(p) == Some(&b'.') {
+    // 小数秒可有可无，支持 logcat 的点号和部分设备日志使用的冒号。
+    // 最多保留 9 位纳秒精度，更多位数只消费不参与比较。
+    let mut ns = 0u32;
+    if matches!(line.get(p), Some(b'.' | b':')) {
         p += 1;
         let start = p;
         let mut digits = 0u32;
         while line.get(p).is_some_and(u8::is_ascii_digit) {
-            if digits < 3 {
-                ms = ms * 10 + (line[p] - b'0') as u32;
+            if digits < 9 {
+                ns = ns * 10 + (line[p] - b'0') as u32;
             }
             digits += 1;
             p += 1;
@@ -258,9 +270,9 @@ fn parse_timestamp(line: &[u8]) -> Option<(Ts, usize)> {
         if p == start {
             return None;
         }
-        // 位数不足 3 位要补齐：`.5` 是 500ms 不是 5ms
-        for _ in digits..3 {
-            ms *= 10;
+        // 位数不足 9 位要补齐：`.5` 是 500ms 不是 0.5ns。
+        for _ in digits..9 {
+            ns *= 10;
         }
     }
 
@@ -268,7 +280,7 @@ fn parse_timestamp(line: &[u8]) -> Option<(Ts, usize)> {
     if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
         return None;
     }
-    Some((Ts::from_parts(year, mon, day, h, m, s, ms), p))
+    Some((Ts::from_parts(year, mon, day, h, m, s, ns)?, p))
 }
 
 #[inline]
@@ -368,7 +380,10 @@ mod tests {
         assert_eq!(l.tag_bytes(s.as_bytes()), b"Hal3Av3");
         assert_eq!(l.message_bytes(s.as_bytes()), b"parseMeta");
         // 2024-01-02 的 Unix 天数
-        assert_eq!(l.ts.unwrap().0 / 86_400_000, days_from_civil(2024, 1, 2));
+        assert_eq!(
+            l.ts.unwrap().0 / 86_400_000_000_000,
+            days_from_civil(2024, 1, 2)
+        );
     }
 
     #[test]
@@ -386,7 +401,14 @@ mod tests {
     fn six_digit_fraction() {
         let a = p("01-02 03:04:05.678000  1 2 I T: x").unwrap();
         let b = p("01-02 03:04:05.678  1 2 I T: x").unwrap();
-        assert_eq!(a.ts, b.ts, "多余的小数位应被忽略而不是算进毫秒");
+        assert_eq!(a.ts, b.ts, "不足 9 位的小数秒应补零到纳秒");
+    }
+
+    #[test]
+    fn colon_fraction_keeps_nanosecond_precision() {
+        let a = p("05-09 21:41:07:788638188  1 2 I T: x").unwrap();
+        let b = p("05-09 21:41:07:788638189  1 2 I T: x").unwrap();
+        assert!(a.ts < b.ts);
     }
 
     #[test]

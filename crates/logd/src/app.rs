@@ -706,7 +706,7 @@ impl LogdApp {
             self.apply_filters_to_view(index, &view, cx);
             self.apply_search_to_view(&view, cx);
         }
-        let has_search = !self.search_filters.is_empty();
+        let has_search = !self.search_query.is_empty();
         self.search_results_panel.update(cx, |panel, cx| {
             panel.reset_scroll();
             if has_search {
@@ -1546,6 +1546,7 @@ impl LogdApp {
                 let context_app = app.clone();
                 h_flex()
                     .id(("tab", index))
+                    .relative()
                     .flex_none()
                     .h_full()
                     .px_3()
@@ -1562,6 +1563,17 @@ impl LogdApp {
                         palette.tab_active_foreground
                     } else {
                         palette.tab_foreground
+                    })
+                    .when(active, |tab| {
+                        tab.font_weight(FontWeight::SEMIBOLD).child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(2.))
+                                .bg(palette.tab_active_indicator),
+                        )
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.set_active(index, cx)))
                     .on_drag(drag, move |drag, _, _, cx| cx.new(|_| drag.clone()))
@@ -1953,7 +1965,7 @@ impl LogdApp {
         let palette = theme::palette(cx);
         let (has_search, files, total_matches, tree_rows, scanning, file_count, lang) = {
             let state = app.read(cx);
-            let has_search = !state.search_filters.is_empty();
+            let has_search = !state.search_query.is_empty();
             let mut files = Vec::new();
             let mut total_matches = 0usize;
             let mut tree_rows = 0usize;
@@ -2674,13 +2686,18 @@ fn parse_search_expression(value: &str) -> SearchExpression {
         })
         .filter(|group| !group.is_empty())
         .collect::<Vec<_>>();
-    let keywords = groups.iter().flatten().cloned().collect();
+    let mut keywords = Vec::new();
     let query = groups
         .iter()
         .map(|group| {
             let terms = group
                 .iter()
-                .map(|keyword| quote_query_literal(keyword))
+                .map(|keyword| {
+                    parse_time_shorthand(keyword).unwrap_or_else(|| {
+                        keywords.push(keyword.clone());
+                        quote_query_literal(keyword)
+                    })
+                })
                 .collect::<Vec<_>>()
                 .join(" and ");
             if group.len() > 1 {
@@ -2692,6 +2709,44 @@ fn parse_search_expression(value: &str) -> SearchExpression {
         .collect::<Vec<_>>()
         .join(" or ");
     SearchExpression { keywords, query }
+}
+
+fn parse_time_shorthand(value: &str) -> Option<String> {
+    let prefix = value.get(..2)?;
+    if !prefix.eq_ignore_ascii_case("t:") {
+        return None;
+    }
+    let parts = value.get(2..)?.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+
+    for start_len in [2, 1] {
+        if start_len > parts.len() {
+            continue;
+        }
+        let start = parts[..start_len].join(" ");
+        if logd_core::query::parse_time_value(&start, None).is_none() {
+            continue;
+        }
+        if start_len == parts.len() {
+            return Some(format!("time>={}", quote_query_literal(&start)));
+        }
+
+        let end_parts = &parts[start_len..];
+        if end_parts.len() > 2 {
+            continue;
+        }
+        let end = end_parts.join(" ");
+        if logd_core::query::parse_time_value(&end, None).is_some() {
+            return Some(format!(
+                "(time>={} and time<={})",
+                quote_query_literal(&start),
+                quote_query_literal(&end)
+            ));
+        }
+    }
+    None
 }
 
 fn quote_query_literal(value: &str) -> String {
@@ -2752,6 +2807,43 @@ mod tests {
             SearchExpression {
                 keywords: Vec::new(),
                 query: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_time_range_search_expression() {
+        assert_eq!(
+            parse_search_expression("t:05-09 21:41:07:788638188 05-09 21:41:08:001129178"),
+            SearchExpression {
+                keywords: Vec::new(),
+                query: concat!(
+                    "(time>=\"05-09 21:41:07:788638188\" and ",
+                    "time<=\"05-09 21:41:08:001129178\")"
+                )
+                .into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_open_ended_time_search_expression() {
+        assert_eq!(
+            parse_search_expression("t:05-09 21:41:08:001129178"),
+            SearchExpression {
+                keywords: Vec::new(),
+                query: "time>=\"05-09 21:41:08:001129178\"".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn combines_time_and_text_search_terms() {
+        assert_eq!(
+            parse_search_expression("error & t:05-09 21:41:08:001129178"),
+            SearchExpression {
+                keywords: vec!["error".into()],
+                query: "(\"error\" and time>=\"05-09 21:41:08:001129178\")".into(),
             }
         );
     }
