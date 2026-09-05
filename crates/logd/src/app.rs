@@ -849,7 +849,12 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn show_filter_panel(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_filter_panel(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.filter_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
         let dock_area = self.dock_area.clone();
@@ -857,7 +862,12 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn show_search_results(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_search_results(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.search_results_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
         let dock_area = self.dock_area.clone();
@@ -1381,6 +1391,8 @@ impl LogdApp {
 
         let add_app = app.clone();
         let cancel_app = app.clone();
+        let reset_fore_app = app.clone();
+        let reset_back_app = app.clone();
 
         v_flex()
             .size_full()
@@ -1394,7 +1406,9 @@ impl LogdApp {
                     .gap_1()
                     .border_b_1()
                     .border_color(theme::c(theme::BORDER))
-                    .child(
+                    .child(control_tooltip(
+                        "filter-add-tooltip",
+                        text(Key::AddFilter, lang),
                         ButtonGroup::new("filter-toolbar")
                             .compact()
                             .xsmall()
@@ -1403,14 +1417,13 @@ impl LogdApp {
                                 Button::new("filter-add")
                                     .icon(IconName::Plus)
                                     .accessibility_label(text(Key::AddFilter, lang))
-                                    .tooltip(text(Key::AddFilter, lang))
                                     .on_click(
                                         window.listener_for(&add_app, |this, _, window, cx| {
                                             this.begin_add_filter(window, cx)
                                         }),
                                     ),
                             ),
-                    )
+                    ))
                     .child(div().flex_1()),
             )
             .when(editor_open, |column| {
@@ -1422,7 +1435,13 @@ impl LogdApp {
                         .border_color(theme::c(theme::BORDER))
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
-                        .child(
+                        .child(control_tooltip(
+                            "filter-editor-scope-tooltip",
+                            format!(
+                                "{}: {}",
+                                text(Key::FilterScope, lang),
+                                filter_scope_label(filter_scope, lang)
+                            ),
                             ButtonGroup::new("filter-editor-scope")
                                 .compact()
                                 .xsmall()
@@ -1436,11 +1455,6 @@ impl LogdApp {
                                             text(Key::FilterScope, lang),
                                             filter_scope_label(filter_scope, lang)
                                         ))
-                                        .tooltip(format!(
-                                            "{}: {}",
-                                            text(Key::FilterScope, lang),
-                                            filter_scope_label(filter_scope, lang)
-                                        ))
                                         .on_click(window.listener_for(app, |this, _, _, cx| {
                                             this.filter_scope = match this.filter_scope {
                                                 FilterScope::AllFiles => FilterScope::CurrentFile,
@@ -1449,62 +1463,145 @@ impl LogdApp {
                                             cx.notify();
                                         })),
                                 ),
-                        )
+                        ))
                         .child(
                             h_flex()
-                                .gap_4()
+                                .flex_wrap()
+                                .gap_2()
                                 .items_center()
                                 .child(
-                                    ColorPicker::new(&filter_fore)
-                                        // The component's default featured colors are
-                                        // repeated in its full palette and reuse the same
-                                        // accessibility IDs in debug builds.
-                                        .featured_colors(Vec::new())
-                                        .small()
-                                        .label(text(Key::ForegroundColor, lang))
-                                        .accessibility_label(text(Key::ForegroundColor, lang)),
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            ColorPicker::new(&filter_fore)
+                                                // The component's default featured colors are
+                                                // repeated in its full palette and reuse the same
+                                                // accessibility IDs in debug builds.
+                                                .featured_colors(Vec::new())
+                                                .small()
+                                                .label(text(Key::ForegroundColor, lang))
+                                                .accessibility_label(text(
+                                                    Key::ForegroundColor,
+                                                    lang,
+                                                )),
+                                        )
+                                        .child(control_tooltip(
+                                            "filter-reset-fore-tooltip",
+                                            text(Key::ResetForegroundColor, lang),
+                                            ButtonGroup::new("filter-reset-fore-group")
+                                                .compact()
+                                                .xsmall()
+                                                .outline()
+                                                .child(
+                                                    Button::new("filter-reset-fore")
+                                                        .icon(IconName::Undo2)
+                                                        .accessibility_label(text(
+                                                            Key::ResetForegroundColor,
+                                                            lang,
+                                                        ))
+                                                        .on_click(window.listener_for(
+                                                            &reset_fore_app,
+                                                            |this, _, window, cx| {
+                                                                this.filter_fore.update(
+                                                                    cx,
+                                                                    |picker, cx| {
+                                                                        picker
+                                                                            .clear_value(window, cx)
+                                                                    },
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )),
                                 )
                                 .child(
-                                    ColorPicker::new(&filter_back)
-                                        .featured_colors(Vec::new())
-                                        .small()
-                                        .label(text(Key::BackgroundColor, lang))
-                                        .accessibility_label(text(Key::BackgroundColor, lang)),
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            ColorPicker::new(&filter_back)
+                                                .featured_colors(Vec::new())
+                                                .small()
+                                                .label(text(Key::BackgroundColor, lang))
+                                                .accessibility_label(text(
+                                                    Key::BackgroundColor,
+                                                    lang,
+                                                )),
+                                        )
+                                        .child(control_tooltip(
+                                            "filter-reset-back-tooltip",
+                                            text(Key::ResetBackgroundColor, lang),
+                                            ButtonGroup::new("filter-reset-back-group")
+                                                .compact()
+                                                .xsmall()
+                                                .outline()
+                                                .child(
+                                                    Button::new("filter-reset-back")
+                                                        .icon(IconName::Undo2)
+                                                        .accessibility_label(text(
+                                                            Key::ResetBackgroundColor,
+                                                            lang,
+                                                        ))
+                                                        .on_click(window.listener_for(
+                                                            &reset_back_app,
+                                                            |this, _, window, cx| {
+                                                                this.filter_back.update(
+                                                                    cx,
+                                                                    |picker, cx| {
+                                                                        picker
+                                                                            .clear_value(window, cx)
+                                                                    },
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        )),
                                 ),
                         )
                         .child(
-                            h_flex().justify_end().child(
-                                ButtonGroup::new("filter-editor-actions")
-                                    .compact()
-                                    .xsmall()
-                                    .outline()
-                                    .child(
-                                        Button::new("filter-editor-cancel")
-                                            .icon(IconName::Close)
-                                            .accessibility_label(text(Key::Cancel, lang))
-                                            .tooltip(text(Key::Cancel, lang))
-                                            .on_click(window.listener_for(
-                                                &cancel_app,
-                                                |this, _, _, cx| {
-                                                    this.filter_editor_open = false;
-                                                    this.editing_filter = None;
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    )
-                                    .child(
-                                        Button::new("filter-editor-save")
-                                            .icon(IconName::Check)
-                                            .accessibility_label(text(Key::SaveFilter, lang))
-                                            .tooltip(text(Key::SaveFilter, lang))
-                                            .on_click(window.listener_for(
-                                                app,
-                                                |this, _, window, cx| {
-                                                    this.commit_filter(window, cx)
-                                                },
-                                            )),
-                                    ),
-                            ),
+                            h_flex()
+                                .justify_end()
+                                .child(control_tooltip(
+                                    "filter-editor-cancel-tooltip",
+                                    text(Key::Cancel, lang),
+                                    ButtonGroup::new("filter-editor-cancel-group")
+                                        .compact()
+                                        .xsmall()
+                                        .outline()
+                                        .child(
+                                            Button::new("filter-editor-cancel")
+                                                .icon(IconName::Close)
+                                                .accessibility_label(text(Key::Cancel, lang))
+                                                .on_click(window.listener_for(
+                                                    &cancel_app,
+                                                    |this, _, _, cx| {
+                                                        this.filter_editor_open = false;
+                                                        this.editing_filter = None;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                ))
+                                .child(control_tooltip(
+                                    "filter-editor-save-tooltip",
+                                    text(Key::SaveFilter, lang),
+                                    ButtonGroup::new("filter-editor-save-group")
+                                        .compact()
+                                        .xsmall()
+                                        .outline()
+                                        .child(
+                                            Button::new("filter-editor-save")
+                                                .icon(IconName::Check)
+                                                .accessibility_label(text(Key::SaveFilter, lang))
+                                                .on_click(window.listener_for(
+                                                    app,
+                                                    |this, _, window, cx| {
+                                                        this.commit_filter(window, cx)
+                                                    },
+                                                )),
+                                        ),
+                                )),
                         ),
                 )
             })
@@ -1922,6 +2019,20 @@ impl Render for LogdApp {
     }
 }
 
+fn control_tooltip(
+    id: impl Into<ElementId>,
+    tooltip: impl Into<SharedString>,
+    child: impl IntoElement,
+) -> Stateful<Div> {
+    let tooltip = tooltip.into();
+    div()
+        .id(id)
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+        })
+        .child(child)
+}
+
 fn render_filter_row(
     app: &Entity<LogdApp>,
     filter: &FilterSpec,
@@ -1965,95 +2076,138 @@ fn render_filter_row(
                 cx.notify();
             }),
         )
-        .child(
+        .child(control_tooltip(
+            ("filter-enabled-tooltip", index),
+            text(Key::FilterEnabled, lang),
             Checkbox::new(("filter-enabled", index))
                 .xsmall()
                 .checked(filter.enabled)
                 .accessibility_label(text(Key::FilterEnabled, lang))
-                .tooltip(text(Key::FilterEnabled, lang))
                 .on_click(
                     window.listener_for(&enable_app, move |this, checked, _, cx| {
                         this.filters[index].enabled = *checked;
                         this.filters_changed(cx);
                     }),
                 ),
-        )
+        ))
         .child(
-            ButtonGroup::new(("filter-options", index))
-                .compact()
-                .xsmall()
-                .outline()
-                .multiple(true)
-                .child(
-                    Button::new(("filter-exclude", index))
-                        .icon(IconName::Minus)
-                        .selected(filter.excluding)
-                        .accessibility_label(text(Key::FilterExcluding, lang))
-                        .tooltip(text(Key::FilterExcluding, lang))
-                        .on_click(window.listener_for(&exclude_app, move |this, _, _, cx| {
-                            this.filters[index].excluding = !this.filters[index].excluding;
-                            this.filters_changed(cx);
-                        })),
-                )
-                .child(
-                    Button::new(("filter-mode", index))
-                        .icon(IconName::GalleryVerticalEnd)
-                        .selected(filter.mode == HighlightMode::Line)
-                        .accessibility_label(text(Key::FilterHighlightLine, lang))
-                        .tooltip(text(Key::FilterHighlightLine, lang))
-                        .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
-                            this.filters[index].mode = match this.filters[index].mode {
-                                HighlightMode::Field => HighlightMode::Line,
-                                HighlightMode::Line => HighlightMode::Field,
-                            };
-                            this.filters_changed(cx);
-                        })),
-                )
-                .child(
-                    Button::new(("filter-regex", index))
-                        .icon(IconName::Asterisk)
-                        .selected(filter.regex)
-                        .accessibility_label(text(Key::FilterRegex, lang))
-                        .tooltip(text(Key::FilterRegex, lang))
-                        .on_click(window.listener_for(&regex_app, move |this, _, _, cx| {
-                            this.filters[index].regex = !this.filters[index].regex;
-                            this.filters_changed(cx);
-                        })),
-                )
-                .child(
-                    Button::new(("filter-case", index))
-                        .icon(IconName::CaseSensitive)
-                        .selected(filter.case_sensitive)
-                        .accessibility_label(text(Key::FilterCaseSensitive, lang))
-                        .tooltip(text(Key::FilterCaseSensitive, lang))
-                        .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
-                            this.filters[index].case_sensitive =
-                                !this.filters[index].case_sensitive;
-                            this.filters_changed(cx);
-                        })),
-                )
-                .child(
-                    Button::new(("filter-scope", index))
-                        .icon(IconName::Globe)
-                        .selected(filter.scope == FilterScope::AllFiles)
-                        .accessibility_label(format!(
-                            "{}: {}",
-                            text(Key::FilterScope, lang),
-                            filter_scope_label(filter.scope, lang)
-                        ))
-                        .tooltip(format!(
-                            "{}: {}",
-                            text(Key::FilterScope, lang),
-                            filter_scope_label(filter.scope, lang)
-                        ))
-                        .on_click(window.listener_for(&scope_app, move |this, _, _, cx| {
-                            this.filters[index].scope = match this.filters[index].scope {
-                                FilterScope::AllFiles => FilterScope::CurrentFile,
-                                FilterScope::CurrentFile => FilterScope::AllFiles,
-                            };
-                            this.filters_changed(cx);
-                        })),
-                ),
+            h_flex()
+                .child(control_tooltip(
+                    ("filter-exclude-tooltip", index),
+                    text(Key::FilterExcluding, lang),
+                    ButtonGroup::new(("filter-exclude-group", index))
+                        .compact()
+                        .xsmall()
+                        .outline()
+                        .child(
+                            Button::new(("filter-exclude", index))
+                                .icon(IconName::Minus)
+                                .selected(filter.excluding)
+                                .accessibility_label(text(Key::FilterExcluding, lang))
+                                .on_click(window.listener_for(
+                                    &exclude_app,
+                                    move |this, _, _, cx| {
+                                        this.filters[index].excluding =
+                                            !this.filters[index].excluding;
+                                        this.filters_changed(cx);
+                                    },
+                                )),
+                        ),
+                ))
+                .child(control_tooltip(
+                    ("filter-mode-tooltip", index),
+                    text(Key::FilterHighlightLine, lang),
+                    ButtonGroup::new(("filter-mode-group", index))
+                        .compact()
+                        .xsmall()
+                        .outline()
+                        .child(
+                            Button::new(("filter-mode", index))
+                                .icon(IconName::GalleryVerticalEnd)
+                                .selected(filter.mode == HighlightMode::Line)
+                                .accessibility_label(text(Key::FilterHighlightLine, lang))
+                                .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
+                                    this.filters[index].mode = match this.filters[index].mode {
+                                        HighlightMode::Field => HighlightMode::Line,
+                                        HighlightMode::Line => HighlightMode::Field,
+                                    };
+                                    this.filters_changed(cx);
+                                })),
+                        ),
+                ))
+                .child(control_tooltip(
+                    ("filter-regex-tooltip", index),
+                    text(Key::FilterRegex, lang),
+                    ButtonGroup::new(("filter-regex-group", index))
+                        .compact()
+                        .xsmall()
+                        .outline()
+                        .child(
+                            Button::new(("filter-regex", index))
+                                .icon(IconName::Asterisk)
+                                .selected(filter.regex)
+                                .accessibility_label(text(Key::FilterRegex, lang))
+                                .on_click(window.listener_for(
+                                    &regex_app,
+                                    move |this, _, _, cx| {
+                                        this.filters[index].regex = !this.filters[index].regex;
+                                        this.filters_changed(cx);
+                                    },
+                                )),
+                        ),
+                ))
+                .child(control_tooltip(
+                    ("filter-case-tooltip", index),
+                    text(Key::FilterCaseSensitive, lang),
+                    ButtonGroup::new(("filter-case-group", index))
+                        .compact()
+                        .xsmall()
+                        .outline()
+                        .child(
+                            Button::new(("filter-case", index))
+                                .icon(IconName::CaseSensitive)
+                                .selected(filter.case_sensitive)
+                                .accessibility_label(text(Key::FilterCaseSensitive, lang))
+                                .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
+                                    this.filters[index].case_sensitive =
+                                        !this.filters[index].case_sensitive;
+                                    this.filters_changed(cx);
+                                })),
+                        ),
+                ))
+                .child(control_tooltip(
+                    ("filter-scope-tooltip", index),
+                    format!(
+                        "{}: {}",
+                        text(Key::FilterScope, lang),
+                        filter_scope_label(filter.scope, lang)
+                    ),
+                    ButtonGroup::new(("filter-scope-group", index))
+                        .compact()
+                        .xsmall()
+                        .outline()
+                        .child(
+                            Button::new(("filter-scope", index))
+                                .icon(IconName::Globe)
+                                .selected(filter.scope == FilterScope::AllFiles)
+                                .accessibility_label(format!(
+                                    "{}: {}",
+                                    text(Key::FilterScope, lang),
+                                    filter_scope_label(filter.scope, lang)
+                                ))
+                                .on_click(window.listener_for(
+                                    &scope_app,
+                                    move |this, _, _, cx| {
+                                        this.filters[index].scope = match this.filters[index].scope
+                                        {
+                                            FilterScope::AllFiles => FilterScope::CurrentFile,
+                                            FilterScope::CurrentFile => FilterScope::AllFiles,
+                                        };
+                                        this.filters_changed(cx);
+                                    },
+                                )),
+                        ),
+                )),
         )
         .child(v_flex().min_w_0().flex_1().child(filter.text.clone()).when(
             !filter.description.is_empty(),

@@ -8,6 +8,7 @@ use gpui_component::dock::{
     DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelInfo,
     PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use crate::app::LogdApp;
 use crate::i18n::{text, Key};
@@ -312,6 +313,26 @@ impl Panel for FilterPanel {
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
+
+    fn dropdown_menu(
+        &mut self,
+        menu: PopupMenu,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let app = self.app.clone();
+        let lang = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(crate::i18n::Language::EnUs);
+        menu.item(
+            PopupMenuItem::new(text(Key::Close, lang)).on_click(move |_, window, cx| {
+                app.update(cx, |app, cx| app.show_filter_panel(false, window, cx))
+                    .ok();
+            }),
+        )
+    }
 }
 
 impl EventEmitter<PanelEvent> for FilterPanel {}
@@ -418,6 +439,26 @@ impl Panel for SearchResultsPanel {
 
     fn inner_padding(&self, _: &App) -> bool {
         false
+    }
+
+    fn dropdown_menu(
+        &mut self,
+        menu: PopupMenu,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let app = self.app.clone();
+        let lang = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(crate::i18n::Language::EnUs);
+        menu.item(
+            PopupMenuItem::new(text(Key::Close, lang)).on_click(move |_, window, cx| {
+                app.update(cx, |app, cx| app.show_search_results(false, window, cx))
+                    .ok();
+            }),
+        )
     }
 }
 

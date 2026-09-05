@@ -1386,7 +1386,6 @@ impl Render for LogView {
                     cx.stop_propagation();
                 }
             }))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
                 if this.drag_grab.is_some() || this.h_drag_grab.is_some() {
@@ -1420,7 +1419,25 @@ impl Render for LogView {
                             });
                         }
                     },
-                    move |_, _, window, _| {
+                    move |bounds, _, window, _| {
+                        window.on_mouse_event({
+                            let scroll_handle = drag_handle.clone();
+                            move |ev: &ScrollWheelEvent, phase, window, cx| {
+                                if phase != DispatchPhase::Capture || !bounds.contains(&ev.position)
+                                {
+                                    return;
+                                }
+                                if scroll_handle
+                                    .update(cx, |this, cx| this.on_scroll(ev, window, cx))
+                                    .is_ok()
+                                {
+                                    // Per-row InputState elements also register scroll
+                                    // listeners. Handle the log viewport first so native
+                                    // horizontal-wheel events cannot be consumed by a row.
+                                    cx.stop_propagation();
+                                }
+                            }
+                        });
                         window.on_mouse_event({
                             let drag_handle = drag_handle.clone();
                             move |ev: &MouseMoveEvent, phase, _, cx| {
