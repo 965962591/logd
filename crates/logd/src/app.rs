@@ -1433,46 +1433,32 @@ impl LogdApp {
             .h_full()
             .icon(IconName::ChevronDown)
             .tooltip(text(Key::SearchHistory, lang))
-            .dropdown_menu(move |menu, window, _| {
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
                 if search_history.is_empty() {
                     return menu
                         .item(PopupMenuItem::new(text(Key::NoSearchHistory, lang)).disabled(true));
                 }
 
                 let history_app = app.clone();
-                let menu = search_history.iter().enumerate().fold(
-                    menu.max_w(px(480.)).scrollable(true),
-                    |menu, (index, query)| {
-                        let selected_query = query.clone();
-                        let selected_app = history_app.clone();
-                        let label = query.clone();
-                        let tooltip = query.clone();
-                        menu.item(
-                            PopupMenuItem::element(move |_, _| {
-                                let tooltip = tooltip.clone();
-                                div()
-                                    .id(("search-history-label", index))
-                                    .w(px(440.))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(label.clone())
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
-                                            .build(window, cx)
-                                    })
-                            })
-                            .on_click(window.listener_for(
-                                &selected_app,
-                                move |this, _, window, cx| {
+                let menu =
+                    search_history.iter().enumerate().fold(
+                        menu.min_w(px(480.))
+                            .max_w(px(480.))
+                            .max_h(px(320.))
+                            .scrollable(true),
+                        |menu, (_, query)| {
+                            let selected_query = query.clone();
+                            let selected_app = history_app.clone();
+                            menu.item(PopupMenuItem::new(query.clone()).on_click(
+                                window.listener_for(&selected_app, move |this, _, window, cx| {
                                     this.keyword.update(cx, |state, cx| {
                                         state.set_value(selected_query.clone(), window, cx)
                                     });
                                     this.set_global_search(selected_query.clone(), window, cx);
-                                },
-                            )),
-                        )
-                    },
-                );
+                                }),
+                            ))
+                        },
+                    );
                 let clear_app = history_app;
                 menu.separator().item(
                     PopupMenuItem::new(text(Key::ClearSearchHistory, lang)).on_click(
