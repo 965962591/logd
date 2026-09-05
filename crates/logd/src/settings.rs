@@ -2,11 +2,13 @@ use std::io;
 use std::path::PathBuf;
 
 use gpui_component::dock::{DockAreaState, DockPlacement};
+use gpui_component::ThemeMode;
 
 const FILTER_PLACEMENT_KEY: &str = "filter_placement";
 const SETTINGS_FILE: &str = "settings.conf";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
 const RECENT_FILES_FILE: &str = "recent-files.json";
+const THEME_FILE: &str = "theme.conf";
 const MAX_RECENT_FILES: usize = 10;
 
 pub fn load_filter_placement() -> DockPlacement {
@@ -56,6 +58,25 @@ pub fn save_recent_files(paths: &[PathBuf]) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
+pub fn load_theme_mode() -> ThemeMode {
+    read_cache_file(THEME_FILE)
+        .and_then(|contents| parse_theme_mode(&contents))
+        .unwrap_or(ThemeMode::Dark)
+}
+
+pub fn save_theme_mode(mode: ThemeMode) -> io::Result<()> {
+    let path = cache_file_path(THEME_FILE).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "executable cache directory not found",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, mode.name())
+}
+
 fn dock_layout_path() -> Option<PathBuf> {
     cache_file_path(DOCK_LAYOUT_FILE)
 }
@@ -98,6 +119,14 @@ fn parse_filter_placement(contents: &str) -> Option<DockPlacement> {
             _ => None,
         }
     })
+}
+
+fn parse_theme_mode(contents: &str) -> Option<ThemeMode> {
+    match contents.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(ThemeMode::Light),
+        "dark" => Some(ThemeMode::Dark),
+        _ => None,
+    }
 }
 
 fn parse_recent_files(contents: &str) -> Vec<PathBuf> {
@@ -168,5 +197,12 @@ mod tests {
     #[test]
     fn invalid_recent_files_json_is_ignored() {
         assert!(parse_recent_files("not json").is_empty());
+    }
+
+    #[test]
+    fn parses_theme_mode() {
+        assert_eq!(parse_theme_mode("light\n"), Some(ThemeMode::Light));
+        assert_eq!(parse_theme_mode("DARK"), Some(ThemeMode::Dark));
+        assert_eq!(parse_theme_mode("system"), None);
     }
 }

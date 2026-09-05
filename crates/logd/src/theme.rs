@@ -1,24 +1,63 @@
-//! 配色与排版常量。深色底，参照 VS Code 暗色主题。
+//! Shared layout values and colors derived from the active gpui-kit theme.
 
-use gpui::{rgb, Rgba};
+use gpui::{rgb, App, Hsla, Rgba};
+use gpui_component::ActiveTheme as _;
 
-pub const BG: u32 = 0x1e1e1e;
-pub const FG: u32 = 0xd4d4d4;
-pub const TITLE_BAR_BG: u32 = 0x181818;
-pub const CONTROL_HOVER: u32 = 0x2a2d2e;
-pub const SEARCH_FORE: u32 = 0xffd75f;
-pub const DANGER: u32 = 0xc42b1c;
-pub const SELECTION: u32 = 0x264f78;
-/// 行号槽、状态栏次要文字
-pub const MUTED: u32 = 0x858585;
-/// 行号槽背景
-pub const GUTTER_BG: u32 = 0x252526;
-pub const BORDER: u32 = 0x3c3c3c;
-pub const STATUS_BG: u32 = 0x007acc;
-pub const STATUS_FG: u32 = 0xffffff;
-pub const SCROLL_TRACK: u32 = 0x252526;
-pub const SCROLL_THUMB: u32 = 0x4e4e4e;
-pub const SCROLL_THUMB_HOVER: u32 = 0x6e6e6e;
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub title_bar: Hsla,
+    pub title_bar_border: Hsla,
+    pub control_hover: Hsla,
+    pub danger: Hsla,
+    pub danger_foreground: Hsla,
+    pub selection: Hsla,
+    pub muted: Hsla,
+    pub gutter: Hsla,
+    pub border: Hsla,
+    pub status: Hsla,
+    pub scroll_track: Hsla,
+    pub scroll_thumb: Hsla,
+    pub scroll_thumb_hover: Hsla,
+    pub tab_bar: Hsla,
+    pub tab: Hsla,
+    pub tab_active: Hsla,
+    pub tab_foreground: Hsla,
+    pub tab_active_foreground: Hsla,
+    pub search_foreground: Hsla,
+}
+
+pub fn palette(cx: &App) -> Palette {
+    let active = cx.theme();
+    Palette {
+        background: active.background,
+        foreground: active.foreground,
+        title_bar: active.title_bar,
+        title_bar_border: active.title_bar_border,
+        control_hover: active.list_hover,
+        danger: active.danger,
+        danger_foreground: active.danger_foreground,
+        selection: active.selection,
+        muted: active.muted_foreground,
+        gutter: active.sidebar,
+        border: active.border,
+        status: active.status_bar,
+        scroll_track: active.scrollbar,
+        scroll_thumb: active.scrollbar_thumb,
+        scroll_thumb_hover: active.scrollbar_thumb_hover,
+        tab_bar: active.tab_bar,
+        tab: active.tab,
+        tab_active: active.tab_active,
+        tab_foreground: active.tab_foreground,
+        tab_active_foreground: active.tab_active_foreground,
+        search_foreground: active.yellow,
+    }
+}
+
+pub fn search_foreground_rgb(cx: &App) -> u32 {
+    u32::from(palette(cx).search_foreground.to_rgb()) >> 8
+}
 
 /// 等宽字体。Consolas 在 Windows 上必然存在。
 #[cfg(target_os = "macos")]

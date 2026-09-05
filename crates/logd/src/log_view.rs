@@ -331,6 +331,21 @@ impl LogView {
         }
     }
 
+    /// Replace presentation-only filter colors without rescanning the file.
+    pub fn restyle_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+        match MatcherSet::new(filters, self.doc.encoding()) {
+            Ok(matcher) => {
+                self.error = None;
+                self.doc.set_matcher(Arc::new(matcher));
+                cx.notify();
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
     pub fn set_show_only_filtered(&mut self, on: bool, cx: &mut Context<Self>) {
         self.clear_text_selection(cx);
         self.selection = None;
@@ -1167,6 +1182,7 @@ impl LogView {
         view_row: u64,
         gutter_w: f32,
         h_scroll: f32,
+        palette: theme::Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1271,7 +1287,7 @@ impl LogView {
                         .bottom_0()
                         .left(px(left))
                         .w(px(width))
-                        .bg(theme::c(theme::SELECTION)),
+                        .bg(palette.selection),
                 )
             })
             .when(!is_editing, |el| {
@@ -1301,7 +1317,7 @@ impl LogView {
             .when_some(line_spec.and_then(|f| f.back), |el, c| el.bg(theme::c(c)))
             .when(
                 selected && line_spec.and_then(|filter| filter.back).is_none(),
-                |el| el.bg(theme::c(theme::SELECTION)),
+                |el| el.bg(palette.selection),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -1327,8 +1343,8 @@ impl LogView {
                     .w(px(gutter_w))
                     .pr_2()
                     .justify_end()
-                    .bg(theme::c(theme::GUTTER_BG))
-                    .text_color(theme::c(theme::MUTED))
+                    .bg(palette.gutter)
+                    .text_color(palette.muted)
                     // 行号槽显示的永远是**文件行号**，筛选视图下也不变
                     .child(format!("{}", row.file_line + 1)),
             )
@@ -1380,6 +1396,7 @@ impl Focusable for LogView {
 
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
         // 上一帧 canvas 量到的尺寸；首帧是 0，canvas 回填后会触发再画一次
         let area = self.area.get();
         if area != self.last_area {
@@ -1459,6 +1476,7 @@ impl Render for LogView {
                     first_row + index as u64,
                     gutter_w,
                     h_scroll,
+                    palette,
                     window,
                     cx,
                 )
@@ -1476,8 +1494,9 @@ impl Render for LogView {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(theme::c(theme::BG))
-            .text_color(theme::c(theme::FG))
+            .cursor_default()
+            .bg(palette.background)
+            .text_color(palette.foreground)
             .font_family(theme::MONO)
             .text_size(px(self.font_size))
             .line_height(px(self.line_height))
@@ -1612,7 +1631,8 @@ impl Render for LogView {
                         })
                         .right_0()
                         .w(px(theme::SCROLLBAR_W))
-                        .bg(theme::c(theme::SCROLL_TRACK))
+                        .cursor_default()
+                        .bg(palette.scroll_track)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -1628,11 +1648,11 @@ impl Render for LogView {
                                 .right_0()
                                 .h(px(thumb_len))
                                 .rounded_sm()
-                                .bg(theme::c(if self.drag_grab.is_some() {
-                                    theme::SCROLL_THUMB_HOVER
+                                .bg(if self.drag_grab.is_some() {
+                                    palette.scroll_thumb_hover
                                 } else {
-                                    theme::SCROLL_THUMB
-                                })),
+                                    palette.scroll_thumb
+                                }),
                         ),
                 )
             })
@@ -1649,7 +1669,8 @@ impl Render for LogView {
                         })
                         .bottom_0()
                         .h(px(theme::SCROLLBAR_W))
-                        .bg(theme::c(theme::SCROLL_TRACK))
+                        .cursor_default()
+                        .bg(palette.scroll_track)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -1670,11 +1691,11 @@ impl Render for LogView {
                                 .bottom_0()
                                 .w(px(h_thumb_len))
                                 .rounded_sm()
-                                .bg(theme::c(if self.h_drag_grab.is_some() {
-                                    theme::SCROLL_THUMB_HOVER
+                                .bg(if self.h_drag_grab.is_some() {
+                                    palette.scroll_thumb_hover
                                 } else {
-                                    theme::SCROLL_THUMB
-                                })),
+                                    palette.scroll_thumb
+                                }),
                         ),
                 )
             })

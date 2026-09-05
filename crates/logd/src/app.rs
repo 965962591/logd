@@ -21,7 +21,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
-    h_flex, v_flex, Icon, IconName, InteractiveElementExt as _, Root, Selectable as _, Sizable,
+    h_flex, v_flex, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Root,
+    Selectable as _, Sizable,
 };
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 
@@ -59,12 +60,13 @@ struct TabDrag {
 }
 
 impl Render for TabDrag {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
         div()
             .px_3()
             .h(px(24.))
-            .bg(theme::c(theme::SELECTION))
-            .text_color(theme::c(theme::FG))
+            .bg(palette.selection)
+            .text_color(palette.foreground)
             .child(self.title.clone())
     }
 }
@@ -77,6 +79,7 @@ enum MenuCommand {
     SaveEditedCopy,
     ImportFilters,
     SetEncoding(Encoding),
+    SetTheme(gpui_component::ThemeMode),
     CopySelection,
     ShowAll,
     ShowOnlyFiltered,
@@ -658,7 +661,7 @@ impl LogdApp {
             .map(|keyword| FilterSpec {
                 text: keyword,
                 mode: HighlightMode::Field,
-                fore: Some(theme::SEARCH_FORE),
+                fore: Some(theme::search_foreground_rgb(cx)),
                 ..Default::default()
             })
             .collect();
@@ -828,6 +831,38 @@ impl LogdApp {
         cx.notify();
     }
 
+    fn set_theme(
+        &mut self,
+        mode: gpui_component::ThemeMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.theme().mode == mode {
+            return;
+        }
+
+        gpui_component::Theme::change(mode, Some(window), cx);
+        let search_foreground = theme::search_foreground_rgb(cx);
+        if !self.search_filters.is_empty() {
+            for filter in &mut self.search_filters {
+                filter.fore = Some(search_foreground);
+            }
+            let updates = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| (tab.view.clone(), self.filters_for_tab(index)))
+                .collect::<Vec<_>>();
+            for (view, filters) in updates {
+                view.update(cx, |view, cx| view.restyle_filters(filters, cx));
+            }
+        }
+
+        let _ = crate::settings::save_theme_mode(mode);
+        cx.refresh_windows();
+        cx.notify();
+    }
+
     fn load_tat(&mut self, path: &Path, cx: &mut Context<Self>) {
         match TatFile::load(path) {
             Ok(tat) => {
@@ -917,6 +952,7 @@ impl LogdApp {
             }
             MenuCommand::ImportFilters => self.prompt_import_filters(window, cx),
             MenuCommand::SetEncoding(encoding) => self.set_encoding(encoding, cx),
+            MenuCommand::SetTheme(mode) => self.set_theme(mode, window, cx),
             MenuCommand::CopySelection => {
                 if let Some(view) = self.active_view().cloned() {
                     view.update(cx, |view, cx| view.copy_selection(cx));
@@ -979,6 +1015,7 @@ impl LogdApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let palette = theme::palette(cx);
         let app = cx.entity();
         let lang = self.language;
         let recent = self.recent_files.clone();
@@ -990,6 +1027,7 @@ impl LogdApp {
         let active_encoding = self
             .active_view()
             .map(|view| view.read(cx).doc().encoding());
+        let dark_theme = cx.theme().mode.is_dark();
         let id = match command_group {
             Key::File => "menu-file",
             Key::View => "menu-view",
@@ -999,7 +1037,7 @@ impl LogdApp {
         let button = Button::new(id)
             .xsmall()
             .ghost()
-            .text_color(theme::c(theme::FG))
+            .text_color(palette.foreground)
             .label(text(command_group, lang));
 
         match command_group {
@@ -1088,6 +1126,8 @@ impl LogdApp {
                     let panel_app = app.clone();
                     let search_panel_app = app.clone();
                     let language_app = app.clone();
+                    let light_theme_app = app.clone();
+                    let dark_theme_app = app.clone();
                     let menu = menu
                         .item(
                             PopupMenuItem::new(text(Key::ShowAll, lang))
@@ -1131,7 +1171,7 @@ impl LogdApp {
                                 this.dispatch(MenuCommand::CopySelection, window, cx)
                             })),
                     );
-                    menu.submenu(
+                    let menu = menu.submenu(
                         text(Key::Language, lang),
                         window,
                         cx,
@@ -1147,6 +1187,45 @@ impl LogdApp {
                                         this.dispatch(MenuCommand::ToggleLanguage, window, cx)
                                     },
                                 )),
+                            )
+                        },
+                    );
+                    menu.submenu(
+                        text(Key::Theme, lang),
+                        window,
+                        cx,
+                        move |menu, window, _| {
+                            menu.item(
+                                PopupMenuItem::new(text(Key::LightTheme, lang))
+                                    .checked(!dark_theme)
+                                    .on_click(window.listener_for(
+                                        &light_theme_app,
+                                        |this, _, window, cx| {
+                                            this.dispatch(
+                                                MenuCommand::SetTheme(
+                                                    gpui_component::ThemeMode::Light,
+                                                ),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                            .item(
+                                PopupMenuItem::new(text(Key::DarkTheme, lang))
+                                    .checked(dark_theme)
+                                    .on_click(window.listener_for(
+                                        &dark_theme_app,
+                                        |this, _, window, cx| {
+                                            this.dispatch(
+                                                MenuCommand::SetTheme(
+                                                    gpui_component::ThemeMode::Dark,
+                                                ),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
                             )
                         },
                     )
@@ -1222,6 +1301,7 @@ impl LogdApp {
     }
 
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette(cx);
         let left = h_flex()
             .h_full()
             .items_center()
@@ -1250,17 +1330,18 @@ impl LogdApp {
                 window.prevent_default();
                 cx.stop_propagation();
             })
-            .bg(theme::c(theme::GUTTER_BG))
+            .bg(palette.gutter)
             .border_1()
-            .border_color(theme::c(theme::BORDER))
+            .border_color(palette.border)
             .rounded(px(4.))
-            .text_color(theme::c(theme::FG))
+            .text_color(palette.foreground)
             .child(Input::new(&self.keyword).small().appearance(false))
             .into_any_element();
-        title_bar::render(left, center, window, self.language).into_any_element()
+        title_bar::render(left, center, window, self.language, cx).into_any_element()
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette(cx);
         let app = cx.entity();
         let lang = self.language;
         self.tab_scroll.scroll_to_item(self.active);
@@ -1269,9 +1350,9 @@ impl LogdApp {
             .w_full()
             .h(px(24.))
             .flex_none()
-            .bg(theme::c(theme::GUTTER_BG))
+            .bg(palette.tab_bar)
             .border_b_1()
-            .border_color(theme::c(theme::BORDER))
+            .border_color(palette.border)
             .text_size(px(12.))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
@@ -1292,9 +1373,17 @@ impl LogdApp {
                     .gap_2()
                     .items_center()
                     .border_r_1()
-                    .border_color(theme::c(theme::BORDER))
-                    .bg(theme::c(if active { theme::BG } else { theme::GUTTER_BG }))
-                    .text_color(theme::c(if active { theme::FG } else { theme::MUTED }))
+                    .border_color(palette.border)
+                    .bg(if active {
+                        palette.tab_active
+                    } else {
+                        palette.tab
+                    })
+                    .text_color(if active {
+                        palette.tab_active_foreground
+                    } else {
+                        palette.tab_foreground
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.set_active(index, cx)))
                     .on_drag(drag, move |drag, _, _, cx| cx.new(|_| drag.clone()))
                     .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
@@ -1353,7 +1442,7 @@ impl LogdApp {
             .h(px(28.))
             .flex_none()
             .relative()
-            .bg(theme::c(theme::GUTTER_BG))
+            .bg(palette.tab_bar)
             .child(tabs)
             .child(
                 Scrollbar::horizontal(&self.tab_scroll)
@@ -1362,21 +1451,9 @@ impl LogdApp {
                     .viewport_from_layout()
                     .styles(|styles| {
                         styles
-                            .track(|track| {
-                                track
-                                    .width(px(4.))
-                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
-                            })
-                            .track_hover(|track| {
-                                track
-                                    .width(px(4.))
-                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
-                            })
-                            .track_active(|track| {
-                                track
-                                    .width(px(4.))
-                                    .bg(Hsla::from(theme::c(theme::SCROLL_TRACK)))
-                            })
+                            .track(|track| track.width(px(4.)).bg(palette.scroll_track))
+                            .track_hover(|track| track.width(px(4.)).bg(palette.scroll_track))
+                            .track_active(|track| track.width(px(4.)).bg(palette.scroll_track))
                             .thumb(|thumb| thumb.width(px(4.)).inset(px(0.)))
                             .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
                             .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
@@ -1385,24 +1462,14 @@ impl LogdApp {
             .into_any_element()
     }
 
-    pub fn render_workspace(&self, _cx: &App) -> AnyElement {
+    pub fn render_workspace(&self, cx: &App) -> AnyElement {
         self.active_view()
             .cloned()
             .map(IntoElement::into_any_element)
             .unwrap_or_else(|| {
-                v_flex()
+                div()
                     .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .bg(theme::c(theme::BG))
-                    .text_color(theme::c(theme::FG))
-                    .child("logd")
-                    .child(
-                        div()
-                            .text_color(theme::c(theme::MUTED))
-                            .child(text(Key::Open, self.language)),
-                    )
+                    .bg(theme::palette(cx).background)
                     .into_any_element()
             })
     }
@@ -1412,6 +1479,7 @@ impl LogdApp {
         window: &mut Window,
         cx: &mut Context<FilterPanel>,
     ) -> AnyElement {
+        let palette = theme::palette(cx);
         let (
             filters,
             selected,
@@ -1444,8 +1512,8 @@ impl LogdApp {
 
         v_flex()
             .size_full()
-            .bg(theme::c(theme::BG))
-            .text_color(theme::c(theme::FG))
+            .bg(palette.background)
+            .text_color(palette.foreground)
             .text_size(px(12.))
             .child(
                 h_flex()
@@ -1453,7 +1521,7 @@ impl LogdApp {
                     .px_2()
                     .gap_1()
                     .border_b_1()
-                    .border_color(theme::c(theme::BORDER))
+                    .border_color(palette.border)
                     .child(control_tooltip(
                         "filter-add-tooltip",
                         text(Key::AddFilter, lang),
@@ -1480,7 +1548,7 @@ impl LogdApp {
                         .p_2()
                         .gap_2()
                         .border_b_1()
-                        .border_color(theme::c(theme::BORDER))
+                        .border_color(palette.border)
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
                         .child(control_tooltip(
@@ -1662,13 +1730,13 @@ impl LogdApp {
                     .flex_1()
                     .overflow_y_scrollbar()
                     .children(filters.iter().enumerate().map(|(index, filter)| {
-                        render_filter_row(app, filter, index, selected, lang, window)
+                        render_filter_row(app, filter, index, selected, lang, palette, window)
                     }))
                     .when(filters.is_empty(), |list| {
                         list.child(
                             div()
                                 .p_3()
-                                .text_color(theme::c(theme::MUTED))
+                                .text_color(palette.muted)
                                 .child(text(Key::NoFilters, lang)),
                         )
                     }),
@@ -1685,6 +1753,7 @@ impl LogdApp {
         _window: &mut Window,
         cx: &mut Context<SearchResultsPanel>,
     ) -> AnyElement {
+        let palette = theme::palette(cx);
         let (has_search, files, total_matches, tree_rows, scanning, file_count, lang) = {
             let state = app.read(cx);
             let has_search = !state.search_filters.is_empty();
@@ -1739,34 +1808,31 @@ impl LogdApp {
             group(files.len() as u64),
             text(Key::Files, lang)
         );
-        let panel =
-            v_flex()
-                .size_full()
-                .min_h_0()
-                .bg(theme::c(theme::BG))
-                .text_color(theme::c(theme::FG))
-                .text_size(px(12.))
-                .child(
-                    h_flex()
-                        .h(px(28.))
-                        .flex_none()
-                        .px_2()
-                        .gap_3()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(theme::c(theme::BORDER))
-                        .child(summary)
-                        .when(scanning > 0, |header| {
-                            header.child(div().text_color(theme::c(theme::SEARCH_FORE)).child(
-                                format!(
-                                    "{} {}/{}",
-                                    text(Key::SearchInProgress, lang),
-                                    file_count.saturating_sub(scanning),
-                                    file_count,
-                                ),
-                            ))
-                        }),
-                );
+        let panel = v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(palette.background)
+            .text_color(palette.foreground)
+            .text_size(px(12.))
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .flex_none()
+                    .px_2()
+                    .gap_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(palette.border)
+                    .child(summary)
+                    .when(scanning > 0, |header| {
+                        header.child(div().text_color(palette.search_foreground).child(format!(
+                            "{} {}/{}",
+                            text(Key::SearchInProgress, lang),
+                            file_count.saturating_sub(scanning),
+                            file_count,
+                        )))
+                    }),
+            );
 
         if !has_search {
             return panel
@@ -1775,7 +1841,7 @@ impl LogdApp {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .text_color(theme::c(theme::MUTED))
+                        .text_color(palette.muted)
                         .child(text(Key::SearchResultsPrompt, lang)),
                 )
                 .into_any_element();
@@ -1792,7 +1858,7 @@ impl LogdApp {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .text_color(theme::c(theme::MUTED))
+                        .text_color(palette.muted)
                         .child(message),
                 )
                 .into_any_element();
@@ -1833,10 +1899,10 @@ impl LogdApp {
                                 .gap_1()
                                 .items_center()
                                 .whitespace_nowrap()
-                                .bg(theme::c(theme::GUTTER_BG))
+                                .bg(palette.gutter)
                                 .border_b_1()
-                                .border_color(theme::c(theme::BORDER))
-                                .hover(|row| row.bg(theme::c(theme::CONTROL_HOVER)))
+                                .border_color(palette.border)
+                                .hover(|row| row.bg(palette.control_hover))
                                 .on_click(move |_, _, cx| {
                                     target_panel
                                         .update(cx, |panel, cx| {
@@ -1851,15 +1917,15 @@ impl LogdApp {
                                         IconName::ChevronRight
                                     })
                                     .xsmall()
-                                    .text_color(theme::c(theme::MUTED)),
+                                    .text_color(palette.muted),
                                 )
                                 .child(
                                     Icon::new(IconName::FileText)
                                         .xsmall()
-                                        .text_color(theme::c(theme::MUTED)),
+                                        .text_color(palette.muted),
                                 )
                                 .child(file.full_path.clone())
-                                .child(div().text_color(theme::c(theme::MUTED)).child(count)),
+                                .child(div().text_color(palette.muted).child(count)),
                         );
                         continue;
                     }
@@ -1885,8 +1951,8 @@ impl LogdApp {
                             .flex_none()
                             .items_center()
                             .border_b_1()
-                            .border_color(theme::c(theme::BORDER))
-                            .hover(|row| row.bg(theme::c(theme::CONTROL_HOVER)))
+                            .border_color(palette.border)
+                            .hover(|row| row.bg(palette.control_hover))
                             .on_click(window.listener_for(&target_app, move |this, _, _, cx| {
                                 this.goto_search_result(tab_index, file_line, cx)
                             }))
@@ -1896,7 +1962,7 @@ impl LogdApp {
                                     .h_full()
                                     .flex_none()
                                     .border_r_1()
-                                    .border_color(theme::c(theme::BORDER)),
+                                    .border_color(palette.border),
                             )
                             .child(
                                 div()
@@ -1904,7 +1970,7 @@ impl LogdApp {
                                     .flex_none()
                                     .px_2()
                                     .text_right()
-                                    .text_color(theme::c(theme::MUTED))
+                                    .text_color(palette.muted)
                                     .child(search_line_label(file_line + 1, lang)),
                             )
                             .child(
@@ -1979,13 +2045,14 @@ impl LogdApp {
     }
 
     fn render_status(&self, cx: &App) -> AnyElement {
+        let palette = theme::palette(cx);
         let mut bar = h_flex()
             .h(px(22.))
             .w_full()
             .px_2()
             .gap_4()
-            .bg(theme::c(theme::STATUS_BG))
-            .text_color(theme::c(theme::STATUS_FG))
+            .bg(palette.status)
+            .text_color(palette.foreground)
             .text_size(px(11.));
         if let Some(view) = self.active_view() {
             let view = view.read(cx);
@@ -2043,6 +2110,7 @@ impl LogdApp {
 
 impl Render for LogdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
         let title = self.render_title_bar(window, cx);
         let tabs = self.render_tabs(cx);
         let status = self.render_status(cx);
@@ -2051,7 +2119,7 @@ impl Render for LogdApp {
             .key_context("Logd")
             .track_focus(&self.focus)
             .size_full()
-            .bg(theme::c(theme::BG))
+            .bg(palette.background)
             .on_key_down(cx.listener(Self::on_key))
             .child(title)
             .when(!self.tabs.is_empty(), |root| root.child(tabs))
@@ -2090,6 +2158,7 @@ fn render_filter_row(
     index: usize,
     selected: Option<usize>,
     lang: Language,
+    palette: theme::Palette,
     window: &mut Window,
 ) -> AnyElement {
     let row_app = app.clone();
@@ -2107,9 +2176,7 @@ fn render_filter_row(
         .px_2()
         .gap_2()
         .items_center()
-        .when(selected == Some(index), |row| {
-            row.bg(theme::c(theme::SELECTION))
-        })
+        .when(selected == Some(index), |row| row.bg(palette.selection))
         .on_click(window.listener_for(&row_app, move |this, _, _, cx| {
             this.selected_filter = Some(index);
             cx.notify();
@@ -2275,7 +2342,7 @@ fn render_filter_row(
                 item.child(
                     div()
                         .text_size(px(10.))
-                        .text_color(theme::c(theme::MUTED))
+                        .text_color(palette.muted)
                         .child(filter.description.clone()),
                 )
             },
@@ -2413,8 +2480,7 @@ pub fn run(initial: Vec<PathBuf>) {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
-        // gpui-component defaults to Light; logd uses a dark client-side shell.
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        gpui_component::Theme::change(crate::settings::load_theme_mode(), None, cx);
         let initial = initial.clone();
         let options = crate::platform::window_options(cx);
         cx.spawn(async move |cx| {

@@ -29,8 +29,10 @@ pub fn render(
     center: AnyElement,
     window: &mut Window,
     lang: Language,
+    cx: &App,
 ) -> impl IntoElement {
     let maximized = window.is_maximized();
+    let palette = theme::palette(cx);
 
     div()
         .id("app-title-bar")
@@ -41,10 +43,10 @@ pub fn render(
         .w_full()
         .h(px(HEIGHT))
         .items_center()
-        .bg(theme::c(theme::TITLE_BAR_BG))
+        .bg(palette.title_bar)
         .border_b_1()
-        .border_color(theme::c(theme::BORDER))
-        .text_color(theme::c(theme::FG))
+        .border_color(palette.title_bar_border)
+        .text_color(palette.foreground)
         .on_double_click(|_, window, _| window.zoom_window())
         .child(
             h_flex()
@@ -82,6 +84,7 @@ pub fn render(
                     IconName::WindowMinimize,
                     text(Key::Minimize, lang),
                     false,
+                    palette,
                     |window| window.minimize_window(),
                 ))
                 .child(control(
@@ -100,6 +103,7 @@ pub fn render(
                         lang,
                     ),
                     false,
+                    palette,
                     |window| window.zoom_window(),
                 ))
                 .child(control(
@@ -107,6 +111,7 @@ pub fn render(
                     IconName::WindowClose,
                     text(Key::Close, lang),
                     true,
+                    palette,
                     |window| window.remove_window(),
                 )),
         )
@@ -128,6 +133,7 @@ fn control(
     icon: IconName,
     tooltip: &'static str,
     danger: bool,
+    palette: theme::Palette,
     action: impl Fn(&mut Window) + 'static,
 ) -> impl IntoElement {
     div()
@@ -147,11 +153,9 @@ fn control(
             WindowControlArea::Max
         })
         .when(danger, |el| {
-            el.hover(|s| s.bg(theme::c(theme::DANGER)).text_color(gpui::white()))
+            el.hover(|s| s.bg(palette.danger).text_color(palette.danger_foreground))
         })
-        .when(!danger, |el| {
-            el.hover(|s| s.bg(theme::c(theme::CONTROL_HOVER)))
-        })
+        .when(!danger, |el| el.hover(|s| s.bg(palette.control_hover)))
         .on_mouse_down(MouseButton::Left, |_, window, cx| {
             window.prevent_default();
             cx.stop_propagation();
