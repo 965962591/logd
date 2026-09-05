@@ -59,6 +59,8 @@ pub struct LogView {
     from_cache: bool,
     selection: Option<LineSelection>,
     selecting: bool,
+    text_selection: Option<TextSelection>,
+    text_selecting: bool,
     edits: BTreeMap<u64, String>,
     /// 修改是否已经写入编辑副本。保存后仍保留编辑内容用于显示。
     edits_saved: bool,
@@ -78,9 +80,54 @@ struct LineSelection {
     active_row: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    view_row: u64,
+    byte: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPoint,
+    active: TextPoint,
+}
+
 impl LineSelection {
     fn range(self) -> std::ops::RangeInclusive<u64> {
         self.anchor_row.min(self.active_row)..=self.anchor_row.max(self.active_row)
+    }
+}
+
+impl TextSelection {
+    fn ordered(self) -> (TextPoint, TextPoint) {
+        if self.anchor <= self.active {
+            (self.anchor, self.active)
+        } else {
+            (self.active, self.anchor)
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.anchor == self.active
+    }
+
+    fn range_for_row(self, view_row: u64, line_len: usize) -> Option<std::ops::Range<usize>> {
+        let (start, end) = self.ordered();
+        if !(start.view_row..=end.view_row).contains(&view_row) {
+            return None;
+        }
+        if start.view_row == end.view_row {
+            return Some(start.byte.min(line_len)..end.byte.min(line_len));
+        }
+
+        let range = if view_row == start.view_row {
+            start.byte.min(line_len)..line_len
+        } else if view_row == end.view_row {
+            0..end.byte.min(line_len)
+        } else {
+            0..line_len
+        };
+        Some(range)
     }
 }
 
@@ -122,6 +169,8 @@ impl LogView {
             from_cache: loaded.from_cache,
             selection: None,
             selecting: false,
+            text_selection: None,
+            text_selecting: false,
             edits: BTreeMap::new(),
             edits_saved: true,
             max_line_width: 0.0,
@@ -238,6 +287,9 @@ impl LogView {
         match MatcherSet::new(filters, self.doc.encoding()) {
             Ok(m) => {
                 self.error = None;
+                self.clear_text_selection(cx);
+                self.selection = None;
+                self.selecting = false;
                 self.doc.set_matcher(Arc::new(m));
                 self.start_scan(cx);
             }
@@ -249,6 +301,9 @@ impl LogView {
     }
 
     pub fn set_show_only_filtered(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.clear_text_selection(cx);
+        self.selection = None;
+        self.selecting = false;
         self.doc.set_show_only_filtered(on);
         cx.notify();
     }
@@ -311,6 +366,34 @@ impl LogView {
     // ---- 输入 ----
 
     pub fn copy_selection(&self, cx: &mut App) {
+        if let Some(selection) = self
+            .text_selection
+            .filter(|selection| !selection.is_empty())
+        {
+            let (start, end) = selection.ordered();
+            let mut output = String::new();
+            for view_row in start.view_row..=end.view_row {
+                let Some(file_line) = self.doc.row_to_file_line(view_row) else {
+                    continue;
+                };
+                let text = self
+                    .edits
+                    .get(&file_line)
+                    .cloned()
+                    .or_else(|| self.doc.line_text(file_line))
+                    .unwrap_or_default();
+                let Some(range) = selection.range_for_row(view_row, text.len()) else {
+                    continue;
+                };
+                if view_row != start.view_row {
+                    output.push('\n');
+                }
+                output.push_str(&text[range]);
+            }
+            cx.write_to_clipboard(output.into());
+            return;
+        }
+
         if let Some(input) = self
             .active_input_line
             .and_then(|file_line| self.line_inputs.get(&file_line))
@@ -345,6 +428,130 @@ impl LogView {
         }
     }
 
+    fn clear_text_selection(&mut self, cx: &mut Context<Self>) {
+        self.text_selection = None;
+        self.text_selecting = false;
+        let inputs = self.line_inputs.values().cloned().collect::<Vec<_>>();
+        for input in inputs {
+            let state = input.read(cx);
+            let range = state.selected_range();
+            let cursor = state.cursor();
+            if !range.is_empty() {
+                input.update(cx, |state, cx| state.set_selected_range(cursor..cursor, cx));
+            }
+        }
+    }
+
+    fn discard_text_selection(&mut self) -> bool {
+        let had_selection = self.text_selection.take().is_some();
+        self.text_selecting = false;
+        had_selection
+    }
+
+    fn apply_text_selection(&self, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection else {
+            return;
+        };
+        let inputs = self
+            .line_inputs
+            .iter()
+            .map(|(&file_line, input)| (file_line, input.clone()))
+            .collect::<Vec<_>>();
+        for (file_line, input) in inputs {
+            let view_row = self.doc.file_line_to_row(file_line);
+            let state = input.read(cx);
+            let current = state.selected_range();
+            let cursor = state.cursor();
+            let desired = selection
+                .range_for_row(view_row, state.value().len())
+                .unwrap_or(cursor..cursor);
+            if current != desired {
+                input.update(cx, |state, cx| state.set_selected_range(desired, cx));
+            }
+        }
+    }
+
+    fn begin_text_selection(&mut self, view_row: u64, cx: &mut Context<Self>) {
+        let Some(file_line) = self.doc.row_to_file_line(view_row) else {
+            return;
+        };
+        let Some(input) = self.line_inputs.get(&file_line) else {
+            return;
+        };
+        let state = input.read(cx);
+        let range = state.selected_range();
+        let active_byte = state.cursor();
+        let anchor_byte = if range.is_empty() {
+            active_byte
+        } else if active_byte == range.start {
+            range.end
+        } else {
+            range.start
+        };
+
+        self.selection = None;
+        self.selecting = false;
+        self.active_input_line = Some(file_line);
+        self.text_selection = Some(TextSelection {
+            anchor: TextPoint {
+                view_row,
+                byte: anchor_byte,
+            },
+            active: TextPoint {
+                view_row,
+                byte: active_byte,
+            },
+        });
+        self.text_selecting = true;
+        self.apply_text_selection(cx);
+        cx.notify();
+    }
+
+    fn extend_text_selection(
+        &mut self,
+        position: Point<Pixels>,
+        gutter_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view_row) = self.row_at_y(f32::from(position.y)) else {
+            return;
+        };
+        let Some(file_line) = self.doc.row_to_file_line(view_row) else {
+            return;
+        };
+        let Some(input) = self.line_inputs.get(&file_line) else {
+            return;
+        };
+        let text = input.read(cx).value();
+        let byte = if text.is_empty() {
+            0
+        } else {
+            let run = TextRun {
+                len: text.len(),
+                font: font(theme::MONO),
+                ..Default::default()
+            };
+            let local_x =
+                f32::from(position.x) - f32::from(self.last_area.origin.x) - gutter_w - 8.0
+                    + self.doc.viewport().h_scroll();
+            window
+                .text_system()
+                .shape_line(text, px(theme::FONT_SIZE), &[run], None)
+                .closest_index_for_x(px(local_x))
+        };
+        let Some(selection) = &mut self.text_selection else {
+            return;
+        };
+        let active = TextPoint { view_row, byte };
+        if selection.active == active {
+            return;
+        }
+        selection.active = active;
+        self.apply_text_selection(cx);
+        cx.notify();
+    }
+
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let row = self
             .selection
@@ -360,6 +567,7 @@ impl LogView {
         let Some(input) = self.line_inputs.get(&file_line).cloned() else {
             return;
         };
+        self.clear_text_selection(cx);
         if let Some(previous) = self.editing_line.filter(|previous| *previous != file_line) {
             self.commit_line_input(previous, cx);
         }
@@ -441,6 +649,7 @@ impl LogView {
                         }
                         InputEvent::Change if this.editing_line == Some(file_line) => {
                             this.editing_changed = true;
+                            this.discard_text_selection();
                             cx.notify();
                         }
                         InputEvent::PressEnter { .. } => this.commit_edit(window, cx),
@@ -468,6 +677,7 @@ impl LogView {
                 input.update(cx, |state, cx| state.set_scroll_offset(offset, cx));
             }
         }
+        self.apply_text_selection(cx);
     }
 
     pub fn save_edited_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -547,6 +757,7 @@ impl LogView {
     }
 
     fn select_row(&mut self, row: u64, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_text_selection(cx);
         self.active_input_line = None;
         self.selection = match (extend, self.selection) {
             (true, Some(selection)) => Some(LineSelection {
@@ -581,9 +792,7 @@ impl LogView {
             return;
         };
         if let Some(selection) = &mut self.selection {
-            // Keep the legacy line-selection gesture bounded to its original
-            // row. Text selection in the log body is handled by the input.
-            if row == selection.anchor_row && selection.active_row != row {
+            if selection.active_row != row {
                 selection.active_row = row;
                 cx.notify();
             }
@@ -607,17 +816,33 @@ impl LogView {
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        let primary = crate::platform::primary_modifier(&ks.modifiers);
         let input_focused = self
             .active_input_line
             .and_then(|file_line| self.line_inputs.get(&file_line))
             .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(_window));
         if input_focused {
+            if primary
+                && ks.key == "c"
+                && self
+                    .text_selection
+                    .is_some_and(|selection| !selection.is_empty())
+            {
+                // The focused per-row input copies only its own fragment. This
+                // handler runs while the event bubbles and replaces it with the
+                // complete cross-row selection.
+                self.copy_selection(cx);
+                return;
+            }
             if ks.key == "escape" {
                 self.cancel_edit(_window, cx);
+                return;
+            }
+            if self.discard_text_selection() {
+                cx.notify();
             }
             return;
         }
-        let primary = crate::platform::primary_modifier(&ks.modifiers);
         if primary && ks.key == "c" {
             self.copy_selection(cx);
             return;
@@ -743,6 +968,7 @@ impl LogView {
         view_row: u64,
         gutter_w: f32,
         h_scroll: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let filters = self.doc.matcher().filters();
@@ -756,6 +982,25 @@ impl LogView {
             .line_inputs
             .get(&row.file_line)
             .expect("visible rows have synchronized InputState instances");
+        let text_selection_bounds = self
+            .text_selection
+            .filter(|selection| !selection.is_empty())
+            .and_then(|selection| {
+                let text = input.read(cx).value();
+                let range = selection.range_for_row(view_row, text.len())?;
+                let run = TextRun {
+                    len: text.len(),
+                    font: font(theme::MONO),
+                    ..Default::default()
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(text, px(theme::FONT_SIZE), &[run], None);
+                let start_x = f32::from(shaped.x_for_index(range.start));
+                let end_x = f32::from(shaped.x_for_index(range.end));
+                Some((8.0 + start_x - h_scroll, (end_x - start_x).max(1.0)))
+            });
 
         let mut content = div()
             .flex_none()
@@ -819,6 +1064,17 @@ impl LogView {
             .h_full()
             .pl_2()
             .overflow_hidden()
+            .when_some(text_selection_bounds, |el, (left, width)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(left))
+                        .w(px(width))
+                        .bg(theme::c(theme::SELECTION)),
+                )
+            })
             .when(!is_editing, |el| {
                 el.child(
                     div()
@@ -851,10 +1107,7 @@ impl LogView {
                     let in_content = f32::from(event.position.x)
                         >= f32::from(this.last_area.origin.x) + gutter_w;
                     if in_content {
-                        if this.selection.take().is_some() {
-                            this.selecting = false;
-                            cx.notify();
-                        }
+                        this.begin_text_selection(view_row, cx);
                         return;
                     }
                     if this.editing_line.is_some() {
@@ -995,6 +1248,20 @@ impl Render for LogView {
         let pixel_offset = vp.pixel_offset();
         let first_row = vp.anchor_line();
         self.sync_line_inputs(&rows, h_scroll, window, cx);
+        let rendered_rows = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                self.render_row(
+                    row,
+                    first_row + index as u64,
+                    gutter_w,
+                    h_scroll,
+                    window,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let bounds_sink = self.area.clone();
         let handle = cx.entity().downgrade();
@@ -1013,11 +1280,13 @@ impl Render for LogView {
             .line_height(px(theme::LINE_HEIGHT))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
                 if this.h_drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
                     this.on_hdrag_move(f32::from(ev.position.x), gutter_w, show_vertical, cx);
                 } else if this.drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
                     this.on_drag_move(f32::from(ev.position.y), cx);
+                } else if this.text_selecting && ev.pressed_button == Some(MouseButton::Left) {
+                    this.extend_text_selection(ev.position, gutter_w, window, cx);
                 } else if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
                     this.extend_selection_to_y(f32::from(ev.position.y), cx);
                 }
@@ -1029,6 +1298,7 @@ impl Render for LogView {
                         cx.notify();
                     }
                     this.selecting = false;
+                    this.text_selecting = false;
                 }),
             )
             // 量视口尺寸：prepaint 回填，尺寸真变了才 notify，避免每帧重画
@@ -1053,9 +1323,7 @@ impl Render for LogView {
                     .right_0()
                     .flex()
                     .flex_col()
-                    .children(rows.iter().enumerate().map(|(index, row)| {
-                        self.render_row(row, first_row + index as u64, gutter_w, h_scroll, cx)
-                    })),
+                    .children(rendered_rows),
             )
             .when(show_vertical, |el| {
                 el.child(
@@ -1136,5 +1404,50 @@ impl Render for LogView {
                         ),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextPoint, TextSelection};
+
+    fn selection(anchor: (u64, usize), active: (u64, usize)) -> TextSelection {
+        TextSelection {
+            anchor: TextPoint {
+                view_row: anchor.0,
+                byte: anchor.1,
+            },
+            active: TextPoint {
+                view_row: active.0,
+                byte: active.1,
+            },
+        }
+    }
+
+    #[test]
+    fn text_selection_splits_across_rows() {
+        let selection = selection((2, 3), (4, 2));
+
+        assert_eq!(selection.range_for_row(1, 10), None);
+        assert_eq!(selection.range_for_row(2, 10), Some(3..10));
+        assert_eq!(selection.range_for_row(3, 7), Some(0..7));
+        assert_eq!(selection.range_for_row(4, 10), Some(0..2));
+        assert_eq!(selection.range_for_row(5, 10), None);
+    }
+
+    #[test]
+    fn text_selection_supports_upward_dragging() {
+        let selection = selection((4, 2), (2, 3));
+
+        assert_eq!(selection.range_for_row(2, 10), Some(3..10));
+        assert_eq!(selection.range_for_row(3, 7), Some(0..7));
+        assert_eq!(selection.range_for_row(4, 10), Some(0..2));
+    }
+
+    #[test]
+    fn text_selection_keeps_single_row_offsets() {
+        let selection = selection((8, 7), (8, 2));
+
+        assert_eq!(selection.range_for_row(8, 10), Some(2..7));
     }
 }
