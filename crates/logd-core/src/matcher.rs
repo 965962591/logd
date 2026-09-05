@@ -290,6 +290,45 @@ impl MatcherSet {
         !self.has_include || hit_include
     }
 
+    /// Record every active filter that matches this line and return the
+    /// configured-filter visibility verdict. A filter is recorded at most
+    /// once even if its pattern occurs multiple times on the same line.
+    pub fn matching_filters(&self, line: &[u8], hits: &mut Vec<bool>) -> bool {
+        hits.clear();
+        hits.resize(self.filters.len(), false);
+        if self.is_noop() {
+            return true;
+        }
+
+        for (ac, ids) in [
+            (&self.ac_cs, &self.ac_cs_ids),
+            (&self.ac_ci, &self.ac_ci_ids),
+        ] {
+            let Some(ac) = ac else { continue };
+            for matched in ac.find_overlapping_iter(line) {
+                hits[ids[matched.pattern().as_usize()]] = true;
+            }
+        }
+
+        if let Some(set) = &self.re_set {
+            for pattern in set.matches(line).iter() {
+                hits[self.re_ids[pattern]] = true;
+            }
+        }
+
+        let mut hit_include = false;
+        for (index, hit) in hits.iter().copied().enumerate() {
+            if !hit {
+                continue;
+            }
+            if self.filters[index].excluding {
+                return false;
+            }
+            hit_include = true;
+        }
+        !self.has_include || hit_include
+    }
+
     /// 渲染路径。同时给出可见性、行级样式、以及字段模式的命中区间。
     ///
     /// `spans` 只装**字段模式**过滤器的命中；行模式不需要逐字区间。
@@ -472,6 +511,24 @@ mod tests {
         }]);
         assert!(m.is_visible(b"clean line"));
         assert!(!m.is_visible(b"has noise"));
+    }
+
+    #[test]
+    fn matching_filters_reports_each_filter_once_per_line() {
+        let m = set(vec![
+            lit("alpha"),
+            lit("beta"),
+            FilterSpec {
+                excluding: true,
+                ..lit("noise")
+            },
+        ]);
+        let mut hits = Vec::new();
+
+        assert!(m.matching_filters(b"alpha alpha beta", &mut hits));
+        assert_eq!(hits, vec![true, true, false]);
+        assert!(!m.matching_filters(b"alpha noise", &mut hits));
+        assert_eq!(hits, vec![true, false, true]);
     }
 
     /// 回归：非重叠的 leftmost 语义会让 "bcd" 被 "abc" 吃掉。

@@ -22,7 +22,7 @@ use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
-    cache, index::HEAD_BYTES, scan_all, scan_all_with_query, scan_query_all, CompileOptions,
+    cache, index::HEAD_BYTES, scan_all_with_query_and_counts, scan_query_all, CompileOptions,
     Document, Encoding, FileSource, FilterSpec, LineIndex, MatcherSet, Progress, Query, RenderRow,
     ScanOutcome, ScrollTo,
 };
@@ -55,6 +55,7 @@ pub struct LogView {
     h_drag_grab: Option<f32>,
     indexing: Option<Arc<Progress>>,
     scanning: Option<Arc<Progress>>,
+    filter_match_counts: Option<Arc<Vec<u64>>>,
     search_query: Arc<Query>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
@@ -175,6 +176,7 @@ impl LogView {
             h_drag_grab: None,
             indexing: None,
             scanning: None,
+            filter_match_counts: None,
             search_query,
             search_matches: None,
             search_scanning: None,
@@ -217,6 +219,10 @@ impl LogView {
 
     pub fn scanning_progress(&self) -> Option<f32> {
         self.scanning.as_ref().map(|p| p.fraction())
+    }
+
+    pub fn filter_match_counts(&self) -> Option<Arc<Vec<u64>>> {
+        self.filter_match_counts.clone()
     }
 
     pub fn search_scanning_progress(&self) -> Option<f32> {
@@ -315,6 +321,7 @@ impl LogView {
     /// 换一套过滤器。非活动标签页可以先 [`mark_dirty`]，切过去时再调这个。
     pub fn apply_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
         self.dirty = false;
+        self.filter_match_counts = None;
         match MatcherSet::new(filters, self.doc.encoding()) {
             Ok(m) => {
                 self.error = None;
@@ -441,7 +448,9 @@ impl LogView {
         if let Some(p) = self.scanning.take() {
             p.cancel();
         }
+        self.filter_match_counts = None;
         if self.doc.matcher().is_noop() && self.search_query.is_empty() {
+            self.filter_match_counts = Some(Arc::new(vec![0; self.doc.matcher().filters().len()]));
             self.doc.set_matches(None);
             cx.notify();
             return;
@@ -460,11 +469,13 @@ impl LogView {
             let out = cx
                 .background_executor()
                 .spawn(async move {
-                    if query.is_empty() {
-                        scan_all(source.data(), &index, &matcher, &progress)
-                    } else {
-                        scan_all_with_query(source.data(), &index, &matcher, &query, &progress)
-                    }
+                    scan_all_with_query_and_counts(
+                        source.data(),
+                        &index,
+                        &matcher,
+                        &query,
+                        &progress,
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -473,8 +484,15 @@ impl LogView {
                     return;
                 }
                 match out {
-                    Some(ScanOutcome::Matched(v)) => this.doc.set_matches(Some(Arc::new(v))),
-                    Some(ScanOutcome::AllVisible) => this.doc.set_matches(None),
+                    Some(result) => {
+                        this.filter_match_counts = Some(Arc::new(result.filter_counts));
+                        match result.outcome {
+                            ScanOutcome::Matched(lines) => {
+                                this.doc.set_matches(Some(Arc::new(lines)))
+                            }
+                            ScanOutcome::AllVisible => this.doc.set_matches(None),
+                        }
+                    }
                     None => {} // 被取消
                 }
                 this.scanning = None;

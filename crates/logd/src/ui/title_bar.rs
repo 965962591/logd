@@ -12,7 +12,7 @@ use crate::theme;
 const HEIGHT: f32 = 34.0;
 const CONTROL_WIDTH: f32 = 46.0;
 const SIDE_DRAG_MIN_WIDTH: f32 = 64.0;
-const SEARCH_MAX_WIDTH: f32 = 520.0;
+const SEARCH_MAX_WIDTH: f32 = 720.0;
 const CENTER_DRAG_MIN_WIDTH: f32 = 20.0;
 const APP_ICON_BYTES: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/2.png"));
@@ -30,6 +30,7 @@ pub fn render(
     window: &mut Window,
     lang: Language,
     cx: &App,
+    on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let maximized = window.is_maximized();
     let palette = theme::palette(cx);
@@ -38,7 +39,7 @@ pub fn render(
         .id("app-title-bar")
         .relative()
         .grid()
-        .grid_cols(3)
+        .grid_cols(4)
         .flex_none()
         .w_full()
         .h(px(HEIGHT))
@@ -62,6 +63,7 @@ pub fn render(
                 .h_full()
                 .w_full()
                 .min_w_0()
+                .col_span(2)
                 .justify_center()
                 .child(drag_region("title-drag-center-left", CENTER_DRAG_MIN_WIDTH))
                 .child(div().w_full().max_w(px(SEARCH_MAX_WIDTH)).child(center))
@@ -85,7 +87,7 @@ pub fn render(
                     text(Key::Minimize, lang),
                     false,
                     palette,
-                    |window| window.minimize_window(),
+                    |window, _| window.minimize_window(),
                 ))
                 .child(control(
                     "window-maximize",
@@ -104,7 +106,7 @@ pub fn render(
                     ),
                     false,
                     palette,
-                    |window| window.zoom_window(),
+                    |window, _| window.zoom_window(),
                 ))
                 .child(control(
                     "window-close",
@@ -112,7 +114,7 @@ pub fn render(
                     text(Key::Close, lang),
                     true,
                     palette,
-                    |window| window.remove_window(),
+                    on_close,
                 )),
         )
 }
@@ -134,7 +136,7 @@ fn control(
     tooltip: &'static str,
     danger: bool,
     palette: theme::Palette,
-    action: impl Fn(&mut Window) + 'static,
+    action: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -162,7 +164,7 @@ fn control(
         })
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
-            action(window);
+            action(window, cx);
         })
         .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx))
         .child(Icon::new(icon).small())

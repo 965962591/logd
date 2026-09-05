@@ -102,6 +102,8 @@ pub struct LogdApp {
     search_query: String,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
+    filters_dirty: bool,
+    filter_save_prompt_open: bool,
     recent_files: Vec<PathBuf>,
     keyword: Entity<InputState>,
     filter_text: Entity<InputState>,
@@ -225,6 +227,12 @@ impl LogdApp {
             }
         })
         .detach();
+        let close_app = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            close_app
+                .update(cx, |app, cx| app.should_close_window(window, cx))
+                .unwrap_or(true)
+        });
 
         let mut this = Self {
             tabs: Vec::new(),
@@ -234,6 +242,8 @@ impl LogdApp {
             search_query: String::new(),
             show_only_filtered: false,
             tat_path: None,
+            filters_dirty: false,
+            filter_save_prompt_open: false,
             recent_files: crate::settings::load_recent_files(),
             keyword,
             filter_text,
@@ -642,6 +652,7 @@ impl LogdApp {
     }
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
+        self.filters_dirty = true;
         for (index, tab) in self.tabs.iter().enumerate() {
             if index == self.active {
                 self.apply_filters_to_view(index, &tab.view, cx);
@@ -806,7 +817,11 @@ impl LogdApp {
     }
 
     fn set_show_only(&mut self, only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_only_filtered == only {
+            return;
+        }
         self.show_only_filtered = only;
+        self.filters_dirty = true;
         if let Some(view) = self.active_view().cloned() {
             let pointer_y = f32::from(window.mouse_position().y);
             view.update(cx, |view, cx| {
@@ -876,6 +891,7 @@ impl LogdApp {
                     self.filters.len()
                 ));
                 self.filters_changed(cx);
+                self.filters_dirty = false;
             }
             Err(error) => {
                 self.status = Some(format!(".tat: {error:#}"));
@@ -884,25 +900,44 @@ impl LogdApp {
         }
     }
 
-    fn save_tat(&mut self, cx: &mut Context<Self>) {
+    fn save_tat(&mut self, window: &mut Window, close_after_save: bool, cx: &mut Context<Self>) {
         let path = self.tat_path.clone().or_else(|| {
             self.tabs
                 .get(self.active)
                 .map(|tab| tab.path.with_extension("tat"))
         });
         let Some(path) = path else {
-            self.status = Some(text(Key::Ready, self.language).to_string());
-            cx.notify();
+            let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let target = cx.prompt_for_new_path(&directory, Some("filters.tat"));
+            cx.spawn_in(window, async move |this, window| {
+                let Some(path) = target.await.ok().and_then(Result::ok).flatten() else {
+                    return;
+                };
+                _ = this.update_in(window, |this, window, cx| {
+                    if this.save_tat_to(path, cx) && close_after_save {
+                        window.remove_window();
+                    }
+                });
+            })
+            .detach();
             return;
         };
+        if self.save_tat_to(path, cx) && close_after_save {
+            window.remove_window();
+        }
+    }
+
+    fn save_tat_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
         let file = TatFile {
             show_only_filtered: self.show_only_filtered,
             filters: self.filters.clone(),
             ..Default::default()
         };
-        self.status = Some(match file.save(&path) {
+        let saved = file.save(&path);
+        self.status = Some(match &saved {
             Ok(()) => {
                 self.tat_path = Some(path.clone());
+                self.filters_dirty = false;
                 format!(
                     "{}: {}",
                     text(Key::SaveFilter, self.language),
@@ -912,6 +947,52 @@ impl LogdApp {
             Err(error) => format!("{}: {error:#}", text(Key::SaveFilter, self.language)),
         });
         cx.notify();
+        saved.is_ok()
+    }
+
+    fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.filters_dirty {
+            return true;
+        }
+        self.prompt_save_filters_before_close(window, cx);
+        false
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_close_window(window, cx) {
+            window.remove_window();
+        }
+    }
+
+    fn prompt_save_filters_before_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_save_prompt_open {
+            return;
+        }
+        self.filter_save_prompt_open = true;
+        let language = self.language;
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            text(Key::UnsavedFilters, language),
+            Some(text(Key::UnsavedFiltersDetail, language)),
+            &[
+                PromptButton::ok(text(Key::SaveFilter, language)),
+                PromptButton::new(text(Key::DontSave, language)),
+                PromptButton::cancel(text(Key::Cancel, language)),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, window| {
+            let answer = answer.await.ok();
+            _ = this.update_in(window, |this, window, cx| {
+                this.filter_save_prompt_open = false;
+                match answer {
+                    Some(0) => this.save_tat(window, true, cx),
+                    Some(1) => window.remove_window(),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn show_filter_panel(
@@ -971,7 +1052,7 @@ impl LogdApp {
             MenuCommand::AddFilter => self.begin_add_filter(window, cx),
             MenuCommand::EditFilter => self.begin_edit_filter(window, cx),
             MenuCommand::DeleteFilter => self.delete_selected_filter(cx),
-            MenuCommand::SaveFilters => self.save_tat(cx),
+            MenuCommand::SaveFilters => self.save_tat(window, false, cx),
             MenuCommand::ToggleLanguage => {
                 self.language = self.language.toggle();
                 cx.notify();
@@ -1337,7 +1418,20 @@ impl LogdApp {
             .text_color(palette.foreground)
             .child(Input::new(&self.keyword).small().appearance(false))
             .into_any_element();
-        title_bar::render(left, center, window, self.language, cx).into_any_element()
+        let close_app = cx.weak_entity();
+        title_bar::render(
+            left,
+            center,
+            window,
+            self.language,
+            cx,
+            move |window, cx| {
+                close_app
+                    .update(cx, |app, cx| app.request_close(window, cx))
+                    .ok();
+            },
+        )
+        .into_any_element()
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1489,9 +1583,13 @@ impl LogdApp {
             filter_fore,
             filter_back,
             filter_scope,
+            filter_counts,
+            filter_counts_pending,
             lang,
         ) = {
             let state = app.read(cx);
+            let active_view = state.active_view();
+            let filter_counts = active_view.and_then(|view| view.read(cx).filter_match_counts());
             (
                 state.filters.clone(),
                 state.selected_filter,
@@ -1501,6 +1599,8 @@ impl LogdApp {
                 state.filter_fore.clone(),
                 state.filter_back.clone(),
                 state.filter_scope,
+                filter_counts.clone(),
+                active_view.is_some() && filter_counts.is_none(),
                 state.language,
             )
         };
@@ -1730,7 +1830,19 @@ impl LogdApp {
                     .flex_1()
                     .overflow_y_scrollbar()
                     .children(filters.iter().enumerate().map(|(index, filter)| {
-                        render_filter_row(app, filter, index, selected, lang, palette, window)
+                        render_filter_row(
+                            app,
+                            filter,
+                            index,
+                            selected,
+                            filter_counts
+                                .as_deref()
+                                .and_then(|counts| counts.get(index).copied()),
+                            filter_counts_pending,
+                            lang,
+                            palette,
+                            window,
+                        )
                     }))
                     .when(filters.is_empty(), |list| {
                         list.child(
@@ -2157,6 +2269,8 @@ fn render_filter_row(
     filter: &FilterSpec,
     index: usize,
     selected: Option<usize>,
+    match_count: Option<u64>,
+    match_count_pending: bool,
     lang: Language,
     palette: theme::Palette,
     window: &mut Window,
@@ -2336,16 +2450,49 @@ fn render_filter_row(
                         ),
                 )),
         )
-        .child(v_flex().min_w_0().flex_1().child(filter.text.clone()).when(
-            !filter.description.is_empty(),
-            |item| {
-                item.child(
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .child(
                     div()
-                        .text_size(px(10.))
-                        .text_color(palette.muted)
-                        .child(filter.description.clone()),
+                        .min_w_0()
+                        .max_w_full()
+                        .self_start()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .px_1()
+                        .when_some(filter.fore, |preview, color| {
+                            preview.text_color(theme::c(color))
+                        })
+                        .when_some(filter.back, |preview, color| preview.bg(theme::c(color)))
+                        .when(filter.bold, |preview| preview.font_weight(FontWeight::BOLD))
+                        .when(filter.italic, |preview| preview.italic())
+                        .child(filter.text.clone()),
                 )
-            },
+                .when(!filter.description.is_empty(), |item| {
+                    item.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(palette.muted)
+                            .child(filter.description.clone()),
+                    )
+                }),
+        )
+        .child(control_tooltip(
+            ("filter-match-count-tooltip", index),
+            text(Key::FilterMatchCount, lang),
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .text_size(px(10.))
+                .text_color(palette.muted)
+                .child(Icon::new(IconName::Search).xsmall())
+                .child(match match_count {
+                    Some(count) => group(count),
+                    None if match_count_pending => "...".to_string(),
+                    None => "-".to_string(),
+                }),
         ))
         .context_menu(move |menu, window, _| {
             let edit_app = context_app.clone();
