@@ -14,6 +14,8 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_component::dialog::DialogFooter;
 use gpui_component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
 };
@@ -21,8 +23,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Root,
-    Selectable as _, Sizable,
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
+    Root, Selectable as _, Sizable, WindowExt as _,
 };
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 
@@ -107,6 +109,7 @@ pub struct LogdApp {
     recent_files: Vec<PathBuf>,
     search_history: Vec<String>,
     keyword: Entity<InputState>,
+    search_history_select: Entity<ComboboxState<Vec<String>>>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
     filter_fore: Entity<ColorPickerState>,
@@ -129,9 +132,12 @@ pub struct LogdApp {
 impl LogdApp {
     pub fn new(initial: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let language = Language::from_env();
+        let search_history = crate::settings::load_search_history();
         let keyword = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::SearchPlaceholder, language))
         });
+        let search_history_select =
+            cx.new(|cx| ComboboxState::new(search_history.clone(), Vec::new(), window, cx));
         let filter_text = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::FilterTextPlaceholder, language))
         });
@@ -142,12 +148,40 @@ impl LogdApp {
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
 
+        let search_history_for_keyword = search_history_select.clone();
         cx.subscribe_in(
             &keyword,
             window,
-            |this, state, ev: &InputEvent, window, cx| {
+            move |this, state, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let value = state.read(cx).value().to_string();
+                    let selected = search_history_for_keyword.read(cx).selected_value();
+                    if selected
+                        .as_deref()
+                        .is_some_and(|selected| selected != value)
+                    {
+                        search_history_for_keyword.update(cx, |state, cx| {
+                            state.clear_selection(cx);
+                        });
+                    }
+                }
                 if matches!(ev, InputEvent::PressEnter { .. }) {
                     this.set_global_search(state.read(cx).value().to_string(), window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &search_history_select,
+            window,
+            |this, _, ev: &ComboboxEvent<Vec<String>>, window, cx| {
+                if let ComboboxEvent::Change(values) = ev {
+                    if let Some(value) = values.first() {
+                        let value = value.clone();
+                        this.keyword
+                            .update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+                        this.set_global_search(value, window, cx);
+                    }
                 }
             },
         )
@@ -246,8 +280,9 @@ impl LogdApp {
             filters_dirty: false,
             filter_save_prompt_open: false,
             recent_files: crate::settings::load_recent_files(),
-            search_history: crate::settings::load_search_history(),
+            search_history,
             keyword,
+            search_history_select,
             filter_text,
             filter_description,
             filter_fore,
@@ -376,9 +411,13 @@ impl LogdApp {
         let _ = crate::settings::save_search_history(&self.search_history);
     }
 
-    fn clear_search_history(&mut self, cx: &mut Context<Self>) {
+    fn clear_search_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_history.clear();
         let _ = crate::settings::save_search_history(&self.search_history);
+        self.search_history_select.update(cx, |state, cx| {
+            state.set_items(Vec::new(), window, cx);
+            state.clear_selection(cx);
+        });
         cx.notify();
     }
 
@@ -683,6 +722,11 @@ impl LogdApp {
         let value = value.trim().to_string();
         if !value.is_empty() {
             self.remember_search(&value);
+            let history = self.search_history.clone();
+            self.search_history_select.update(cx, |state, cx| {
+                state.set_items(history, window, cx);
+                state.clear_selection(cx);
+            });
         }
         let expression = parse_search_expression(&value);
         self.search_query = expression.query;
@@ -990,29 +1034,60 @@ impl LogdApp {
         }
         self.filter_save_prompt_open = true;
         let language = self.language;
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            text(Key::UnsavedFilters, language),
-            Some(text(Key::UnsavedFiltersDetail, language)),
-            &[
-                PromptButton::ok(text(Key::SaveFilter, language)),
-                PromptButton::new(text(Key::DontSave, language)),
-                PromptButton::cancel(text(Key::Cancel, language)),
-            ],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, window| {
-            let answer = answer.await.ok();
-            _ = this.update_in(window, |this, window, cx| {
-                this.filter_save_prompt_open = false;
-                match answer {
-                    Some(0) => this.save_tat(window, true, cx),
-                    Some(1) => window.remove_window(),
-                    _ => {}
-                }
-            });
-        })
-        .detach();
+        let save_app = cx.entity();
+        let discard_app = save_app.clone();
+        let cancel_app = save_app.clone();
+        let close_app = save_app.clone();
+        window.open_alert_dialog(cx, move |alert, window, _| {
+            let on_close_app = close_app.clone();
+            alert
+                .title(text(Key::UnsavedFilters, language))
+                .description(text(Key::UnsavedFiltersDetail, language))
+                .on_close(move |_, _, cx| {
+                    on_close_app.update(cx, |this, _| {
+                        this.filter_save_prompt_open = false;
+                    });
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-filter-save")
+                                .label(text(Key::Cancel, language))
+                                .on_click(window.listener_for(
+                                    &cancel_app,
+                                    |this: &mut LogdApp, _, window, cx| {
+                                        this.filter_save_prompt_open = false;
+                                        window.close_dialog(cx);
+                                    },
+                                )),
+                        )
+                        .child(
+                            Button::new("discard-filter-changes")
+                                .label(text(Key::DontSave, language))
+                                .on_click(window.listener_for(
+                                    &discard_app,
+                                    |this: &mut LogdApp, _, window, cx| {
+                                        this.filter_save_prompt_open = false;
+                                        window.close_dialog(cx);
+                                        window.remove_window();
+                                    },
+                                )),
+                        )
+                        .child(
+                            Button::new("save-filter-changes")
+                                .primary()
+                                .label(text(Key::SaveFilter, language))
+                                .on_click(window.listener_for(
+                                    &save_app,
+                                    |this: &mut LogdApp, _, window, cx| {
+                                        this.filter_save_prompt_open = false;
+                                        window.close_dialog(cx);
+                                        this.save_tat(window, true, cx);
+                                    },
+                                )),
+                        ),
+                )
+        });
     }
 
     pub(crate) fn show_filter_panel(
@@ -1405,6 +1480,9 @@ impl LogdApp {
         let palette = theme::palette(cx);
         let app = cx.entity();
         let search_history = self.search_history.clone();
+        let has_search_history = !search_history.is_empty();
+        let search_history_select = self.search_history_select.clone();
+        let keyword = self.keyword.clone();
         let lang = self.language;
         let left = h_flex()
             .h_full()
@@ -1426,46 +1504,50 @@ impl LogdApp {
             .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
             .into_any_element();
-        let search_history_button = Button::new("search-history")
-            .xsmall()
-            .ghost()
-            .compact()
+        let clear_app = app.clone();
+        let search_history_combo = Combobox::new(&search_history_select)
+            .small()
+            .w_full()
             .h_full()
-            .icon(IconName::ChevronDown)
-            .tooltip(text(Key::SearchHistory, lang))
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
-                if search_history.is_empty() {
-                    return menu
-                        .item(PopupMenuItem::new(text(Key::NoSearchHistory, lang)).disabled(true));
-                }
-
-                let history_app = app.clone();
-                let menu =
-                    search_history.iter().enumerate().fold(
-                        menu.min_w(px(480.))
-                            .max_w(px(480.))
-                            .max_h(px(320.))
-                            .scrollable(true),
-                        |menu, (_, query)| {
-                            let selected_query = query.clone();
-                            let selected_app = history_app.clone();
-                            menu.item(PopupMenuItem::new(query.clone()).on_click(
-                                window.listener_for(&selected_app, move |this, _, window, cx| {
-                                    this.keyword.update(cx, |state, cx| {
-                                        state.set_value(selected_query.clone(), window, cx)
-                                    });
-                                    this.set_global_search(selected_query.clone(), window, cx);
-                                }),
-                            ))
-                        },
-                    );
-                let clear_app = history_app;
-                menu.separator().item(
-                    PopupMenuItem::new(text(Key::ClearSearchHistory, lang)).on_click(
-                        window.listener_for(&clear_app, |this, _, _, cx| {
-                            this.clear_search_history(cx)
-                        }),
-                    ),
+            .appearance(false)
+            .menu_max_h(px(320.))
+            .render_trigger(move |_, _, _| {
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .min_w_0()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("search-keyword-input")
+                            .min_w_0()
+                            .flex_1()
+                            .h_full()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(Input::new(&keyword).small().appearance(false)),
+                    )
+                    .child(control_tooltip(
+                        "search-history-tooltip",
+                        text(Key::SearchHistory, lang),
+                        Icon::new(IconName::ChevronDown).xsmall(),
+                    ))
+            })
+            .empty(move |_, _| {
+                h_flex()
+                    .justify_center()
+                    .py_6()
+                    .child(text(Key::NoSearchHistory, lang))
+            })
+            .footer(move |window, _| {
+                h_flex().justify_end().child(
+                    Button::new("clear-search-history")
+                        .small()
+                        .ghost()
+                        .label(text(Key::ClearSearchHistory, lang))
+                        .disabled(!has_search_history)
+                        .on_click(window.listener_for(&clear_app, |this, _, window, cx| {
+                            this.clear_search_history(window, cx)
+                        })),
                 )
             });
         let center = h_flex()
@@ -1485,9 +1567,9 @@ impl LogdApp {
                 div()
                     .min_w_0()
                     .flex_1()
-                    .child(Input::new(&self.keyword).small().appearance(false)),
+                    .h_full()
+                    .child(search_history_combo),
             )
-            .child(search_history_button)
             .into_any_element();
         let close_app = cx.weak_entity();
         title_bar::render(
