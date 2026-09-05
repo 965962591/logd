@@ -5,12 +5,16 @@
 //! dirty until activated. Title-bar searches are temporary and scan every tab.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_component::dock::{panel_handle, DockArea, DockLayout, DockPlacement};
+use gpui_component::dock::{
+    panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
+};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
@@ -20,7 +24,9 @@ use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
 use crate::theme;
-use crate::ui::dock::{logd_dock_area, FilterPanel, LogPanel};
+use crate::ui::dock::{
+    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, SearchResultsPanel,
+};
 use crate::ui::title_bar;
 
 struct Tab {
@@ -28,6 +34,18 @@ struct Tab {
     title: String,
     path: PathBuf,
 }
+
+#[derive(Clone)]
+struct SearchResultFile {
+    tab_index: usize,
+    title: String,
+    full_path: String,
+    view: Entity<LogView>,
+    lines: Arc<Vec<u64>>,
+    start: usize,
+}
+
+const DOCK_LAYOUT_VERSION: usize = 2;
 
 #[derive(Clone)]
 struct TabDrag {
@@ -58,12 +76,12 @@ enum MenuCommand {
     ShowAll,
     ShowOnlyFiltered,
     ToggleFilters,
+    ToggleSearchResults,
     AddFilter,
     EditFilter,
     DeleteFilter,
     SaveFilters,
     ToggleLanguage,
-    DockFilters(DockPlacement),
 }
 
 pub struct LogdApp {
@@ -88,8 +106,9 @@ pub struct LogdApp {
     dock_area: Entity<DockArea>,
     tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
-    filter_placement: DockPlacement,
-    filters_open: bool,
+    search_results_panel: Entity<SearchResultsPanel>,
+    last_layout_state: Option<DockAreaState>,
+    save_layout_task: Option<Task<()>>,
     language: Language,
     status: Option<String>,
     focus: FocusHandle,
@@ -111,11 +130,15 @@ impl LogdApp {
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
 
-        cx.subscribe_in(&keyword, window, |this, state, ev: &InputEvent, _, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) {
-                this.set_global_search(state.read(cx).value().to_string(), cx);
-            }
-        })
+        cx.subscribe_in(
+            &keyword,
+            window,
+            |this, state, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    this.set_global_search(state.read(cx).value().to_string(), window, cx);
+                }
+            },
+        )
         .detach();
         cx.subscribe(&filter_fore, |_, _, _: &ColorPickerEvent, cx| cx.notify())
             .detach();
@@ -134,31 +157,65 @@ impl LogdApp {
 
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
-        let filter_panel = cx.new(|cx| FilterPanel::new(app, cx));
-        let filter_placement = crate::settings::load_filter_placement();
-        let (dock_area, skin) = logd_dock_area("logd.main", Some(1), window, cx);
+        let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
+        let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app, cx));
+        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
+
+        let legacy_filter_placement = crate::settings::load_filter_placement();
+        let (dock_area, skin) = logd_dock_area("logd.main", Some(DOCK_LAYOUT_VERSION), window, cx);
         // The View menu is the single visibility control; avoid a duplicate dock toggle button.
         skin.set_toggle_button_visible(false, cx);
+        let restored = crate::settings::load_dock_layout()
+            .filter(|state| state.version == Some(DOCK_LAYOUT_VERSION))
+            .is_some_and(|state| {
+                dock_area
+                    .update(cx, |dock, cx| dock.load(state, window, cx))
+                    .is_ok()
+            });
+        if !restored {
+            Self::reset_default_dock_layout(
+                &dock_area,
+                &log_panel,
+                &filter_panel,
+                &search_results_panel,
+                legacy_filter_placement,
+                window,
+                cx,
+            );
+        }
         dock_area.update(cx, |dock, cx| {
-            dock.set_center(
-                DockLayout::tabs().panel_view(panel_handle(log_panel), cx),
-                window,
-                cx,
-            );
-            dock.set_dock(
-                filter_placement,
-                DockLayout::tabs().panel_view(panel_handle(filter_panel.clone()), cx),
-                window,
-                cx,
-            );
-            let filter_size = if filter_placement == DockPlacement::Bottom {
-                px(240.)
-            } else {
-                px(360.)
-            };
-            dock.set_dock_size(filter_placement, filter_size, window, cx);
-            dock.set_dock_collapsible(filter_placement, true, window, cx);
+            for placement in [
+                DockPlacement::Left,
+                DockPlacement::Right,
+                DockPlacement::Bottom,
+            ] {
+                if dock.has_dock(placement) {
+                    dock.set_dock_collapsible(placement, true, window, cx);
+                }
+            }
         });
+        let last_layout_state = Some(dock_area.read(cx).dump(cx));
+
+        cx.subscribe_in(
+            &dock_area,
+            window,
+            |this, dock_area, event: &DockEvent, window, cx| {
+                if matches!(event, DockEvent::LayoutChanged) {
+                    this.schedule_layout_save(dock_area, window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.on_app_quit({
+            let dock_area = dock_area.clone();
+            move |_, cx| {
+                let state = dock_area.read(cx).dump(cx);
+                cx.background_executor().spawn(async move {
+                    let _ = crate::settings::save_dock_layout(&state);
+                })
+            }
+        })
+        .detach();
 
         let mut this = Self {
             tabs: Vec::new(),
@@ -180,8 +237,9 @@ impl LogdApp {
             dock_area,
             tab_scroll: ScrollHandle::new(),
             filter_panel,
-            filter_placement,
-            filters_open: true,
+            search_results_panel,
+            last_layout_state,
+            save_layout_task: None,
             language,
             status: None,
             focus: cx.focus_handle(),
@@ -190,6 +248,80 @@ impl LogdApp {
             this.open_path(&path, window, cx);
         }
         this
+    }
+
+    fn reset_default_dock_layout(
+        dock_area: &Entity<DockArea>,
+        workspace: &Entity<LogPanel>,
+        filters: &Entity<FilterPanel>,
+        search_results: &Entity<SearchResultsPanel>,
+        filter_placement: DockPlacement,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        dock_area.update(cx, |dock, cx| {
+            for placement in [
+                DockPlacement::Left,
+                DockPlacement::Right,
+                DockPlacement::Bottom,
+            ] {
+                dock.remove_dock(placement, window, cx);
+            }
+            let workspace = DockLayout::tabs().panel_view(panel_handle(workspace.clone()), cx);
+            let filters = DockLayout::tabs().panel_view(panel_handle(filters.clone()), cx);
+            let search_results =
+                DockLayout::tabs().panel_view(panel_handle(search_results.clone()), cx);
+
+            // An outer dock protects its last visible panel from being
+            // dragged away. One split tree keeps these tool panels movable.
+            let center = match filter_placement {
+                DockPlacement::Left => DockLayout::h_split().child(filters, Some(px(360.))).child(
+                    DockLayout::v_split()
+                        .child(workspace, None)
+                        .child(search_results, Some(px(240.))),
+                    None,
+                ),
+                DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
+                    DockLayout::h_split()
+                        .child(search_results, None)
+                        .child(filters, Some(px(360.))),
+                    Some(px(240.)),
+                ),
+                DockPlacement::Right | DockPlacement::Center => DockLayout::h_split()
+                    .child(
+                        DockLayout::v_split()
+                            .child(workspace, None)
+                            .child(search_results, Some(px(240.))),
+                        None,
+                    )
+                    .child(filters, Some(px(360.))),
+            };
+            dock.set_center(center, window, cx);
+        });
+    }
+
+    fn schedule_layout_save(
+        &mut self,
+        dock_area: &Entity<DockArea>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dock_area = dock_area.clone();
+        self.save_layout_task = Some(cx.spawn_in(window, async move |this, window| {
+            window
+                .background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            _ = this.update_in(window, move |this, _, cx| {
+                let state = dock_area.read(cx).dump(cx);
+                if this.last_layout_state.as_ref() == Some(&state) {
+                    return;
+                }
+                if crate::settings::save_dock_layout(&state).is_ok() {
+                    this.last_layout_state = Some(state);
+                }
+            });
+        }));
     }
 
     pub fn language(&self) -> Language {
@@ -222,6 +354,7 @@ impl LogdApp {
         match LogView::load(path) {
             Ok(loaded) => {
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
+                self.observe_log_view(&view, cx);
                 let tab_index = self.tabs.len();
                 self.tabs.push(Tab {
                     view: view.clone(),
@@ -234,6 +367,7 @@ impl LogdApp {
                 self.active = tab_index;
                 self.tab_scroll.scroll_to_item(tab_index);
                 self.apply_filters_to_view(tab_index, &view, cx);
+                self.apply_search_to_view(&view, cx);
                 self.remember_file(path);
                 self.status = None;
             }
@@ -267,6 +401,23 @@ impl LogdApp {
             view.apply_filters(filters, cx);
             view.set_show_only_filtered(only, cx);
         });
+    }
+
+    fn apply_search_to_view(&self, view: &Entity<LogView>, cx: &mut App) {
+        let filters = self.search_filters.clone();
+        view.update(cx, |view, cx| view.apply_search(filters, cx));
+    }
+
+    fn observe_log_view(&self, view: &Entity<LogView>, cx: &mut Context<Self>) {
+        cx.observe(view, |this, _, cx| {
+            this.search_results_panel.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        })
+        .detach();
+    }
+
+    fn notify_search_results(&self, cx: &mut App) {
+        self.search_results_panel.update(cx, |_, cx| cx.notify());
     }
 
     fn prompt_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -331,7 +482,9 @@ impl LogdApp {
         match LogView::load(&path) {
             Ok(loaded) => {
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
+                self.observe_log_view(&view, cx);
                 self.apply_filters_to_view(self.active, &view, cx);
+                self.apply_search_to_view(&view, cx);
                 self.tabs[self.active].view = view;
                 self.status = Some(format!(
                     "{}: {}",
@@ -392,6 +545,7 @@ impl LogdApp {
         if !self.tabs.is_empty() {
             self.tab_scroll.scroll_to_item(self.active);
         }
+        self.notify_search_results(cx);
         cx.notify();
     }
 
@@ -423,6 +577,7 @@ impl LogdApp {
     fn restore_active_path(&mut self, active_path: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             self.active = 0;
+            self.notify_search_results(cx);
             cx.notify();
             return;
         }
@@ -441,6 +596,7 @@ impl LogdApp {
             let view = self.tabs[self.active].view.clone();
             self.apply_filters_to_view(self.active, &view, cx);
         }
+        self.notify_search_results(cx);
         cx.notify();
     }
 
@@ -457,11 +613,21 @@ impl LogdApp {
             .and_then(|path| self.tabs.iter().position(|tab| &tab.path == path))
             .unwrap_or(insertion);
         self.tab_scroll.scroll_to_item(self.active);
+        self.notify_search_results(cx);
         cx.notify();
     }
 
     fn active_view(&self) -> Option<&Entity<LogView>> {
         self.tabs.get(self.active).map(|tab| &tab.view)
+    }
+
+    fn goto_search_result(&mut self, tab_index: usize, file_line: u64, cx: &mut Context<Self>) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+        self.set_active(tab_index, cx);
+        let view = self.tabs[tab_index].view.clone();
+        view.update(cx, |view, cx| view.goto_file_line(file_line, cx));
     }
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
@@ -475,7 +641,7 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn set_global_search(&mut self, value: String, cx: &mut Context<Self>) {
+    fn set_global_search(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
         self.search_filters = split_search_keywords(&value)
             .into_iter()
             .map(|keyword| FilterSpec {
@@ -493,6 +659,19 @@ impl LogdApp {
             .collect::<Vec<_>>();
         for (index, view) in tab_filters {
             self.apply_filters_to_view(index, &view, cx);
+            self.apply_search_to_view(&view, cx);
+        }
+        let has_search = !self.search_filters.is_empty();
+        self.search_results_panel.update(cx, |panel, cx| {
+            panel.reset_scroll();
+            if has_search {
+                panel.set_visible(true, cx);
+            }
+            cx.notify();
+        });
+        if has_search {
+            let dock_area = self.dock_area.clone();
+            self.schedule_layout_save(&dock_area, window, cx);
         }
         cx.notify();
     }
@@ -607,7 +786,10 @@ impl LogdApp {
             return;
         }
         let filters = self.filters_for_tab(self.active);
-        view.update(cx, |view, cx| view.set_encoding(encoding, filters, cx));
+        let search_filters = self.search_filters.clone();
+        view.update(cx, |view, cx| {
+            view.set_encoding(encoding, filters, search_filters, cx)
+        });
         cx.notify();
     }
 
@@ -663,46 +845,18 @@ impl LogdApp {
     }
 
     fn show_filter_panel(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.filters_open != show {
-            self.dock_area.update(cx, |dock, cx| {
-                dock.toggle_dock(self.filter_placement, window, cx)
-            });
-            self.filters_open = show;
-        }
+        self.filter_panel
+            .update(cx, |panel, cx| panel.set_visible(show, cx));
+        let dock_area = self.dock_area.clone();
+        self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
     }
 
-    fn move_filter_panel(
-        &mut self,
-        placement: DockPlacement,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if placement == self.filter_placement {
-            self.show_filter_panel(true, window, cx);
-            return;
-        }
-        let old = self.filter_placement;
-        let panel = self.filter_panel.clone();
-        self.dock_area.update(cx, |dock, cx| {
-            dock.remove_dock(old, window, cx);
-            dock.set_dock(
-                placement,
-                DockLayout::tabs().panel_view(panel_handle(panel), cx),
-                window,
-                cx,
-            );
-            let size = if placement == DockPlacement::Bottom {
-                px(240.)
-            } else {
-                px(360.)
-            };
-            dock.set_dock_size(placement, size, window, cx);
-            dock.set_dock_collapsible(placement, true, window, cx);
-        });
-        self.filter_placement = placement;
-        self.filters_open = true;
-        let _ = crate::settings::save_filter_placement(placement);
+    fn show_search_results(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_results_panel
+            .update(cx, |panel, cx| panel.set_visible(show, cx));
+        let dock_area = self.dock_area.clone();
+        self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
     }
 
@@ -725,7 +879,14 @@ impl LogdApp {
             }
             MenuCommand::ShowAll => self.set_show_only(false, cx),
             MenuCommand::ShowOnlyFiltered => self.set_show_only(true, cx),
-            MenuCommand::ToggleFilters => self.show_filter_panel(!self.filters_open, window, cx),
+            MenuCommand::ToggleFilters => {
+                let visible = self.filter_panel.read(cx).visible();
+                self.show_filter_panel(!visible, window, cx)
+            }
+            MenuCommand::ToggleSearchResults => {
+                let visible = self.search_results_panel.read(cx).visible();
+                self.show_search_results(!visible, window, cx)
+            }
             MenuCommand::AddFilter => self.begin_add_filter(window, cx),
             MenuCommand::EditFilter => self.begin_edit_filter(window, cx),
             MenuCommand::DeleteFilter => self.delete_selected_filter(cx),
@@ -734,7 +895,6 @@ impl LogdApp {
                 self.language = self.language.toggle();
                 cx.notify();
             }
-            MenuCommand::DockFilters(placement) => self.move_filter_panel(placement, window, cx),
         }
     }
 
@@ -764,9 +924,9 @@ impl LogdApp {
         let lang = self.language;
         let recent = self.recent_files.clone();
         let only = self.show_only_filtered;
-        let filters_open = self.filters_open;
+        let filters_open = self.filter_panel.read(cx).visible();
+        let search_results_open = self.search_results_panel.read(cx).visible();
         let selected = self.selected_filter.is_some();
-        let placement = self.filter_placement;
         let has_view = self.active_view().is_some();
         let active_encoding = self
             .active_view()
@@ -784,90 +944,90 @@ impl LogdApp {
             .label(text(command_group, lang));
 
         match command_group {
-            Key::File => button
-                .dropdown_menu(move |menu, window, cx| {
-                    let open_app = app.clone();
-                    let refresh_app = app.clone();
-                    let save_copy_app = app.clone();
-                    let menu = menu
-                        .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
-                            window.listener_for(&open_app, |this, _, window, cx| {
-                                this.dispatch(MenuCommand::Open, window, cx)
-                            }),
-                        ))
-                        .item(PopupMenuItem::new(text(Key::Refresh, lang)).on_click(
-                            window.listener_for(&refresh_app, |this, _, window, cx| {
-                                this.dispatch(MenuCommand::Refresh, window, cx)
-                            }),
-                        ))
-                        .item(
-                            PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
-                                window.listener_for(&save_copy_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
+            Key::File => {
+                button
+                    .dropdown_menu(move |menu, window, cx| {
+                        let open_app = app.clone();
+                        let refresh_app = app.clone();
+                        let save_copy_app = app.clone();
+                        let menu = menu
+                            .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
+                                window.listener_for(&open_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::Open, window, cx)
                                 }),
-                            ),
-                        );
-                    let submenu_recent = recent.clone();
-                    let submenu_app = app.clone();
-                    menu.submenu(
-                        text(Key::RecentFiles, lang),
-                        window,
-                        cx,
-                        move |menu, window, _| {
-                            if submenu_recent.is_empty() {
-                                return menu.item(
-                                    PopupMenuItem::new(text(Key::NoRecentFiles, lang))
-                                        .disabled(true),
-                                );
-                            }
-                            submenu_recent.iter().enumerate().fold(
-                                menu.max_w(px(480.)),
-                                |menu, (index, path)| {
-                                    let target = path.clone();
-                                    let target_app = submenu_app.clone();
-                                    let full_path = path.display().to_string();
-                                    menu.item(
-                                        PopupMenuItem::element(move |_, _| {
-                                            let label = full_path.clone();
-                                            let tooltip = full_path.clone();
-                                            div()
-                                                .id(("recent-file-label", index))
-                                                .w(px(440.))
-                                                .overflow_hidden()
-                                                .text_ellipsis_middle()
-                                                .child(label)
-                                                .tooltip(move |window, cx| {
-                                                    gpui_component::tooltip::Tooltip::new(
-                                                        tooltip.clone(),
+                            ))
+                            .item(PopupMenuItem::new(text(Key::Refresh, lang)).on_click(
+                                window.listener_for(&refresh_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::Refresh, window, cx)
+                                }),
+                            ))
+                            .item(
+                                PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
+                                    window.listener_for(&save_copy_app, |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
+                                    }),
+                                ),
+                            );
+                        let submenu_recent = recent.clone();
+                        let submenu_app = app.clone();
+                        menu.submenu(
+                            text(Key::RecentFiles, lang),
+                            window,
+                            cx,
+                            move |menu, window, _| {
+                                if submenu_recent.is_empty() {
+                                    return menu.item(
+                                        PopupMenuItem::new(text(Key::NoRecentFiles, lang))
+                                            .disabled(true),
+                                    );
+                                }
+                                submenu_recent.iter().enumerate().fold(
+                                    menu.max_w(px(480.)),
+                                    |menu, (index, path)| {
+                                        let target = path.clone();
+                                        let target_app = submenu_app.clone();
+                                        let full_path = path.display().to_string();
+                                        menu.item(
+                                            PopupMenuItem::element(move |_, _| {
+                                                let label = full_path.clone();
+                                                let tooltip = full_path.clone();
+                                                div()
+                                                    .id(("recent-file-label", index))
+                                                    .w(px(440.))
+                                                    .overflow_hidden()
+                                                    .text_ellipsis_middle()
+                                                    .child(label)
+                                                    .tooltip(move |window, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            tooltip.clone(),
+                                                        )
+                                                        .build(window, cx)
+                                                    })
+                                            })
+                                            .on_click(window.listener_for(
+                                                &target_app,
+                                                move |this, _, window, cx| {
+                                                    this.dispatch(
+                                                        MenuCommand::OpenRecent(target.clone()),
+                                                        window,
+                                                        cx,
                                                     )
-                                                    .build(window, cx)
-                                                })
-                                        })
-                                        .on_click(window.listener_for(
-                                            &target_app,
-                                            move |this, _, window, cx| {
-                                                this.dispatch(
-                                                    MenuCommand::OpenRecent(target.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
-                                    )
-                                },
-                            )
-                        },
-                    )
-                })
-                .into_any_element(),
+                                                },
+                                            )),
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    })
+                    .into_any_element()
+            }
             Key::View => button
                 .dropdown_menu(move |menu, window, cx| {
                     let all_app = app.clone();
                     let only_app = app.clone();
                     let panel_app = app.clone();
-                    let left_app = app.clone();
-                    let right_app = app.clone();
-                    let bottom_app = app.clone();
+                    let search_panel_app = app.clone();
                     let language_app = app.clone();
                     let menu = menu
                         .item(
@@ -894,43 +1054,13 @@ impl LogdApp {
                                     },
                                 )),
                         )
-                        .separator()
                         .item(
-                            PopupMenuItem::new(text(Key::DockLeft, lang))
-                                .checked(placement == DockPlacement::Left)
-                                .on_click(window.listener_for(&left_app, |this, _, window, cx| {
-                                    this.dispatch(
-                                        MenuCommand::DockFilters(DockPlacement::Left),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::DockRight, lang))
-                                .checked(placement == DockPlacement::Right)
+                            PopupMenuItem::new(text(Key::ShowSearchResults, lang))
+                                .checked(search_results_open)
                                 .on_click(window.listener_for(
-                                    &right_app,
+                                    &search_panel_app,
                                     |this, _, window, cx| {
-                                        this.dispatch(
-                                            MenuCommand::DockFilters(DockPlacement::Right),
-                                            window,
-                                            cx,
-                                        )
-                                    },
-                                )),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::DockBottom, lang))
-                                .checked(placement == DockPlacement::Bottom)
-                                .on_click(window.listener_for(
-                                    &bottom_app,
-                                    |this, _, window, cx| {
-                                        this.dispatch(
-                                            MenuCommand::DockFilters(DockPlacement::Bottom),
-                                            window,
-                                            cx,
-                                        )
+                                        this.dispatch(MenuCommand::ToggleSearchResults, window, cx)
                                     },
                                 )),
                         );
@@ -1360,6 +1490,224 @@ impl LogdApp {
                                 .child(text(Key::NoFilters, lang)),
                         )
                     }),
+            )
+            .into_any_element()
+    }
+
+    pub fn render_search_results(
+        app: &Entity<Self>,
+        scroll: &UniformListScrollHandle,
+        _window: &mut Window,
+        cx: &mut Context<SearchResultsPanel>,
+    ) -> AnyElement {
+        let (has_search, files, total, scanning, file_count, lang) = {
+            let state = app.read(cx);
+            let has_search = !state.search_filters.is_empty();
+            let mut files = Vec::new();
+            let mut total = 0usize;
+            let mut scanning = 0usize;
+            for (tab_index, tab) in state.tabs.iter().enumerate() {
+                let view = tab.view.read(cx);
+                if has_search
+                    && (view.search_scanning_progress().is_some()
+                        || view.indexing_progress().is_some())
+                {
+                    scanning += 1;
+                }
+                let Some(lines) = view.search_matches() else {
+                    continue;
+                };
+                if lines.is_empty() {
+                    continue;
+                }
+                files.push(SearchResultFile {
+                    tab_index,
+                    title: tab.title.clone(),
+                    full_path: tab.path.display().to_string(),
+                    view: tab.view.clone(),
+                    lines,
+                    start: total,
+                });
+                total = total.saturating_add(files.last().unwrap().lines.len());
+            }
+            (
+                has_search,
+                Arc::new(files),
+                total,
+                scanning,
+                state.tabs.len(),
+                state.language,
+            )
+        };
+
+        let summary = format!(
+            "{} {}  |  {} {}",
+            group(total as u64),
+            text(Key::Matches, lang),
+            group(files.len() as u64),
+            text(Key::Files, lang)
+        );
+        let mut panel =
+            v_flex()
+                .size_full()
+                .min_h_0()
+                .bg(theme::c(theme::BG))
+                .text_color(theme::c(theme::FG))
+                .text_size(px(12.))
+                .child(
+                    h_flex()
+                        .h(px(28.))
+                        .flex_none()
+                        .px_2()
+                        .gap_3()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(theme::c(theme::BORDER))
+                        .child(summary)
+                        .when(scanning > 0, |header| {
+                            header.child(div().text_color(theme::c(theme::SEARCH_FORE)).child(
+                                format!(
+                                    "{} {}/{}",
+                                    text(Key::SearchInProgress, lang),
+                                    file_count.saturating_sub(scanning),
+                                    file_count,
+                                ),
+                            ))
+                        }),
+                );
+
+        if !has_search {
+            return panel
+                .child(
+                    div()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme::c(theme::MUTED))
+                        .child(text(Key::SearchResultsPrompt, lang)),
+                )
+                .into_any_element();
+        }
+        if total == 0 {
+            let message = if scanning > 0 {
+                text(Key::SearchInProgress, lang)
+            } else {
+                text(Key::NoSearchResults, lang)
+            };
+            return panel
+                .child(
+                    div()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme::c(theme::MUTED))
+                        .child(message),
+                )
+                .into_any_element();
+        }
+
+        panel = panel.child(
+            h_flex()
+                .h(px(24.))
+                .flex_none()
+                .bg(theme::c(theme::GUTTER_BG))
+                .border_b_1()
+                .border_color(theme::c(theme::BORDER))
+                .text_color(theme::c(theme::MUTED))
+                .child(div().w(px(190.)).px_2().child(text(Key::Files, lang)))
+                .child(
+                    div()
+                        .w(px(76.))
+                        .px_2()
+                        .text_right()
+                        .child(text(Key::Lines, lang)),
+                )
+                .child(div().flex_1().px_2().child(text(Key::Content, lang))),
+        );
+
+        let row_app = app.clone();
+        let rows = uniform_list(
+            "multi-file-search-results",
+            total,
+            move |range, window, cx| {
+                let mut elements = Vec::with_capacity(range.len());
+                for result_index in range {
+                    let file_index = files
+                        .partition_point(|file| file.start <= result_index)
+                        .saturating_sub(1);
+                    let file = &files[file_index];
+                    let line_index = result_index - file.start;
+                    let Some(&file_line) = file.lines.get(line_index) else {
+                        continue;
+                    };
+                    let line_text = file
+                        .view
+                        .read(cx)
+                        .doc()
+                        .line_text(file_line)
+                        .unwrap_or_default();
+                    let target_app = row_app.clone();
+                    let tab_index = file.tab_index;
+                    let tooltip = file.full_path.clone();
+                    elements.push(
+                        h_flex()
+                            .id(("search-result", result_index))
+                            .h(px(24.))
+                            .flex_none()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(theme::c(theme::BORDER))
+                            .hover(|row| row.bg(theme::c(theme::CONTROL_HOVER)))
+                            .on_click(window.listener_for(&target_app, move |this, _, _, cx| {
+                                this.goto_search_result(tab_index, file_line, cx)
+                            }))
+                            .child(
+                                div()
+                                    .id(("search-result-file", result_index))
+                                    .w(px(190.))
+                                    .px_2()
+                                    .overflow_hidden()
+                                    .text_ellipsis_middle()
+                                    .child(file.title.clone())
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                            .build(window, cx)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(76.))
+                                    .px_2()
+                                    .text_right()
+                                    .text_color(theme::c(theme::MUTED))
+                                    .child(group(file_line + 1)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_2()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(line_text),
+                            ),
+                    );
+                }
+                elements
+            },
+        )
+        .size_full()
+        .track_scroll(scroll);
+
+        panel
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(rows)
+                    .vertical_scrollbar(scroll),
             )
             .into_any_element()
     }

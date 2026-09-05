@@ -20,6 +20,7 @@ encoding_rs = "0.8.35"
 parking_lot = "0.12.5"
 twox-hash = "2.1.3"
 dirs = "6.0.0"
+serde_json = "1.0.149"
 # zed 这两条必须用**原始 github 地址**，不能走 gh-proxy 镜像：
 # gpui-component 自己的 manifest 里写死的是 https://github.com/zed-industries/zed，
 # cargo 按 URL 字符串区分 source，地址不一致就会拉进两份 gpui，

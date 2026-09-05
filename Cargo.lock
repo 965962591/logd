@@ -3519,6 +3519,7 @@ dependencies = [
  "logd-core",
  "parking_lot",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

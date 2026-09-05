@@ -20,3 +20,4 @@ anyhow.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 dirs.workspace = true
+serde_json.workspace = true

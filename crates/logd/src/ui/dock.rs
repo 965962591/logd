@@ -4,13 +4,17 @@ use std::{rc::Rc, sync::Arc};
 
 use gpui::*;
 use gpui_component::dock::{
-    BasePanel, BasePanelView, DockArea, DockAreaRenderer, DockContext, DockSkin, DropIndicator,
-    NodeId, Panel, PanelControl, PanelEvent, PanelState, TabGroupContext, TabGroupRenderer,
-    TilesRenderer,
+    panel_handle, register_panel, BasePanel, BasePanelView, DockArea, DockAreaRenderer,
+    DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelInfo,
+    PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
 
 use crate::app::LogdApp;
 use crate::i18n::{text, Key};
+
+pub const WORKSPACE_PANEL: &str = "logd.workspace";
+pub const FILTER_PANEL: &str = "logd.filters";
+pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
 
 /// Builds the normal component dock, except that the central log workspace
 /// does not draw redundant single-panel chrome above its content.
@@ -115,9 +119,9 @@ impl TabGroupRenderer for LogdTabGroupSkin {
             .filter(|panel| panel.visible(cx))
             .count();
         if visible_panels == 1
-            && group.active_panel().is_some_and(|panel| {
-                matches!(panel.panel_name(cx), "logd.workspace" | "logd.filters")
-            })
+            && group
+                .active_panel()
+                .is_some_and(|panel| panel.panel_name(cx) == WORKSPACE_PANEL)
         {
             Empty.into_any_element()
         } else {
@@ -154,6 +158,49 @@ impl TabGroupRenderer for LogdTabGroupSkin {
     }
 }
 
+pub fn register_logd_panels(
+    workspace: &Entity<LogPanel>,
+    filters: &Entity<FilterPanel>,
+    search_results: &Entity<SearchResultsPanel>,
+    cx: &mut App,
+) {
+    register_panel(cx, WORKSPACE_PANEL, {
+        let workspace = workspace.clone();
+        move |_, _, _| panel_handle(workspace.clone())
+    });
+    register_panel(cx, FILTER_PANEL, {
+        let filters = filters.clone();
+        move |context, _, cx| {
+            if let Some(visible) = restored_visibility(context.info()) {
+                filters.update(cx, |panel, cx| panel.set_visible(visible, cx));
+            }
+            panel_handle(filters.clone())
+        }
+    });
+    register_panel(cx, SEARCH_RESULTS_PANEL, {
+        let search_results = search_results.clone();
+        move |context, _, cx| {
+            if let Some(visible) = restored_visibility(context.info()) {
+                search_results.update(cx, |panel, cx| panel.set_visible(visible, cx));
+            }
+            panel_handle(search_results.clone())
+        }
+    });
+}
+
+fn visibility_state(panel_name: &'static str, visible: bool) -> PanelState {
+    let mut state = PanelState::new(panel_name);
+    state.info = PanelInfo::panel(serde_json::json!({ "visible": visible }));
+    state
+}
+
+fn restored_visibility(info: &PanelInfo) -> Option<bool> {
+    let PanelInfo::Panel(value) = info else {
+        return None;
+    };
+    value.get("visible").and_then(serde_json::Value::as_bool)
+}
+
 pub struct LogPanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
@@ -170,7 +217,7 @@ impl LogPanel {
 
 impl BasePanel for LogPanel {
     fn panel_name(&self) -> &'static str {
-        "logd.workspace"
+        WORKSPACE_PANEL
     }
 
     fn closable(&self, _: &App) -> bool {
@@ -212,6 +259,7 @@ impl Render for LogPanel {
 pub struct FilterPanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
+    visible: bool,
 }
 
 impl FilterPanel {
@@ -219,17 +267,37 @@ impl FilterPanel {
         Self {
             app,
             focus: cx.focus_handle(),
+            visible: true,
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
         }
     }
 }
 
 impl BasePanel for FilterPanel {
     fn panel_name(&self) -> &'static str {
-        "logd.filters"
+        FILTER_PANEL
+    }
+
+    fn visible(&self, _: &App) -> bool {
+        self.visible
     }
 
     fn closable(&self, _: &App) -> bool {
         false
+    }
+
+    fn dump(&self, _: &App) -> PanelState {
+        visibility_state(FILTER_PANEL, self.visible)
     }
 }
 
@@ -260,5 +328,104 @@ impl Render for FilterPanel {
             .upgrade()
             .map(|app| LogdApp::render_filters(&app, window, cx))
             .unwrap_or_else(|| div().into_any_element())
+    }
+}
+
+pub struct SearchResultsPanel {
+    app: WeakEntity<LogdApp>,
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    visible: bool,
+}
+
+impl SearchResultsPanel {
+    pub fn new(app: WeakEntity<LogdApp>, cx: &mut Context<Self>) -> Self {
+        Self {
+            app,
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            visible: true,
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
+    }
+
+    pub fn reset_scroll(&self) {
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+}
+
+impl BasePanel for SearchResultsPanel {
+    fn panel_name(&self) -> &'static str {
+        SEARCH_RESULTS_PANEL
+    }
+
+    fn visible(&self, _: &App) -> bool {
+        self.visible
+    }
+
+    fn closable(&self, _: &App) -> bool {
+        false
+    }
+
+    fn dump(&self, _: &App) -> PanelState {
+        visibility_state(SEARCH_RESULTS_PANEL, self.visible)
+    }
+}
+
+impl Panel for SearchResultsPanel {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app
+            .upgrade()
+            .map(|app| text(Key::SearchResults, app.read(cx).language()).to_string())
+            .unwrap_or_else(|| "Search Results".to_string())
+    }
+
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
+}
+
+impl EventEmitter<PanelEvent> for SearchResultsPanel {}
+
+impl Focusable for SearchResultsPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for SearchResultsPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app
+            .upgrade()
+            .map(|app| LogdApp::render_search_results(&app, &self.scroll, window, cx))
+            .unwrap_or_else(|| div().into_any_element())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restored_visibility, visibility_state, FILTER_PANEL};
+    use gpui_component::dock::PanelState;
+
+    #[test]
+    fn panel_visibility_round_trips_through_json() {
+        for visible in [false, true] {
+            let state = visibility_state(FILTER_PANEL, visible);
+            let json = serde_json::to_string(&state).unwrap();
+            let restored: PanelState = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(restored.panel_name, FILTER_PANEL);
+            assert_eq!(restored_visibility(&restored.info), Some(visible));
+        }
     }
 }

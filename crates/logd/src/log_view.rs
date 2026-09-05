@@ -23,7 +23,7 @@ use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
-    MatcherSet, Progress, RenderRow, ScanOutcome,
+    MatcherSet, Progress, RenderRow, ScanOutcome, ScrollTo,
 };
 
 use crate::theme;
@@ -50,8 +50,12 @@ pub struct LogView {
     h_drag_grab: Option<f32>,
     indexing: Option<Arc<Progress>>,
     scanning: Option<Arc<Progress>>,
+    search_matcher: Arc<MatcherSet>,
+    search_matches: Option<Arc<Vec<u64>>>,
+    search_scanning: Option<Arc<Progress>>,
     /// 每次发起筛选自增。回调里对不上就说明结果已经过期，直接丢弃。
     scan_gen: u64,
+    search_scan_gen: u64,
     /// 过滤器变了但这个标签页还没重扫（非活动标签页先记账，切过去再扫）
     dirty: bool,
     /// 正则编译失败之类的提示
@@ -154,6 +158,10 @@ impl LogView {
 
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let complete = loaded.index.complete;
+        let search_matcher = Arc::new(
+            MatcherSet::new(Vec::new(), loaded.source.encoding())
+                .expect("an empty search matcher is always valid"),
+        );
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
@@ -163,7 +171,11 @@ impl LogView {
             h_drag_grab: None,
             indexing: None,
             scanning: None,
+            search_matcher,
+            search_matches: None,
+            search_scanning: None,
             scan_gen: 0,
+            search_scan_gen: 0,
             dirty: false,
             error: None,
             from_cache: loaded.from_cache,
@@ -199,6 +211,14 @@ impl LogView {
 
     pub fn scanning_progress(&self) -> Option<f32> {
         self.scanning.as_ref().map(|p| p.fraction())
+    }
+
+    pub fn search_scanning_progress(&self) -> Option<f32> {
+        self.search_scanning.as_ref().map(|p| p.fraction())
+    }
+
+    pub fn search_matches(&self) -> Option<Arc<Vec<u64>>> {
+        self.search_matches.clone()
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -237,6 +257,9 @@ impl LogView {
                     if !this.doc.matcher().is_noop() {
                         this.start_scan(cx);
                     }
+                    if !this.search_matcher.is_noop() {
+                        this.start_search_scan(cx);
+                    }
                 }
                 this.indexing = None;
                 cx.notify();
@@ -257,7 +280,9 @@ impl LogView {
             let busy = this
                 .update(cx, |this, cx| {
                     cx.notify();
-                    this.indexing.is_some() || this.scanning.is_some()
+                    this.indexing.is_some()
+                        || this.scanning.is_some()
+                        || this.search_scanning.is_some()
                 })
                 .unwrap_or(false);
             if !busy {
@@ -312,11 +337,26 @@ impl LogView {
         &mut self,
         enc: Encoding,
         filters: Vec<FilterSpec>,
+        search_filters: Vec<FilterSpec>,
         cx: &mut Context<Self>,
     ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
         self.apply_filters(filters, cx);
+        self.apply_search(search_filters, cx);
+    }
+
+    pub fn apply_search(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+        match MatcherSet::new(filters, self.doc.encoding()) {
+            Ok(matcher) => {
+                self.search_matcher = Arc::new(matcher);
+                self.start_search_scan(cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+            }
+        }
     }
 
     fn start_scan(&mut self, cx: &mut Context<Self>) {
@@ -361,6 +401,58 @@ impl LogView {
         .detach();
 
         self.poll_while_busy(cx);
+    }
+
+    fn start_search_scan(&mut self, cx: &mut Context<Self>) {
+        if let Some(progress) = self.search_scanning.take() {
+            progress.cancel();
+        }
+        self.search_matches = None;
+        self.search_scan_gen += 1;
+        let generation = self.search_scan_gen;
+        if self.search_matcher.is_noop() {
+            cx.notify();
+            return;
+        }
+
+        let source = self.doc.source().clone();
+        let index = self.doc.index().clone();
+        let matcher = self.search_matcher.clone();
+        let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
+        self.search_scanning = Some(progress.clone());
+
+        cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move { scan_all(source.data(), &index, &matcher, &progress) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.search_scan_gen != generation {
+                    return;
+                }
+                match out {
+                    Some(ScanOutcome::Matched(lines)) => {
+                        this.search_matches = Some(Arc::new(lines));
+                    }
+                    Some(ScanOutcome::AllVisible) => this.search_matches = None,
+                    None => {}
+                }
+                this.search_scanning = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
+        self.poll_while_busy(cx);
+    }
+
+    pub fn goto_file_line(&mut self, file_line: u64, cx: &mut Context<Self>) {
+        self.clear_text_selection(cx);
+        self.selection = None;
+        self.selecting = false;
+        self.doc.goto_file_line(file_line, ScrollTo::Center);
+        cx.notify();
     }
 
     // ---- 输入 ----
@@ -1350,8 +1442,7 @@ impl Render for LogView {
                         window.on_mouse_event({
                             let drag_handle = drag_handle.clone();
                             move |ev: &MouseUpEvent, phase, _, cx| {
-                                if phase != DispatchPhase::Capture
-                                    || ev.button != MouseButton::Left
+                                if phase != DispatchPhase::Capture || ev.button != MouseButton::Left
                                 {
                                     return;
                                 }
