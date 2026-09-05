@@ -1265,6 +1265,7 @@ impl Render for LogView {
 
         let bounds_sink = self.area.clone();
         let handle = cx.entity().downgrade();
+        let drag_handle = cx.entity().downgrade();
 
         div()
             .id("log-view")
@@ -1290,11 +1291,10 @@ impl Render for LogView {
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                if this.h_drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
-                    this.on_hdrag_move(f32::from(ev.position.x), gutter_w, show_vertical, cx);
-                } else if this.drag_grab.is_some() && ev.pressed_button == Some(MouseButton::Left) {
-                    this.on_drag_move(f32::from(ev.position.y), cx);
-                } else if this.text_selecting && ev.pressed_button == Some(MouseButton::Left) {
+                if this.drag_grab.is_some() || this.h_drag_grab.is_some() {
+                    return;
+                }
+                if this.text_selecting && ev.pressed_button == Some(MouseButton::Left) {
                     this.extend_text_selection(ev.position, gutter_w, window, cx);
                 } else if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
                     this.extend_selection_to_y(f32::from(ev.position.y), cx);
@@ -1302,10 +1302,7 @@ impl Render for LogView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                    if this.drag_grab.take().is_some() || this.h_drag_grab.take().is_some() {
-                        cx.notify();
-                    }
+                cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
                     this.selecting = false;
                     this.text_selecting = false;
                 }),
@@ -1325,7 +1322,51 @@ impl Render for LogView {
                             });
                         }
                     },
-                    |_, _, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event({
+                            let drag_handle = drag_handle.clone();
+                            move |ev: &MouseMoveEvent, phase, _, cx| {
+                                if phase != DispatchPhase::Capture
+                                    || ev.pressed_button != Some(MouseButton::Left)
+                                {
+                                    return;
+                                }
+                                drag_handle
+                                    .update(cx, |this, cx| {
+                                        if this.h_drag_grab.is_some() {
+                                            this.on_hdrag_move(
+                                                f32::from(ev.position.x),
+                                                gutter_w,
+                                                show_vertical,
+                                                cx,
+                                            );
+                                        } else if this.drag_grab.is_some() {
+                                            this.on_drag_move(f32::from(ev.position.y), cx);
+                                        }
+                                    })
+                                    .ok();
+                            }
+                        });
+                        window.on_mouse_event({
+                            let drag_handle = drag_handle.clone();
+                            move |ev: &MouseUpEvent, phase, _, cx| {
+                                if phase != DispatchPhase::Capture
+                                    || ev.button != MouseButton::Left
+                                {
+                                    return;
+                                }
+                                drag_handle
+                                    .update(cx, |this, cx| {
+                                        let was_dragging = this.drag_grab.take().is_some();
+                                        let was_h_dragging = this.h_drag_grab.take().is_some();
+                                        if was_dragging || was_h_dragging {
+                                            cx.notify();
+                                        }
+                                    })
+                                    .ok();
+                            }
+                        });
+                    },
                 )
                 .absolute()
                 .size_full(),
