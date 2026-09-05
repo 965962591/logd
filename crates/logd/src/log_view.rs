@@ -8,7 +8,7 @@
 //! 比例运算全走 f64，只在最后一步落到像素。滚动数学在 `logd-core` 里有单测。
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState, Position};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all, Document, Encoding, FileSource, FilterSpec, LineIndex,
@@ -64,7 +65,11 @@ pub struct LogView {
     /// 当前已绘制行中观测到的最长内容宽度，避免滚动后横向范围跳变。
     max_line_width: f32,
     editing_line: Option<u64>,
-    edit_input: Entity<InputState>,
+    /// 每个可见文件行对应一个输入状态。只保留视口附近的状态，避免把整个大文件
+    /// 物化进输入控件，同时让 InputState 接管光标、选择、复制和编辑交互。
+    line_inputs: BTreeMap<u64, Entity<InputState>>,
+    active_input_line: Option<u64>,
+    editing_changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -102,21 +107,6 @@ impl LogView {
 
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let complete = loaded.index.complete;
-        let edit_input = cx.new(|cx| InputState::new(window, cx));
-        cx.subscribe_in(
-            &edit_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.commit_edit(window, cx);
-                } else if matches!(event, InputEvent::Change) {
-                    // The edited line can grow beyond the current viewport;
-                    // redraw the parent so its horizontal range is refreshed.
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
@@ -136,7 +126,9 @@ impl LogView {
             edits_saved: true,
             max_line_width: 0.0,
             editing_line: None,
-            edit_input,
+            line_inputs: BTreeMap::new(),
+            active_input_line: None,
+            editing_changed: false,
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -233,7 +225,7 @@ impl LogView {
     }
 
     pub fn can_close_without_prompt(&self) -> bool {
-        self.edits.is_empty() || self.edits_saved
+        !self.editing_changed && (self.edits.is_empty() || self.edits_saved)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -319,6 +311,18 @@ impl LogView {
     // ---- 输入 ----
 
     pub fn copy_selection(&self, cx: &mut App) {
+        if let Some(input) = self
+            .active_input_line
+            .and_then(|file_line| self.line_inputs.get(&file_line))
+        {
+            let input = input.read(cx);
+            let range = input.selected_range();
+            if !range.is_empty() {
+                cx.write_to_clipboard(input.selected_value().to_string().into());
+                return;
+            }
+        }
+
         let Some(selection) = self.selection else {
             return;
         };
@@ -342,66 +346,134 @@ impl LogView {
     }
 
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_selected_at(window, cx, None, 0.0, 0.0);
-    }
-
-    fn edit_selected_at(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        cursor_x: Option<f32>,
-        gutter_w: f32,
-        h_scroll: f32,
-    ) {
         let row = self
             .selection
             .map(|selection| selection.active_row)
             .unwrap_or_else(|| self.doc.viewport().anchor_line());
+        self.focus_row_input(row, window, cx);
+    }
+
+    fn focus_row_input(&mut self, row: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file_line) = self.doc.row_to_file_line(row) else {
             return;
         };
-        let text = self
-            .edits
-            .get(&file_line)
-            .cloned()
-            .or_else(|| self.doc.line_text(file_line))
-            .unwrap_or_default();
-        self.editing_line = Some(file_line);
-        self.edit_input
-            .update(cx, |state, cx| state.set_value(text, window, cx));
-        if let Some(cursor_x) = cursor_x {
-            let column = self.cursor_column_at_x(
-                &self.edit_input.read(cx).value().to_string(),
-                cursor_x,
-                gutter_w,
-                h_scroll,
-            );
-            self.edit_input.update(cx, |state, cx| {
-                state.set_cursor_position(Position::new(0, column as u32), window, cx);
-                // The log view owns the document's horizontal viewport. Keep
-                // the input text at the same offset while the row is edited.
-                state.set_scroll_offset(point(px(-h_scroll), px(0.)), cx);
-            });
-        } else {
-            window.focus(&self.edit_input.read(cx).focus_handle(cx), cx);
+        let Some(input) = self.line_inputs.get(&file_line).cloned() else {
+            return;
+        };
+        if let Some(previous) = self.editing_line.filter(|previous| *previous != file_line) {
+            self.commit_line_input(previous, cx);
         }
+        self.editing_line = Some(file_line);
+        self.active_input_line = Some(file_line);
+        self.editing_changed = false;
+        self.selection = None;
+        let focus = input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
-    fn cursor_column_at_x(&self, text: &str, x: f32, gutter_w: f32, h_scroll: f32) -> usize {
-        let local = (x - f32::from(self.last_area.origin.x) - gutter_w - 8.0 + h_scroll).max(0.0);
-        let mut width = 0.0;
-        for (column, ch) in text.chars().enumerate() {
-            let char_width = theme::FONT_SIZE * if ch.is_ascii() { 0.62 } else { 1.0 };
-            if local < width + char_width * 0.5 {
-                return column;
-            }
-            width += char_width;
+    fn commit_line_input(&mut self, file_line: u64, cx: &mut Context<Self>) {
+        let Some(input) = self.line_inputs.get(&file_line) else {
+            return;
+        };
+        let value = input.read(cx).value().to_string();
+        let original = self.doc.line_text(file_line).unwrap_or_default();
+        let previous = self.edits.get(&file_line).cloned();
+        if value == original {
+            self.edits.remove(&file_line);
+        } else {
+            self.edits.insert(file_line, value);
         }
-        text.chars().count()
+        if previous != self.edits.get(&file_line).cloned() {
+            self.edits_saved = false;
+        }
+        self.editing_changed = false;
+    }
+
+    fn sync_line_inputs(
+        &mut self,
+        rows: &[RenderRow],
+        h_scroll: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible = rows
+            .iter()
+            .map(|row| row.file_line)
+            .collect::<BTreeSet<_>>();
+        if let Some(file_line) = self.editing_line.filter(|line| !visible.contains(line)) {
+            self.commit_line_input(file_line, cx);
+            self.editing_line = None;
+            self.active_input_line = None;
+            window.focus(&self.focus, cx);
+        }
+        self.line_inputs
+            .retain(|file_line, _| visible.contains(file_line));
+
+        for row in rows {
+            let file_line = row.file_line;
+            let expected = self
+                .edits
+                .get(&file_line)
+                .cloned()
+                .unwrap_or_else(|| row.text.clone());
+            if !self.line_inputs.contains_key(&file_line) {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(expected.clone())
+                        .context_menu(true)
+                });
+                cx.subscribe_in(
+                    &input,
+                    window,
+                    move |this, _, event: &InputEvent, window, cx| match event {
+                        InputEvent::Focus => {
+                            if let Some(previous) =
+                                this.editing_line.filter(|previous| *previous != file_line)
+                            {
+                                this.commit_line_input(previous, cx);
+                            }
+                            this.editing_line = Some(file_line);
+                            this.active_input_line = Some(file_line);
+                            this.editing_changed = false;
+                            this.selection = None;
+                            cx.notify();
+                        }
+                        InputEvent::Change if this.editing_line == Some(file_line) => {
+                            this.editing_changed = true;
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter { .. } => this.commit_edit(window, cx),
+                        InputEvent::Blur if this.editing_line == Some(file_line) => {
+                            this.commit_line_input(file_line, cx);
+                            this.editing_line = None;
+                            cx.notify();
+                        }
+                        _ => {}
+                    },
+                )
+                .detach();
+                self.line_inputs.insert(file_line, input);
+            } else if self.editing_line != Some(file_line) {
+                let input = &self.line_inputs[&file_line];
+                if input.read(cx).value().as_ref() != expected {
+                    input.update(cx, |state, cx| state.set_value(expected, window, cx));
+                }
+            }
+        }
+
+        let offset = point(px(-h_scroll), px(0.));
+        for input in self.line_inputs.values() {
+            if input.read(cx).scroll_offset() != offset {
+                input.update(cx, |state, cx| state.set_scroll_offset(offset, cx));
+            }
+        }
     }
 
     pub fn save_edited_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_line.is_some() {
+            self.commit_edit(window, cx);
+        }
         if self.edits.is_empty() {
             return;
         }
@@ -452,21 +524,30 @@ impl LogView {
         let Some(file_line) = self.editing_line.take() else {
             return;
         };
-        let value = self.edit_input.read(cx).value().to_string();
-        self.edits.insert(file_line, value);
-        self.edits_saved = false;
+        self.commit_line_input(file_line, cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_line.take().is_some() {
+        if let Some(file_line) = self.editing_line.take() {
+            let value = self
+                .edits
+                .get(&file_line)
+                .cloned()
+                .or_else(|| self.doc.line_text(file_line))
+                .unwrap_or_default();
+            if let Some(input) = self.line_inputs.get(&file_line) {
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            self.editing_changed = false;
             window.focus(&self.focus, cx);
             cx.notify();
         }
     }
 
     fn select_row(&mut self, row: u64, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_input_line = None;
         self.selection = match (extend, self.selection) {
             (true, Some(selection)) => Some(LineSelection {
                 active_row: row,
@@ -500,7 +581,9 @@ impl LogView {
             return;
         };
         if let Some(selection) = &mut self.selection {
-            if selection.active_row != row {
+            // Keep the legacy line-selection gesture bounded to its original
+            // row. Text selection in the log body is handled by the input.
+            if row == selection.anchor_row && selection.active_row != row {
                 selection.active_row = row;
                 cx.notify();
             }
@@ -524,6 +607,16 @@ impl LogView {
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        let input_focused = self
+            .active_input_line
+            .and_then(|file_line| self.line_inputs.get(&file_line))
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(_window));
+        if input_focused {
+            if ks.key == "escape" {
+                self.cancel_edit(_window, cx);
+            }
+            return;
+        }
         let primary = crate::platform::primary_modifier(&ks.modifiers);
         if primary && ks.key == "c" {
             self.copy_selection(cx);
@@ -657,9 +750,12 @@ impl LogView {
         let selected = self
             .selection
             .is_some_and(|selection| selection.range().contains(&view_row));
-        let file_line = row.file_line;
         let edited = self.edits.get(&row.file_line);
         let is_editing = self.editing_line == Some(row.file_line);
+        let input = self
+            .line_inputs
+            .get(&row.file_line)
+            .expect("visible rows have synchronized InputState instances");
 
         let mut content = div()
             .flex_none()
@@ -669,7 +765,8 @@ impl LogView {
             })
             .when(line_spec.is_some_and(|f| f.bold), |el| {
                 el.font_weight(FontWeight::BOLD)
-            });
+            })
+            .when(line_spec.is_some_and(|f| f.italic), |el| el.italic());
 
         if let Some(edited) = edited {
             content = content.child(edited.clone());
@@ -696,26 +793,47 @@ impl LogView {
             content = content.child(StyledText::new(row.text.clone()).with_highlights(runs));
         }
 
-        let line_content = if is_editing {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .pl_2()
-                .overflow_hidden()
-                .child(Input::new(&self.edit_input).xsmall().appearance(false))
-                .into_any_element()
+        let mut input = Input::new(input)
+            .xsmall()
+            .appearance(false)
+            .bordered(false)
+            .focus_bordered(false)
+            .readonly(!is_editing)
+            .px_0()
+            .text_size(px(theme::FONT_SIZE))
+            .line_height(px(theme::LINE_HEIGHT));
+        input.style().size.height = Some(relative(1.).into());
+        let input = if is_editing {
+            input
         } else {
-            div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .pl_2()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(content)
-                .into_any_element()
+            // The normal rendering underneath retains field-level highlight
+            // spans. This transparent InputState layer supplies native caret,
+            // selection and clipboard behavior without painting duplicate text.
+            input.text_color(transparent_black())
         };
+        let line_content = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .pl_2()
+            .overflow_hidden()
+            .when(!is_editing, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left(px(8.))
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .child(content),
+                )
+            })
+            .child(input);
 
         div()
             .id(("log-row", view_row as usize))
@@ -732,27 +850,19 @@ impl LogView {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     let in_content = f32::from(event.position.x)
                         >= f32::from(this.last_area.origin.x) + gutter_w;
-                    // Let the input's own handler place the caret. The row
-                    // handler must not focus LogView again after the child has
-                    // processed the click.
-                    if this.editing_line == Some(file_line) && !event.modifiers.shift && in_content
-                    {
+                    if in_content {
+                        if this.selection.take().is_some() {
+                            this.selecting = false;
+                            cx.notify();
+                        }
                         return;
                     }
-                    this.select_row(view_row, event.modifiers.shift, window, cx);
-                    if this.editing_line != Some(file_line) && !event.modifiers.shift && in_content
-                    {
-                        if this.editing_line.is_some() {
-                            this.commit_edit(window, cx);
-                        }
-                        this.edit_selected_at(
-                            window,
-                            cx,
-                            Some(f32::from(event.position.x)),
-                            gutter_w,
-                            h_scroll,
-                        );
+                    if this.editing_line.is_some() {
+                        this.commit_edit(window, cx);
                     }
+                    GlobalState::init(cx);
+                    GlobalState::suppress_text_selection(cx);
+                    this.select_row(view_row, event.modifiers.shift, window, cx);
                 }),
             )
             .child(
@@ -814,7 +924,7 @@ impl Focusable for LogView {
 }
 
 impl Render for LogView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 上一帧 canvas 量到的尺寸；首帧是 0，canvas 回填后会触发再画一次
         let area = self.area.get();
         if area != self.last_area {
@@ -827,8 +937,9 @@ impl Render for LogView {
         let gutter_w = self.gutter_width();
         let rows = self.doc.rows();
         let editing_line = self.editing_line;
-        let editing_text =
-            editing_line.map(|file_line| self.edit_input.read(cx).value().to_string());
+        let editing_text = editing_line
+            .and_then(|file_line| self.line_inputs.get(&file_line))
+            .map(|input| input.read(cx).value().to_string());
         let estimated_width = rows
             .iter()
             .map(|row| {
@@ -883,6 +994,7 @@ impl Render for LogView {
         let h_scroll = vp.h_scroll();
         let pixel_offset = vp.pixel_offset();
         let first_row = vp.anchor_line();
+        self.sync_line_inputs(&rows, h_scroll, window, cx);
 
         let bounds_sink = self.area.clone();
         let handle = cx.entity().downgrade();

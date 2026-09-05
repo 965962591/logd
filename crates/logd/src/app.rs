@@ -499,10 +499,10 @@ impl LogdApp {
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_scope = FilterScope::default();
-        let fore = theme::PALETTE[self.filters.len() % theme::PALETTE.len()];
-        self.filter_fore.update(cx, |picker, cx| {
-            picker.set_value(theme::c(fore), window, cx)
-        });
+        // New filters start with the editor's neutral/default colors. Colors
+        // are opt-in and can be assigned from the editor when needed.
+        self.filter_fore
+            .update(cx, |picker, cx| picker.clear_value(window, cx));
         self.filter_back
             .update(cx, |picker, cx| picker.clear_value(window, cx));
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
@@ -1441,8 +1441,6 @@ fn render_filter_row(
     let regex_app = app.clone();
     let case_app = app.clone();
     let scope_app = app.clone();
-    let fg_app = app.clone();
-    let bg_app = app.clone();
     let context_app = app.clone();
     h_flex()
         .id(("filter-row", index))
@@ -1536,24 +1534,6 @@ fn render_filter_row(
                     this.filters_changed(cx);
                 })),
         )
-        .child(swatch(
-            ("filter-fg", index),
-            "A",
-            filter.fore,
-            window.listener_for(&fg_app, move |this, _, _, cx| {
-                this.filters[index].fore = theme::next_color(this.filters[index].fore);
-                this.filters_changed(cx);
-            }),
-        ))
-        .child(swatch(
-            ("filter-bg", index),
-            "#",
-            filter.back,
-            window.listener_for(&bg_app, move |this, _, _, cx| {
-                this.filters[index].back = theme::next_color(this.filters[index].back);
-                this.filters_changed(cx);
-            }),
-        ))
         .child(v_flex().min_w_0().flex_1().child(filter.text.clone()).when(
             !filter.description.is_empty(),
             |item| {
@@ -1584,22 +1564,6 @@ fn render_filter_row(
                 )),
             )
         })
-        .into_any_element()
-}
-
-fn swatch(
-    id: (&'static str, usize),
-    glyph: &'static str,
-    color: Option<u32>,
-    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .flex_none()
-        .w(px(18.))
-        .text_color(theme::c(color.unwrap_or(theme::BORDER)))
-        .child(glyph)
-        .on_click(click)
         .into_any_element()
 }
 
