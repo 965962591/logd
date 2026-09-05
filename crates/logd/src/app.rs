@@ -53,7 +53,7 @@ enum MenuCommand {
     Refresh,
     SaveEditedCopy,
     ImportFilters,
-    ToggleEncoding,
+    SetEncoding(Encoding),
     CopySelection,
     ShowAll,
     ShowOnlyFiltered,
@@ -135,6 +135,7 @@ impl LogdApp {
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app, cx));
+        let filter_placement = crate::settings::load_filter_placement();
         let (dock_area, skin) = logd_dock_area("logd.main", Some(1), window, cx);
         // The View menu is the single visibility control; avoid a duplicate dock toggle button.
         skin.set_toggle_button_visible(false, cx);
@@ -145,13 +146,18 @@ impl LogdApp {
                 cx,
             );
             dock.set_dock(
-                DockPlacement::Right,
+                filter_placement,
                 DockLayout::tabs().panel_view(panel_handle(filter_panel.clone()), cx),
                 window,
                 cx,
             );
-            dock.set_dock_size(DockPlacement::Right, px(360.), window, cx);
-            dock.set_dock_collapsible(DockPlacement::Right, true, window, cx);
+            let filter_size = if filter_placement == DockPlacement::Bottom {
+                px(240.)
+            } else {
+                px(360.)
+            };
+            dock.set_dock_size(filter_placement, filter_size, window, cx);
+            dock.set_dock_collapsible(filter_placement, true, window, cx);
         });
 
         let mut this = Self {
@@ -174,7 +180,7 @@ impl LogdApp {
             dock_area,
             tab_scroll: ScrollHandle::new(),
             filter_panel,
-            filter_placement: DockPlacement::Right,
+            filter_placement,
             filters_open: true,
             language,
             status: None,
@@ -593,16 +599,15 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn toggle_encoding(&mut self, cx: &mut Context<Self>) {
+    fn set_encoding(&mut self, encoding: Encoding, cx: &mut Context<Self>) {
         let Some(view) = self.active_view().cloned() else {
             return;
         };
-        let next = match view.read(cx).doc().encoding() {
-            Encoding::Utf8 => Encoding::Gb18030,
-            Encoding::Gb18030 => Encoding::Utf8,
-        };
+        if view.read(cx).doc().encoding() == encoding {
+            return;
+        }
         let filters = self.filters_for_tab(self.active);
-        view.update(cx, |view, cx| view.set_encoding(next, filters, cx));
+        view.update(cx, |view, cx| view.set_encoding(encoding, filters, cx));
         cx.notify();
     }
 
@@ -697,6 +702,7 @@ impl LogdApp {
         });
         self.filter_placement = placement;
         self.filters_open = true;
+        let _ = crate::settings::save_filter_placement(placement);
         cx.notify();
     }
 
@@ -711,7 +717,7 @@ impl LogdApp {
                 }
             }
             MenuCommand::ImportFilters => self.prompt_import_filters(window, cx),
-            MenuCommand::ToggleEncoding => self.toggle_encoding(cx),
+            MenuCommand::SetEncoding(encoding) => self.set_encoding(encoding, cx),
             MenuCommand::CopySelection => {
                 if let Some(view) = self.active_view().cloned() {
                     view.update(cx, |view, cx| view.copy_selection(cx));
@@ -762,9 +768,13 @@ impl LogdApp {
         let selected = self.selected_filter.is_some();
         let placement = self.filter_placement;
         let has_view = self.active_view().is_some();
+        let active_encoding = self
+            .active_view()
+            .map(|view| view.read(cx).doc().encoding());
         let id = match command_group {
             Key::File => "menu-file",
             Key::View => "menu-view",
+            Key::Encoding => "menu-encoding",
             _ => "menu-filters",
         };
         let button = Button::new(id)
@@ -810,19 +820,42 @@ impl LogdApp {
                                         .disabled(true),
                                 );
                             }
-                            submenu_recent.iter().fold(menu, |menu, path| {
-                                let target = path.clone();
-                                let target_app = submenu_app.clone();
-                                menu.item(PopupMenuItem::new(path.display().to_string()).on_click(
-                                    window.listener_for(&target_app, move |this, _, window, cx| {
-                                        this.dispatch(
-                                            MenuCommand::OpenRecent(target.clone()),
-                                            window,
-                                            cx,
-                                        )
-                                    }),
-                                ))
-                            })
+                            submenu_recent.iter().enumerate().fold(
+                                menu.max_w(px(480.)),
+                                |menu, (index, path)| {
+                                    let target = path.clone();
+                                    let target_app = submenu_app.clone();
+                                    let full_path = path.display().to_string();
+                                    menu.item(
+                                        PopupMenuItem::element(move |_, _| {
+                                            let label = full_path.clone();
+                                            let tooltip = full_path.clone();
+                                            div()
+                                                .id(("recent-file-label", index))
+                                                .w(px(440.))
+                                                .overflow_hidden()
+                                                .text_ellipsis_middle()
+                                                .child(label)
+                                                .tooltip(move |window, cx| {
+                                                    gpui_component::tooltip::Tooltip::new(
+                                                        tooltip.clone(),
+                                                    )
+                                                    .build(window, cx)
+                                                })
+                                        })
+                                        .on_click(window.listener_for(
+                                            &target_app,
+                                            move |this, _, window, cx| {
+                                                this.dispatch(
+                                                    MenuCommand::OpenRecent(target.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                    )
+                                },
+                            )
                         },
                     )
                 })
@@ -901,26 +934,14 @@ impl LogdApp {
                                     },
                                 )),
                         );
-                    let encoding_app = app.clone();
                     let copy_app = app.clone();
-                    let menu = menu
-                        .item(
-                            PopupMenuItem::new(text(Key::Encoding, lang))
-                                .disabled(!has_view)
-                                .on_click(window.listener_for(
-                                    &encoding_app,
-                                    |this, _, window, cx| {
-                                        this.dispatch(MenuCommand::ToggleEncoding, window, cx)
-                                    },
-                                )),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::Copy, lang))
-                                .disabled(!has_view)
-                                .on_click(window.listener_for(&copy_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::CopySelection, window, cx)
-                                })),
-                        );
+                    let menu = menu.item(
+                        PopupMenuItem::new(text(Key::Copy, lang))
+                            .disabled(!has_view)
+                            .on_click(window.listener_for(&copy_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::CopySelection, window, cx)
+                            })),
+                    );
                     menu.submenu(
                         text(Key::Language, lang),
                         window,
@@ -940,6 +961,31 @@ impl LogdApp {
                             )
                         },
                     )
+                })
+                .into_any_element(),
+            Key::Encoding => button
+                .dropdown_menu(move |menu, window, _| {
+                    Encoding::ALL
+                        .iter()
+                        .copied()
+                        .fold(menu.scrollable(true), |menu, encoding| {
+                            let encoding_app = app.clone();
+                            menu.item(
+                                PopupMenuItem::new(encoding.label())
+                                    .checked(active_encoding == Some(encoding))
+                                    .disabled(!has_view)
+                                    .on_click(window.listener_for(
+                                        &encoding_app,
+                                        move |this, _, window, cx| {
+                                            this.dispatch(
+                                                MenuCommand::SetEncoding(encoding),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                        })
                 })
                 .into_any_element(),
             _ => button
@@ -1002,6 +1048,7 @@ impl LogdApp {
             )
             .child(self.menu_button(Key::File, window, cx))
             .child(self.menu_button(Key::View, window, cx))
+            .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
             .into_any_element();
         let center = div()
@@ -1017,23 +1064,7 @@ impl LogdApp {
             .text_color(theme::c(theme::FG))
             .child(Input::new(&self.keyword).small().appearance(false))
             .into_any_element();
-        let right = self
-            .active_view()
-            .map(|view| view.read(cx).doc().encoding().label().to_string())
-            .unwrap_or_default();
-        title_bar::render(
-            left,
-            center,
-            div()
-                .pr_2()
-                .text_size(px(11.))
-                .text_color(theme::c(theme::MUTED))
-                .child(right)
-                .into_any_element(),
-            window,
-            self.language,
-        )
-        .into_any_element()
+        title_bar::render(left, center, window, self.language).into_any_element()
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {

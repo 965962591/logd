@@ -19,3 +19,4 @@ gpui-component-assets.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
+dirs.workspace = true

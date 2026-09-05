@@ -134,10 +134,7 @@ pub struct MatcherSet {
 
 /// 把关键字转成目标文件编码下的字节串。
 pub fn encode_pattern(text: &str, enc: Encoding) -> Vec<u8> {
-    match enc {
-        Encoding::Utf8 => text.as_bytes().to_vec(),
-        Encoding::Gb18030 => encoding_rs::GB18030.encode(text).0.into_owned(),
-    }
+    enc.codec().encode(text).0.into_owned()
 }
 
 impl MatcherSet {
@@ -566,5 +563,14 @@ mod tests {
         // 用 UTF-8 编的关键字去打 GB18030 的干草堆，必然不中
         let m = MatcherSet::new(vec![lit("曝光表")], Encoding::Utf8).unwrap();
         assert!(!m.is_visible(&hay));
+    }
+
+    #[test]
+    fn big5_pattern_matches_big5_bytes() {
+        let (hay, _, had_errors) = encoding_rs::BIG5.encode("繁體日誌 AEtable");
+        assert!(!had_errors);
+
+        let m = MatcherSet::new(vec![lit("繁體日誌")], Encoding::Big5).unwrap();
+        assert!(m.is_visible(&hay));
     }
 }

@@ -64,7 +64,7 @@ impl Document {
         self.encoding
     }
 
-    /// 手动切换编码。行索引不受影响——两种编码都是 ASCII 兼容的字节流，
+    /// 手动切换编码。行索引不受影响——菜单中的编码都是 ASCII 兼容的字节流，
     /// `b'\n'` 的位置不变；但关键字要按新编码重新编码，所以命中集作废。
     pub fn set_encoding(&mut self, enc: Encoding) {
         if self.encoding != enc {

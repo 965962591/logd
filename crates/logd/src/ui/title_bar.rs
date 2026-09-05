@@ -16,7 +16,6 @@ const CENTER_DRAG_MIN_WIDTH: f32 = 20.0;
 pub fn render(
     left: AnyElement,
     center: AnyElement,
-    right: AnyElement,
     window: &mut Window,
     lang: Language,
 ) -> impl IntoElement {
@@ -64,11 +63,9 @@ pub fn render(
                 .w_full()
                 .min_w_0()
                 .justify_end()
-                // The space before the encoding label is part of the title
-                // bar too. Without its own hitbox it remains a normal client
-                // area and cannot move the window on Windows.
+                // The space before the window controls needs its own hitbox;
+                // otherwise it cannot move the window on Windows.
                 .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
-                .child(right)
                 .child(control(
                     "window-minimize",
                     IconName::WindowMinimize,

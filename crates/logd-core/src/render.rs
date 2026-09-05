@@ -62,13 +62,10 @@ pub fn prepare_plain(raw: &[u8], enc: Encoding, max_bytes: usize) -> RenderLine 
 }
 
 fn decode(bytes: &[u8], enc: Encoding) -> String {
-    match enc {
-        Encoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
-        Encoding::Gb18030 => encoding_rs::GB18030
-            .decode_without_bom_handling(bytes)
-            .0
-            .into_owned(),
-    }
+    enc.codec()
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
 }
 
 /// 在原始字节里找一个 `<= max_bytes` 的安全切点，别把多字节序列劈开。
@@ -85,13 +82,20 @@ fn floor_raw_boundary(raw: &[u8], enc: Encoding, max_bytes: usize) -> usize {
             }
             i
         }
-        // GB18030 没有自同步位，只能从行首扫。截断只发生在超长行上，
-        // 而超长行本来就罕见，这点开销可接受；解码器会告诉我们消费了多少字节。
-        Encoding::Gb18030 => {
-            let mut dec = encoding_rs::GB18030.new_decoder();
-            let mut sink = String::with_capacity(max_bytes + 4);
-            let (_, consumed, _) = dec.decode_to_string(&raw[..max_bytes], &mut sink, false);
-            consumed
+        // 其他多字节编码没有 UTF-8 那样的自同步位。受支持编码的码元最多 4 字节，
+        // 从截断点最多回看 3 字节，直到完整解码不以替换字符结尾。
+        _ => {
+            if enc.codec().is_single_byte() {
+                return max_bytes;
+            }
+            let floor = max_bytes.saturating_sub(3);
+            for cut in (floor..=max_bytes).rev() {
+                let (text, had_errors) = enc.codec().decode_without_bom_handling(&raw[..cut]);
+                if !had_errors || !text.ends_with('\u{FFFD}') {
+                    return cut;
+                }
+            }
+            floor
         }
     }
 }
@@ -227,6 +231,43 @@ mod tests {
         let line = prepare_line(&raw, Encoding::Gb18030, &mut Vec::new(), 7);
         assert!(line.truncated);
         assert_eq!(line.text, "曝曝曝…", "不该出现替换字符");
+    }
+
+    #[test]
+    fn big5_truncation_does_not_split_multibyte() {
+        let long = "繁".repeat(50);
+        let (raw, _, had_errors) = encoding_rs::BIG5.encode(&long);
+        assert!(!had_errors);
+
+        let line = prepare_line(&raw, Encoding::Big5, &mut Vec::new(), 7);
+        assert!(line.truncated);
+        assert_eq!(line.text, "繁繁繁…", "不该出现替换字符");
+    }
+
+    #[test]
+    fn every_supported_multibyte_encoding_truncates_cleanly() {
+        let cases = [
+            (Encoding::Gb18030, "😀"),
+            (Encoding::Gbk, "曝"),
+            (Encoding::Big5, "繁"),
+            (Encoding::ShiftJis, "日"),
+            (Encoding::EucJp, "日"),
+            (Encoding::EucKr, "한"),
+        ];
+        for (encoding, ch) in cases {
+            let text = ch.repeat(12);
+            let (raw, _, had_errors) = encoding.codec().encode(&text);
+            assert!(!had_errors, "{} cannot encode {ch}", encoding.label());
+            for limit in 1..raw.len() {
+                let line = prepare_plain(&raw, encoding, limit);
+                assert!(
+                    !line.text.contains('\u{FFFD}'),
+                    "{} split a character at byte {limit}: {:?}",
+                    encoding.label(),
+                    line.text
+                );
+            }
+        }
     }
 
     /// 非法 UTF-8 会变成 3 字节的 U+FFFD，偏移会漂，必须走换算分支。
