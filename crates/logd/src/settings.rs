@@ -4,25 +4,29 @@ use std::path::PathBuf;
 use gpui_component::dock::{DockAreaState, DockPlacement};
 
 const FILTER_PLACEMENT_KEY: &str = "filter_placement";
+const SETTINGS_FILE: &str = "settings.conf";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
 const RECENT_FILES_FILE: &str = "recent-files.json";
 const MAX_RECENT_FILES: usize = 10;
 
 pub fn load_filter_placement() -> DockPlacement {
-    settings_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+    read_cache_file(SETTINGS_FILE)
         .and_then(|contents| parse_filter_placement(&contents))
         .unwrap_or(DockPlacement::Right)
 }
 
 pub fn load_dock_layout() -> Option<DockAreaState> {
-    let contents = std::fs::read_to_string(dock_layout_path()?).ok()?;
+    let contents = read_cache_file(DOCK_LAYOUT_FILE)?;
     serde_json::from_str(&contents).ok()
 }
 
 pub fn save_dock_layout(state: &DockAreaState) -> io::Result<()> {
-    let path = dock_layout_path()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "local data directory not found"))?;
+    let path = dock_layout_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "executable cache directory not found",
+        )
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -32,15 +36,18 @@ pub fn save_dock_layout(state: &DockAreaState) -> io::Result<()> {
 }
 
 pub fn load_recent_files() -> Vec<PathBuf> {
-    recent_files_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+    read_cache_file(RECENT_FILES_FILE)
         .map(|contents| parse_recent_files(&contents))
         .unwrap_or_default()
 }
 
 pub fn save_recent_files(paths: &[PathBuf]) -> io::Result<()> {
-    let path = recent_files_path()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "local data directory not found"))?;
+    let path = recent_files_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "executable cache directory not found",
+        )
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -49,20 +56,33 @@ pub fn save_recent_files(paths: &[PathBuf]) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
-fn settings_path() -> Option<PathBuf> {
-    app_data_dir().map(|path| path.join("settings.conf"))
-}
-
 fn dock_layout_path() -> Option<PathBuf> {
-    app_data_dir().map(|path| path.join(DOCK_LAYOUT_FILE))
+    cache_file_path(DOCK_LAYOUT_FILE)
 }
 
 fn recent_files_path() -> Option<PathBuf> {
-    app_data_dir().map(|path| path.join(RECENT_FILES_FILE))
+    cache_file_path(RECENT_FILES_FILE)
 }
 
-fn app_data_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|path| path.join("logd"))
+fn cache_file_path(file_name: &str) -> Option<PathBuf> {
+    logd_core::cache::application_cache_dir()
+        .ok()
+        .map(|path| path.join(file_name))
+}
+
+fn read_cache_file(file_name: &str) -> Option<String> {
+    let path = cache_file_path(file_name)?;
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        return Some(contents);
+    }
+
+    let legacy_path = dirs::data_local_dir()?.join("logd").join(file_name);
+    let contents = std::fs::read_to_string(legacy_path).ok()?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, &contents);
+    Some(contents)
 }
 
 fn parse_filter_placement(contents: &str) -> Option<DockPlacement> {

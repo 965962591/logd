@@ -16,29 +16,48 @@ const MAGIC: &[u8; 8] = b"LOGDIDX\x00";
 /// 索引结构或 ANCHOR_STRIDE 一变就要 +1，旧缓存自动失效。
 const FORMAT_VERSION: u32 = 1;
 
-/// 缓存文件路径：`%LOCALAPPDATA%\logd\cache\{hash}-{len}-{mtime}.idx`
+/// All application-owned state lives beside the executable so a deployed
+/// folder remains self-contained.
+pub fn application_cache_dir() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("找不到当前程序路径")?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("当前程序路径没有父目录: {}", executable.display()))?;
+    Ok(directory.join("cache"))
+}
+
+/// 缓存文件路径：`程序目录\cache\{hash}-{len}-{mtime}.idx`
 pub fn cache_path(source: &Path) -> Result<PathBuf> {
     let meta = std::fs::metadata(source)
         .with_context(|| format!("读不到 {} 的元信息", source.display()))?;
     let mtime = mtime_nanos(&meta);
     let key = fnv1a64(source.to_string_lossy().as_bytes());
-    let dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("找不到 LOCALAPPDATA 目录"))?
-        .join("logd")
-        .join("cache");
+    let dir = application_cache_dir()?;
     Ok(dir.join(format!("{key:016x}-{}-{mtime}.idx", meta.len())))
 }
 
 /// 读缓存。任何不匹配/损坏都返回 `Ok(None)`，让调用方安静地回退到重建。
 pub fn load(source: &Path) -> Result<Option<LineIndex>> {
     let path = cache_path(source)?;
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Ok(None);
+    let (bytes, migrate) = match std::fs::read(&path) {
+        Ok(bytes) => (bytes, false),
+        Err(_) => {
+            let Some(legacy_path) = legacy_cache_path(&path) else {
+                return Ok(None);
+            };
+            let Ok(bytes) = std::fs::read(legacy_path) else {
+                return Ok(None);
+            };
+            (bytes, true)
+        }
     };
     match decode(&bytes) {
         Ok(idx) => {
             let meta = std::fs::metadata(source)?;
             if idx.file_len == meta.len() {
+                if migrate {
+                    let _ = write_cache(&path, &bytes);
+                }
                 Ok(Some(idx))
             } else {
                 Ok(None)
@@ -58,14 +77,27 @@ pub fn store(source: &Path, index: &LineIndex) -> Result<()> {
         return Ok(());
     }
     let path = cache_path(source)?;
+    write_cache(&path, &encode(index))
+}
+
+fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("建不了 {}", dir.display()))?;
     }
     // 先写临时文件再 rename，避免半截文件被当成有效缓存
     let tmp = path.with_extension("idx.tmp");
-    std::fs::write(&tmp, encode(index)).with_context(|| format!("写不了 {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("重命名到 {} 失败", path.display()))?;
+    std::fs::write(&tmp, bytes).with_context(|| format!("写不了 {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("重命名到 {} 失败", path.display()))?;
     Ok(())
+}
+
+fn legacy_cache_path(path: &Path) -> Option<PathBuf> {
+    Some(
+        dirs::data_local_dir()?
+            .join("logd")
+            .join("cache")
+            .join(path.file_name()?),
+    )
 }
 
 pub fn encode(index: &LineIndex) -> Vec<u8> {
@@ -152,7 +184,10 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let s = self.b.get(self.p..self.p + n).ok_or_else(|| anyhow!("数据截断"))?;
+        let s = self
+            .b
+            .get(self.p..self.p + n)
+            .ok_or_else(|| anyhow!("数据截断"))?;
         self.p += n;
         Ok(s)
     }
@@ -243,5 +278,14 @@ mod tests {
     fn fnv_is_stable() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_ne!(fnv1a64(b"a"), fnv1a64(b"b"));
+    }
+
+    #[test]
+    fn application_cache_is_beside_the_executable() {
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(
+            application_cache_dir().unwrap(),
+            executable.parent().unwrap().join("cache")
+        );
     }
 }

@@ -265,6 +265,9 @@ pub struct FilterPanel {
 
 impl FilterPanel {
     pub fn new(app: WeakEntity<LogdApp>, cx: &mut Context<Self>) -> Self {
+        if let Some(app) = app.upgrade() {
+            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             app,
             focus: cx.focus_handle(),

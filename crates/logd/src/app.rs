@@ -1228,11 +1228,15 @@ impl LogdApp {
             .gap_1()
             .pl_2()
             .child(
-                div()
+                h_flex()
                     .id("title-app-drag")
+                    .h_full()
+                    .items_center()
+                    .gap_1()
                     .font_weight(FontWeight::SEMIBOLD)
                     .px_1()
                     .window_control_area(WindowControlArea::Drag)
+                    .child(title_bar::app_icon())
                     .child("logd"),
             )
             .child(self.menu_button(Key::File, window, cx))
@@ -1494,6 +1498,9 @@ impl LogdApp {
                                     Button::new("filter-scope")
                                         .icon(IconName::Globe)
                                         .selected(filter_scope == FilterScope::AllFiles)
+                                        .when(filter_scope == FilterScope::AllFiles, |button| {
+                                            button.primary()
+                                        })
                                         .accessibility_label(format!(
                                             "{}: {}",
                                             text(Key::FilterScope, lang),
@@ -2147,6 +2154,7 @@ fn render_filter_row(
                             Button::new(("filter-exclude", index))
                                 .icon(IconName::Minus)
                                 .selected(filter.excluding)
+                                .when(filter.excluding, |button| button.primary())
                                 .accessibility_label(text(Key::FilterExcluding, lang))
                                 .on_click(window.listener_for(
                                     &exclude_app,
@@ -2169,6 +2177,9 @@ fn render_filter_row(
                             Button::new(("filter-mode", index))
                                 .icon(IconName::GalleryVerticalEnd)
                                 .selected(filter.mode == HighlightMode::Line)
+                                .when(filter.mode == HighlightMode::Line, |button| {
+                                    button.primary()
+                                })
                                 .accessibility_label(text(Key::FilterHighlightLine, lang))
                                 .on_click(window.listener_for(&mode_app, move |this, _, _, cx| {
                                     this.filters[index].mode = match this.filters[index].mode {
@@ -2190,6 +2201,7 @@ fn render_filter_row(
                             Button::new(("filter-regex", index))
                                 .icon(IconName::Asterisk)
                                 .selected(filter.regex)
+                                .when(filter.regex, |button| button.primary())
                                 .accessibility_label(text(Key::FilterRegex, lang))
                                 .on_click(window.listener_for(
                                     &regex_app,
@@ -2211,6 +2223,7 @@ fn render_filter_row(
                             Button::new(("filter-case", index))
                                 .icon(IconName::CaseSensitive)
                                 .selected(filter.case_sensitive)
+                                .when(filter.case_sensitive, |button| button.primary())
                                 .accessibility_label(text(Key::FilterCaseSensitive, lang))
                                 .on_click(window.listener_for(&case_app, move |this, _, _, cx| {
                                     this.filters[index].case_sensitive =
@@ -2234,6 +2247,9 @@ fn render_filter_row(
                             Button::new(("filter-scope", index))
                                 .icon(IconName::Globe)
                                 .selected(filter.scope == FilterScope::AllFiles)
+                                .when(filter.scope == FilterScope::AllFiles, |button| {
+                                    button.primary()
+                                })
                                 .accessibility_label(format!(
                                     "{}: {}",
                                     text(Key::FilterScope, lang),
