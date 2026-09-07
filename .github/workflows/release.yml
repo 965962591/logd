@@ -110,6 +110,16 @@ jobs:
             throw "Unexpected ProductName '$($versionInfo.ProductName)'; expected 'logd'"
           }
 
+          # The GPUI Windows backend relies on PerMonitorV2 for logical pixel sizes.
+          # Inspect the final executable, rather than a dependency or intermediate file,
+          # so packaging cannot silently drop the manifest.
+          $manifest = Join-Path $env:RUNNER_TEMP "logd.manifest.xml"
+          mt.exe -nologo -inputresource:"$exe;#1" -out:"$manifest"
+          $manifestText = Get-Content -Raw $manifest
+          if ($manifestText -notmatch "PerMonitorV2") {
+            throw "logd.exe manifest does not declare PerMonitorV2 DPI awareness"
+          }
+
       - name: Collect Windows packages
         shell: pwsh
         run: |

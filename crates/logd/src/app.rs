@@ -3127,6 +3127,10 @@ pub fn run(initial: Vec<PathBuf>) {
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| LogdApp::new(initial, window, cx));
+                // Keep the release executable's first client area identical to dev builds.
+                // Some Windows packaging/runtime combinations adjust the requested bounds
+                // while creating the native window; resize after the platform window exists.
+                window.resize(crate::platform::initial_window_size());
                 cx.new(|cx| Root::new(view, window, cx).bordered(false))
             })
             .expect("failed to create logd window");

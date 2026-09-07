@@ -1,6 +1,14 @@
 //! Cross-platform window policy for Windows and macOS.
 
-use gpui::{px, size, App, TitlebarOptions, WindowDecorations, WindowOptions};
+use gpui::{px, size, App, Size, TitlebarOptions, WindowDecorations, WindowOptions};
+
+/// The initial client area used by every build and platform.
+pub const INITIAL_WINDOW_WIDTH: f32 = 900.0;
+pub const INITIAL_WINDOW_HEIGHT: f32 = 600.0;
+
+pub fn initial_window_size() -> Size<gpui::Pixels> {
+    size(px(INITIAL_WINDOW_WIDTH), px(INITIAL_WINDOW_HEIGHT))
+}
 
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
@@ -13,7 +21,7 @@ pub fn window_options(cx: &App) -> WindowOptions {
             ..Default::default()
         }),
         is_movable: true,
-        window_bounds: Some(gpui::WindowBounds::centered(size(px(900.), px(600.)), cx)),
+        window_bounds: Some(gpui::WindowBounds::centered(initial_window_size(), cx)),
         window_min_size: Some(size(px(760.), px(480.))),
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
