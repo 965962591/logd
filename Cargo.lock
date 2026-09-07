@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "logd"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -3514,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "logd-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aho-corasick",
  "anyhow",
