@@ -493,9 +493,10 @@ impl LogdApp {
 
     fn apply_filters_to_view(&self, tab_index: usize, view: &Entity<LogView>, cx: &mut App) {
         let filters = self.filters_for_tab(tab_index);
+        let configured_filter_count = self.filters.len();
         let only = self.show_only_filtered;
         view.update(cx, |view, cx| {
-            view.apply_filters(filters, cx);
+            view.apply_filters(filters, configured_filter_count, cx);
             view.set_show_only_filtered(only, cx);
         });
     }
@@ -503,6 +504,12 @@ impl LogdApp {
     fn apply_search_to_view(&self, view: &Entity<LogView>, cx: &mut App) {
         let query = self.search_query.clone();
         view.update(cx, |view, cx| view.apply_search(query, cx));
+    }
+
+    fn has_multi_file_filter_results(&self) -> bool {
+        self.filters.iter().any(|filter| {
+            filter.is_active() && !filter.excluding && filter.scope == FilterScope::AllFiles
+        })
     }
 
     fn observe_log_view(&self, view: &Entity<LogView>, cx: &mut Context<Self>) {
@@ -737,13 +744,22 @@ impl LogdApp {
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
         self.filters_dirty = true;
+        let refresh_all = self.has_multi_file_filter_results()
+            || self
+                .tabs
+                .iter()
+                .any(|tab| tab.view.read(cx).has_multi_file_filter_results());
         for (index, tab) in self.tabs.iter().enumerate() {
-            if index == self.active {
+            if index == self.active || refresh_all {
                 self.apply_filters_to_view(index, &tab.view, cx);
             } else {
                 tab.view.update(cx, |view, _| view.mark_dirty());
             }
         }
+        self.search_results_panel.update(cx, |panel, cx| {
+            panel.reset_scroll();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -940,9 +956,10 @@ impl LogdApp {
             return;
         }
         let filters = self.filters_for_tab(self.active);
+        let configured_filter_count = self.filters.len();
         let search_query = self.search_query.clone();
         view.update(cx, |view, cx| {
-            view.set_encoding(encoding, filters, search_query, cx)
+            view.set_encoding(encoding, filters, configured_filter_count, search_query, cx)
         });
         cx.notify();
     }
@@ -1248,18 +1265,30 @@ impl LogdApp {
 
     pub(crate) fn search_results_title_status(&self, cx: &App) -> (String, Option<String>) {
         let has_search = !self.search_query.is_empty();
+        let has_filter_results = self.has_multi_file_filter_results();
+        let has_results = has_search || has_filter_results;
         let mut total_matches = 0usize;
         let mut matched_files = 0usize;
         let mut scanning = 0usize;
 
         for tab in &self.tabs {
             let view = tab.view.read(cx);
-            if has_search
-                && (view.search_scanning_progress().is_some() || view.indexing_progress().is_some())
-            {
+            let result_scanning = if has_search {
+                view.search_scanning_progress().is_some()
+            } else {
+                has_filter_results && view.scanning_progress().is_some()
+            };
+            if has_results && (result_scanning || view.indexing_progress().is_some()) {
                 scanning += 1;
             }
-            if let Some(lines) = view.search_matches().filter(|lines| !lines.is_empty()) {
+            let lines = if has_search {
+                view.search_matches()
+            } else if has_filter_results {
+                view.multi_file_filter_matches()
+            } else {
+                None
+            };
+            if let Some(lines) = lines.filter(|lines| !lines.is_empty()) {
                 total_matches = total_matches.saturating_add(lines.len());
                 matched_files += 1;
             }
@@ -2288,22 +2317,33 @@ impl LogdApp {
         cx: &mut Context<SearchResultsPanel>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
-        let (has_search, files, total_matches, tree_rows, scanning, lang) = {
+        let (has_results, files, total_matches, tree_rows, scanning, lang) = {
             let state = app.read(cx);
             let has_search = !state.search_query.is_empty();
+            let has_filter_results = state.has_multi_file_filter_results();
+            let has_results = has_search || has_filter_results;
             let mut files = Vec::new();
             let mut total_matches = 0usize;
             let mut tree_rows = 0usize;
             let mut scanning = 0usize;
             for (tab_index, tab) in state.tabs.iter().enumerate() {
                 let view = tab.view.read(cx);
-                if has_search
-                    && (view.search_scanning_progress().is_some()
-                        || view.indexing_progress().is_some())
-                {
+                let result_scanning = if has_search {
+                    view.search_scanning_progress().is_some()
+                } else {
+                    has_filter_results && view.scanning_progress().is_some()
+                };
+                if has_results && (result_scanning || view.indexing_progress().is_some()) {
                     scanning += 1;
                 }
-                let Some(lines) = view.search_matches() else {
+                let lines = if has_search {
+                    view.search_matches()
+                } else if has_filter_results {
+                    view.multi_file_filter_matches()
+                } else {
+                    None
+                };
+                let Some(lines) = lines else {
                     continue;
                 };
                 if lines.is_empty() {
@@ -2325,7 +2365,7 @@ impl LogdApp {
                 });
             }
             (
-                has_search,
+                has_results,
                 Arc::new(files),
                 total_matches,
                 tree_rows,
@@ -2341,7 +2381,7 @@ impl LogdApp {
             .text_color(palette.foreground)
             .text_size(px(12.));
 
-        if !has_search {
+        if !has_results {
             return panel
                 .child(
                     div()

@@ -29,8 +29,8 @@ pub use query::{CompileOptions, Query, QueryScratch};
 pub use render::{prepare_line, prepare_plain, RenderLine, DEFAULT_MAX_RENDER_BYTES};
 pub use rowmap::{ContextMap, Matches, RowIndex, Segment};
 pub use scan::{
-    scan_all, scan_all_with_query, scan_all_with_query_and_counts, scan_query_all,
-    FilterScanResult, ScanOutcome,
+    scan_all, scan_all_with_query, scan_all_with_query_and_counts,
+    scan_all_with_query_and_counts_for_filters, scan_query_all, FilterScanResult, ScanOutcome,
 };
 pub use source::{Encoding, FileSource};
 pub use tat::TatFile;

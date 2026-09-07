@@ -22,9 +22,9 @@ use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
-    cache, index::HEAD_BYTES, scan_all_with_query_and_counts, scan_query_all, CompileOptions,
-    Document, Encoding, FileSource, FilterSpec, LineIndex, MatcherSet, Progress, Query, RenderRow,
-    ScanOutcome, ScrollTo,
+    cache, index::HEAD_BYTES, scan_all_with_query_and_counts_for_filters, scan_query_all,
+    CompileOptions, Document, Encoding, FileSource, FilterSpec, LineIndex, MatcherSet, Progress,
+    Query, RenderRow, ScanOutcome, ScrollTo,
 };
 
 use crate::theme;
@@ -57,6 +57,8 @@ pub struct LogView {
     indexing: Option<Arc<Progress>>,
     scanning: Option<Arc<Progress>>,
     filter_match_counts: Option<Arc<Vec<u64>>>,
+    multi_file_filter_mask: Arc<Vec<bool>>,
+    multi_file_filter_matches: Option<Arc<Vec<u64>>>,
     search_query: Arc<Query>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
@@ -181,6 +183,8 @@ impl LogView {
             indexing: None,
             scanning: None,
             filter_match_counts: None,
+            multi_file_filter_mask: Arc::new(Vec::new()),
+            multi_file_filter_matches: None,
             search_query,
             search_matches: None,
             search_scanning: None,
@@ -230,6 +234,17 @@ impl LogView {
 
     pub fn filter_match_counts(&self) -> Option<Arc<Vec<u64>>> {
         self.filter_match_counts.clone()
+    }
+
+    pub fn has_multi_file_filter_results(&self) -> bool {
+        self.multi_file_filter_mask
+            .iter()
+            .zip(self.doc.matcher().filters())
+            .any(|(selected, filter)| *selected && !filter.excluding)
+    }
+
+    pub fn multi_file_filter_matches(&self) -> Option<Arc<Vec<u64>>> {
+        self.multi_file_filter_matches.clone()
     }
 
     pub fn search_scanning_progress(&self) -> Option<f32> {
@@ -326,9 +341,26 @@ impl LogView {
     }
 
     /// 换一套过滤器。非活动标签页可以先 [`mark_dirty`]，切过去时再调这个。
-    pub fn apply_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
+    pub fn apply_filters(
+        &mut self,
+        filters: Vec<FilterSpec>,
+        configured_filter_count: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.dirty = false;
         self.filter_match_counts = None;
+        self.multi_file_filter_mask = Arc::new(
+            filters
+                .iter()
+                .enumerate()
+                .map(|(index, filter)| {
+                    index < configured_filter_count
+                        && filter.is_active()
+                        && filter.scope == logd_core::FilterScope::AllFiles
+                })
+                .collect(),
+        );
+        self.multi_file_filter_matches = None;
         match MatcherSet::new(filters, self.doc.encoding()) {
             Ok(m) => {
                 self.error = None;
@@ -420,12 +452,13 @@ impl LogView {
         &mut self,
         enc: Encoding,
         filters: Vec<FilterSpec>,
+        configured_filter_count: usize,
         search_query: String,
         cx: &mut Context<Self>,
     ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
-        self.apply_filters(filters, cx);
+        self.apply_filters(filters, configured_filter_count, cx);
         self.apply_search(search_query, cx);
     }
 
@@ -472,6 +505,7 @@ impl LogView {
             p.cancel();
         }
         self.filter_match_counts = None;
+        self.multi_file_filter_matches = None;
         if self.doc.matcher().is_noop() && self.search_query.is_empty() {
             self.filter_match_counts = Some(Arc::new(vec![0; self.doc.matcher().filters().len()]));
             self.doc.set_matches(None);
@@ -484,6 +518,7 @@ impl LogView {
         let source = self.doc.source().clone();
         let index = self.doc.index().clone();
         let matcher = self.doc.matcher().clone();
+        let multi_file_filter_mask = self.multi_file_filter_mask.clone();
         let query = self.search_query.clone();
         let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
         self.scanning = Some(progress.clone());
@@ -492,11 +527,12 @@ impl LogView {
             let out = cx
                 .background_executor()
                 .spawn(async move {
-                    scan_all_with_query_and_counts(
+                    scan_all_with_query_and_counts_for_filters(
                         source.data(),
                         &index,
                         &matcher,
                         &query,
+                        multi_file_filter_mask.as_slice(),
                         &progress,
                     )
                 })
@@ -509,6 +545,9 @@ impl LogView {
                 match out {
                     Some(result) => {
                         this.filter_match_counts = Some(Arc::new(result.filter_counts));
+                        this.multi_file_filter_matches = this
+                            .has_multi_file_filter_results()
+                            .then(|| Arc::new(result.selected_filter_lines));
                         match result.outcome {
                             ScanOutcome::Matched(lines) => {
                                 this.doc.set_matches(Some(Arc::new(lines)))

@@ -30,6 +30,8 @@ pub struct FilterScanResult {
     pub outcome: ScanOutcome,
     /// Number of matching lines for each filter in `MatcherSet::filters()`.
     pub filter_counts: Vec<u64>,
+    /// Lines matching the selected include filters after selected excludes.
+    pub selected_filter_lines: Vec<u64>,
 }
 
 impl ScanOutcome {
@@ -106,6 +108,19 @@ pub fn scan_all_with_query_and_counts(
     query: &Query,
     progress: &Progress,
 ) -> Option<FilterScanResult> {
+    scan_all_with_query_and_counts_for_filters(data, index, matcher, query, &[], progress)
+}
+
+/// Apply configured filters and a temporary query while also collecting the
+/// lines hit by selected include filters, minus lines hit by selected excludes.
+pub fn scan_all_with_query_and_counts_for_filters(
+    data: &[u8],
+    index: &LineIndex,
+    matcher: &MatcherSet,
+    query: &Query,
+    result_filters: &[bool],
+    progress: &Progress,
+) -> Option<FilterScanResult> {
     progress.set_total(index.indexed_bytes.max(1));
 
     if matcher.is_noop() && query.is_empty() {
@@ -113,13 +128,14 @@ pub fn scan_all_with_query_and_counts(
         return Some(FilterScanResult {
             outcome: ScanOutcome::AllVisible,
             filter_counts: vec![0; matcher.filters().len()],
+            selected_filter_lines: Vec::new(),
         });
     }
 
     let parts: Vec<FilterScanChunk> = index
         .chunks
         .par_iter()
-        .map(|chunk| scan_filter_chunk(data, chunk, matcher, query, progress))
+        .map(|chunk| scan_filter_chunk(data, chunk, matcher, query, result_filters, progress))
         .collect();
 
     if progress.is_cancelled() {
@@ -127,10 +143,16 @@ pub fn scan_all_with_query_and_counts(
     }
 
     let total: usize = parts.iter().map(|part| part.lines.len()).sum();
+    let selected_total: usize = parts
+        .iter()
+        .map(|part| part.selected_filter_lines.len())
+        .sum();
     let mut lines = Vec::with_capacity(total);
+    let mut selected_filter_lines = Vec::with_capacity(selected_total);
     let mut filter_counts = vec![0u64; matcher.filters().len()];
     for part in parts {
         lines.extend(part.lines);
+        selected_filter_lines.extend(part.selected_filter_lines);
         for (total, count) in filter_counts.iter_mut().zip(part.filter_counts) {
             *total = total.saturating_add(count);
         }
@@ -138,12 +160,14 @@ pub fn scan_all_with_query_and_counts(
     Some(FilterScanResult {
         outcome: ScanOutcome::Matched(lines),
         filter_counts,
+        selected_filter_lines,
     })
 }
 
 struct FilterScanChunk {
     lines: Vec<u64>,
     filter_counts: Vec<u64>,
+    selected_filter_lines: Vec<u64>,
 }
 
 fn scan_filter_chunk(
@@ -151,11 +175,13 @@ fn scan_filter_chunk(
     chunk: &ChunkIndex,
     matcher: &MatcherSet,
     query: &Query,
+    result_filters: &[bool],
     progress: &Progress,
 ) -> FilterScanChunk {
     let end = (chunk.end_byte as usize).min(data.len());
     let mut pos = chunk.start_byte as usize;
     let mut lines = Vec::new();
+    let mut selected_filter_lines = Vec::new();
     let mut filter_counts = vec![0u64; matcher.filters().len()];
     let mut filter_hits = Vec::with_capacity(matcher.filters().len());
     let mut query_scratch = QueryScratch::default();
@@ -179,6 +205,25 @@ fn scan_filter_chunk(
                 *count = count.saturating_add(1);
             }
         }
+        let mut selected_include = false;
+        let mut selected_exclude = false;
+        for ((hit, selected), filter) in filter_hits
+            .iter()
+            .zip(result_filters)
+            .zip(matcher.filters())
+        {
+            if !*hit || !*selected {
+                continue;
+            }
+            if filter.excluding {
+                selected_exclude = true;
+            } else {
+                selected_include = true;
+            }
+        }
+        if selected_include && !selected_exclude {
+            selected_filter_lines.push(chunk.start_line + line_offset);
+        }
         if filters_visible && query.matches(line, &mut query_scratch) {
             lines.push(chunk.start_line + line_offset);
         }
@@ -193,6 +238,7 @@ fn scan_filter_chunk(
     FilterScanChunk {
         lines,
         filter_counts,
+        selected_filter_lines,
     }
 }
 
@@ -460,5 +506,43 @@ mod tests {
         };
         assert_eq!(lines, vec![0]);
         assert_eq!(result.filter_counts, vec![2, 2, 2, 0]);
+    }
+
+    #[test]
+    fn selected_filter_lines_ignore_query_but_respect_excludes() {
+        let (data, idx) = build("alpha beta\nalpha\nalpha noise\nalpha local\nbeta\n");
+        let matcher = matcher(vec![
+            FilterSpec {
+                text: "alpha".into(),
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "noise".into(),
+                excluding: true,
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "local".into(),
+                excluding: true,
+                ..Default::default()
+            },
+        ]);
+        let query = Query::parse("beta", CompileOptions::default()).unwrap();
+
+        let result = scan_all_with_query_and_counts_for_filters(
+            &data,
+            &idx,
+            &matcher,
+            &query,
+            &[true, true, false],
+            &Progress::default(),
+        )
+        .unwrap();
+
+        let ScanOutcome::Matched(lines) = result.outcome else {
+            panic!()
+        };
+        assert_eq!(lines, vec![0]);
+        assert_eq!(result.selected_filter_lines, vec![0, 1, 3]);
     }
 }
