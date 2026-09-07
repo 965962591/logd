@@ -1508,6 +1508,12 @@ impl LogdApp {
             .child(self.menu_button(Key::View, window, cx))
             .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
+            .into_any_element();
+        let right = h_flex()
+            .h_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
             .child(title_bar::panel_toggle(
                 "title-toggle-filters",
                 IconName::PanelLeft,
@@ -1618,6 +1624,7 @@ impl LogdApp {
         title_bar::render(
             left,
             center,
+            right,
             window,
             self.language,
             cx,

@@ -6,7 +6,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
-    h_flex, Icon, IconName, InteractiveElementExt as _, Selectable as _, Sizable as _,
+    h_flex, Icon, IconName, InteractiveElementExt as _, Sizable as _,
 };
 
 use crate::i18n::{text, Key, Language};
@@ -37,18 +37,23 @@ pub fn panel_toggle(
 ) -> impl IntoElement {
     Button::new(id)
         .icon(if open { open_icon } else { closed_icon })
-        .xsmall()
+        .small()
         .ghost()
-        .selected(open)
         .toggled(open)
         .tab_stop(false)
         .tooltip(tooltip)
-        .on_click(action)
+        .on_click(move |event, window, cx| {
+            // Panel buttons live inside the title bar, whose double-click
+            // handler is reserved for maximizing the window.
+            cx.stop_propagation();
+            action(event, window, cx);
+        })
 }
 
 pub fn render(
     left: AnyElement,
     center: AnyElement,
+    right: AnyElement,
     window: &mut Window,
     lang: Language,
     cx: &App,
@@ -103,6 +108,7 @@ pub fn render(
                 // The space before the window controls needs its own hitbox;
                 // otherwise it cannot move the window on Windows.
                 .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
+                .child(right)
                 .child(control(
                     "window-minimize",
                     IconName::WindowMinimize,

@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.package.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches Cargo version
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "logd") | .version' | head -n 1)"
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "Cannot find the logd package in Cargo metadata" >&2
+            exit 1
+          fi
+
+          expected_tag="v$version"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match Cargo version '$expected_tag'" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  package-windows:
+    name: Package Windows x64
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.value }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+
+      - name: Build executable and MSI
+        run: cargo packager --release -p logd --formats wix
+
+      - name: Collect Windows packages
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem -Path target/release -Filter *.msi -File -Recurse)
+          if ($packages.Count -ne 1) {
+            throw "Expected one MSI package, found $($packages.Count)"
+          }
+
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          Copy-Item target/release/logd.exe release-assets/logd.exe
+          Copy-Item $packages[0].FullName "release-assets/logd-$env:RELEASE_VERSION-windows-x86_64.msi"
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release-assets/*
+          if-no-files-found: error
+
+  package-macos:
+    name: Package macOS
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.value }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+
+      - name: Build DMG
+        run: cargo packager --release -p logd --formats dmg
+
+      - name: Collect macOS package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_count="$(find target/release -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          if [[ "$package_count" -ne 1 ]]; then
+            echo "Expected one DMG package, found $package_count" >&2
+            exit 1
+          fi
+
+          package="$(find target/release -type f -name '*.dmg' -print -quit)"
+          arch="$(uname -m)"
+          mkdir -p release-assets
+          cp "$package" "release-assets/logd-${RELEASE_VERSION}-macos-${arch}.dmg"
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - version
+      - package-windows
+      - package-macos
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.value }}
+
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(release-assets/*)
+          if [[ ${#assets[@]} -ne 3 ]]; then
+            echo "Expected three release files, found ${#assets[@]}" >&2
+            exit 1
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            "${assets[@]}" \
+            --verify-tag \
+            --generate-notes \
+            --title "logd $RELEASE_VERSION"
