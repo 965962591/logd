@@ -146,6 +146,25 @@ jobs:
         with:
           tool: cargo-packager@0.11.8
 
+      - name: Generate macOS application icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          iconset="target/logd.iconset"
+          mkdir -p "$iconset"
+
+          sips -z 16 16 public/2.png --out "$iconset/icon_16x16.png"
+          sips -z 32 32 public/2.png --out "$iconset/icon_16x16@2x.png"
+          sips -z 32 32 public/2.png --out "$iconset/icon_32x32.png"
+          sips -z 64 64 public/2.png --out "$iconset/icon_32x32@2x.png"
+          sips -z 128 128 public/2.png --out "$iconset/icon_128x128.png"
+          sips -z 256 256 public/2.png --out "$iconset/icon_128x128@2x.png"
+          sips -z 256 256 public/2.png --out "$iconset/icon_256x256.png"
+          sips -z 512 512 public/2.png --out "$iconset/icon_256x256@2x.png"
+          sips -z 512 512 public/2.png --out "$iconset/icon_512x512.png"
+          sips -z 1024 1024 public/2.png --out "$iconset/icon_512x512@2x.png"
+          iconutil -c icns "$iconset" -o public/logd.icns
+
       - name: Build DMG
         run: cargo packager --release -p logd --formats dmg
 

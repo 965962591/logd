@@ -30,5 +30,5 @@ product-name = "logd"
 identifier = "com.github.965962591.logd"
 publisher = "logd"
 category = "DeveloperTool"
-icons = ["../../public/logd.ico", "../../public/2.png"]
+icons = ["../../public/logd.ico", "../../public/logd.icns", "../../public/2.png"]
 before-packaging-command = "cargo build --locked --release -p logd"
