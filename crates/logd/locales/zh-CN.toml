@@ -38,6 +38,7 @@ search_placeholder = "搜索所有已导入文件（& 同时满足，| 任一满
 search_history = "搜索历史"
 no_search_history = "暂无搜索历史"
 clear_search_history = "清空搜索历史"
+clear_recent_files = "清空最近文件"
 filter_panel = "过滤器面板"
 copy = "复制"
 encoding = "编码"

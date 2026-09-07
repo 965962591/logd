@@ -77,6 +77,7 @@ impl Render for TabDrag {
 enum MenuCommand {
     Open,
     OpenRecent(PathBuf),
+    ClearRecentFiles,
     Refresh,
     SaveEditedCopy,
     ImportFilters,
@@ -418,6 +419,12 @@ impl LogdApp {
             state.set_items(Vec::new(), window, cx);
             state.clear_selection(cx);
         });
+        cx.notify();
+    }
+
+    fn clear_recent_files(&mut self, cx: &mut Context<Self>) {
+        self.recent_files.clear();
+        let _ = crate::settings::save_recent_files(&self.recent_files);
         cx.notify();
     }
 
@@ -1121,6 +1128,7 @@ impl LogdApp {
         match command {
             MenuCommand::Open => self.prompt_open(window, cx),
             MenuCommand::OpenRecent(path) => self.open_path(&path, window, cx),
+            MenuCommand::ClearRecentFiles => self.clear_recent_files(cx),
             MenuCommand::Refresh => self.refresh_active(window, cx),
             MenuCommand::SaveEditedCopy => {
                 if let Some(view) = self.active_view().cloned() {
@@ -1244,52 +1252,70 @@ impl LogdApp {
                             );
                         let submenu_recent = recent.clone();
                         let submenu_app = app.clone();
+                        let clear_recent_app = app.clone();
                         menu.submenu(
                             text(Key::RecentFiles, lang),
                             window,
                             cx,
                             move |menu, window, _| {
-                                if submenu_recent.is_empty() {
-                                    return menu.item(
+                                let menu = if submenu_recent.is_empty() {
+                                    menu.item(
                                         PopupMenuItem::new(text(Key::NoRecentFiles, lang))
                                             .disabled(true),
-                                    );
-                                }
-                                submenu_recent.iter().enumerate().fold(
-                                    menu.max_w(px(480.)),
-                                    |menu, (index, path)| {
-                                        let target = path.clone();
-                                        let target_app = submenu_app.clone();
-                                        let full_path = path.display().to_string();
-                                        menu.item(
-                                            PopupMenuItem::element(move |_, _| {
-                                                let label = full_path.clone();
-                                                let tooltip = full_path.clone();
-                                                div()
-                                                    .id(("recent-file-label", index))
-                                                    .w(px(440.))
-                                                    .overflow_hidden()
-                                                    .text_ellipsis_middle()
-                                                    .child(label)
-                                                    .tooltip(move |window, cx| {
-                                                        gpui_component::tooltip::Tooltip::new(
-                                                            tooltip.clone(),
+                                    )
+                                } else {
+                                    submenu_recent.iter().enumerate().fold(
+                                        menu.max_w(px(480.)),
+                                        |menu, (index, path)| {
+                                            let target = path.clone();
+                                            let target_app = submenu_app.clone();
+                                            let full_path = path.display().to_string();
+                                            menu.item(
+                                                PopupMenuItem::element(move |_, _| {
+                                                    let label = full_path.clone();
+                                                    let tooltip = full_path.clone();
+                                                    div()
+                                                        .id(("recent-file-label", index))
+                                                        .w(px(440.))
+                                                        .overflow_hidden()
+                                                        .text_ellipsis_middle()
+                                                        .child(label)
+                                                        .tooltip(move |window, cx| {
+                                                            gpui_component::tooltip::Tooltip::new(
+                                                                tooltip.clone(),
+                                                            )
+                                                            .build(window, cx)
+                                                        })
+                                                })
+                                                .on_click(window.listener_for(
+                                                    &target_app,
+                                                    move |this, _, window, cx| {
+                                                        this.dispatch(
+                                                            MenuCommand::OpenRecent(target.clone()),
+                                                            window,
+                                                            cx,
                                                         )
-                                                        .build(window, cx)
-                                                    })
-                                            })
-                                            .on_click(window.listener_for(
-                                                &target_app,
-                                                move |this, _, window, cx| {
-                                                    this.dispatch(
-                                                        MenuCommand::OpenRecent(target.clone()),
-                                                        window,
-                                                        cx,
-                                                    )
-                                                },
-                                            )),
-                                        )
-                                    },
+                                                    },
+                                                )),
+                                            )
+                                        },
+                                    )
+                                };
+                                let has_recent_files = !submenu_recent.is_empty();
+                                let clear_recent_app = clear_recent_app.clone();
+                                menu.separator().item(
+                                    PopupMenuItem::new(text(Key::ClearRecentFiles, lang))
+                                        .disabled(!has_recent_files)
+                                        .on_click(window.listener_for(
+                                            &clear_recent_app,
+                                            |this, _, window, cx| {
+                                                this.dispatch(
+                                                    MenuCommand::ClearRecentFiles,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
                                 )
                             },
                         )

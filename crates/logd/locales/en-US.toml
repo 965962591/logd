@@ -38,6 +38,7 @@ search_placeholder = "Search all imported files (& means AND, | means OR), press
 search_history = "Search history"
 no_search_history = "No search history"
 clear_search_history = "Clear search history"
+clear_recent_files = "Clear recent files"
 filter_panel = "Filter Panel"
 copy = "Copy"
 encoding = "Encoding"
