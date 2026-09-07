@@ -114,7 +114,18 @@ jobs:
           # Inspect the final executable, rather than a dependency or intermediate file,
           # so packaging cannot silently drop the manifest.
           $manifest = Join-Path $env:RUNNER_TEMP "logd.manifest.xml"
-          mt.exe -nologo -inputresource:"$exe;#1" -out:"$manifest"
+          $windowsKitRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+          $mt = Get-ChildItem -Path $windowsKitRoot -Filter mt.exe -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $mt) {
+            throw "Windows SDK mt.exe was not found under '$windowsKitRoot'"
+          }
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "mt.exe failed to extract the logd.exe manifest (exit code $LASTEXITCODE)"
+          }
           $manifestText = Get-Content -Raw $manifest
           if ($manifestText -notmatch "PerMonitorV2") {
             throw "logd.exe manifest does not declare PerMonitorV2 DPI awareness"

@@ -2390,7 +2390,7 @@ impl LogdApp {
                         .items_center()
                         .justify_center()
                         .text_color(palette.muted)
-                        .child(text(Key::SearchResultsPrompt, lang)),
+                        // .child(text(Key::SearchResultsPrompt, lang)),
                 )
                 .into_any_element();
         }
