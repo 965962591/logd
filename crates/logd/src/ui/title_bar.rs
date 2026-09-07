@@ -73,7 +73,12 @@ pub fn render(
         .border_b_1()
         .border_color(palette.title_bar_border)
         .text_color(palette.foreground)
-        .on_double_click(|_, window, _| window.zoom_window())
+        // Windows toggles maximize/restore natively for HTCAPTION. GPUI's
+        // zoom_window implementation on Windows only maximizes, so keep the
+        // application-level handler for the other platforms.
+        .when(!cfg!(windows), |el| {
+            el.on_double_click(|_, window, _| window.zoom_window())
+        })
         .child(
             h_flex()
                 .h_full()
@@ -112,6 +117,7 @@ pub fn render(
                     IconName::WindowMinimize,
                     text(Key::Minimize, lang),
                     false,
+                    false,
                     palette,
                     |window, _| window.minimize_window(),
                 ))
@@ -131,6 +137,7 @@ pub fn render(
                         lang,
                     ),
                     false,
+                    cfg!(windows),
                     palette,
                     |window, _| window.zoom_window(),
                 ))
@@ -139,6 +146,7 @@ pub fn render(
                     IconName::WindowClose,
                     text(Key::Close, lang),
                     true,
+                    false,
                     palette,
                     on_close,
                 )),
@@ -161,6 +169,7 @@ fn control(
     icon: IconName,
     tooltip: &'static str,
     danger: bool,
+    native_control: bool,
     palette: theme::Palette,
     action: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -184,13 +193,15 @@ fn control(
             el.hover(|s| s.bg(palette.danger).text_color(palette.danger_foreground))
         })
         .when(!danger, |el| el.hover(|s| s.bg(palette.control_hover)))
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-            window.prevent_default();
-            cx.stop_propagation();
-        })
-        .on_click(move |_, window, cx| {
-            cx.stop_propagation();
-            action(window, cx);
+        .when(!native_control, |el| {
+            el.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                action(window, cx);
+            })
         })
         .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx))
         .child(Icon::new(icon).small())

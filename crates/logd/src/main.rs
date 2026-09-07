@@ -1,5 +1,8 @@
 #![recursion_limit = "512"]
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// logd is a GUI application in both dev and release builds. Keeping the
+// Windows subsystem consistent prevents a console window from appearing when
+// a debug-built executable is launched directly.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 //! logd —— 超大日志文件的筛选与阅读工具。
 //!
