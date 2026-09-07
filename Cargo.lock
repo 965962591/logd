@@ -3525,6 +3525,8 @@ dependencies = [
  "quick-xml 0.36.2",
  "rayon",
  "regex",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

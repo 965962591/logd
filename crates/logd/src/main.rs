@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 //! logd —— 超大日志文件的筛选与阅读工具。
 //!
@@ -14,7 +15,7 @@ mod theme;
 mod ui;
 
 fn main() {
-    // 命令行可以直接给若干路径：日志文件开标签页，.tat 当配置加载。
+    // 命令行可以直接给若干路径：日志文件开标签页，.logd/.tat 当配置加载。
     // 方便拿大文件做性能验收。
     let initial: Vec<_> = std::env::args()
         .skip(1)

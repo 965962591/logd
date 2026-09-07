@@ -99,19 +99,10 @@ impl Ts {
         (year + if month <= 2 { 1 } else { 0 }) as i32
     }
 
-    fn from_parts(
-        year: i32,
-        mon: u32,
-        day: u32,
-        h: u32,
-        m: u32,
-        s: u32,
-        ns: u32,
-    ) -> Option<Ts> {
+    fn from_parts(year: i32, mon: u32, day: u32, h: u32, m: u32, s: u32, ns: u32) -> Option<Ts> {
         let days = days_from_civil(year, mon, day);
         let date = days.checked_mul(86_400_000_000_000)?;
-        let time = (h as i64 * 3600 + m as i64 * 60 + s as i64)
-            .checked_mul(1_000_000_000)?;
+        let time = (h as i64 * 3600 + m as i64 * 60 + s as i64).checked_mul(1_000_000_000)?;
         Some(Ts(date.checked_add(time)?.checked_add(ns as i64)?))
     }
 }
@@ -379,7 +370,11 @@ mod tests {
         assert_eq!(l.pid, Some(1234));
         assert_eq!(l.tid, Some(5678));
         assert_eq!(l.level, Some(Level::Debug));
-        assert_eq!(l.tag_bytes(s.as_bytes()), b"AeAlgo", "tag 右侧补齐的空格要去掉");
+        assert_eq!(
+            l.tag_bytes(s.as_bytes()),
+            b"AeAlgo",
+            "tag 右侧补齐的空格要去掉"
+        );
         assert_eq!(
             l.message_bytes(s.as_bytes()),
             b"[updateAEInfo2ISP] gain=1024"
@@ -483,7 +478,10 @@ mod tests {
     #[test]
     fn rejects_bogus_level() {
         assert!(p("01-02 03:04:05.678  1 2 Dxx Tag: x").is_none());
-        assert!(p("01-02 03:04:05.678  1 2 Z Tag: x").is_none(), "Z 不是合法 level");
+        assert!(
+            p("01-02 03:04:05.678  1 2 Z Tag: x").is_none(),
+            "Z 不是合法 level"
+        );
     }
 
     #[test]

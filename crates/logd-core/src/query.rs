@@ -769,21 +769,29 @@ impl Compiler {
             }
             "pid" => FieldTerm::Pid(
                 cmp(op)?,
-                value.parse().with_context(|| format!("pid 不是数字：{value}"))?,
+                value
+                    .parse()
+                    .with_context(|| format!("pid 不是数字：{value}"))?,
             ),
             "tid" => FieldTerm::Tid(
                 cmp(op)?,
-                value.parse().with_context(|| format!("tid 不是数字：{value}"))?,
+                value
+                    .parse()
+                    .with_context(|| format!("tid 不是数字：{value}"))?,
             ),
             "time" | "ts" => {
                 let ts = parse_time_value(value, self.opts.base_date)
                     .ok_or_else(|| anyhow!("认不出时间 {value:?}，用 `MM-DD HH:MM:SS[.fffffffff]`、`MM-DD HH:MM:SS:fffffffff` 或 `HH:MM:SS`"))?;
                 FieldTerm::Time(cmp(op)?, ts)
             }
-            "tag" => FieldTerm::Tag(self.str_op(op, value, is_regex, name)?, op == "!=" || op == "!~"),
-            "msg" | "message" | "text" => {
-                FieldTerm::Msg(self.str_op(op, value, is_regex, name)?, op == "!=" || op == "!~")
-            }
+            "tag" => FieldTerm::Tag(
+                self.str_op(op, value, is_regex, name)?,
+                op == "!=" || op == "!~",
+            ),
+            "msg" | "message" | "text" => FieldTerm::Msg(
+                self.str_op(op, value, is_regex, name)?,
+                op == "!=" || op == "!~",
+            ),
             "is" => match value.to_ascii_lowercase().as_str() {
                 "log" | "structured" => FieldTerm::Structured,
                 _ => bail!("is: 只支持 log"),
@@ -845,8 +853,7 @@ pub fn parse_time_value(s: &str, base: Option<Ts>) -> Option<Ts> {
     let day_ns = 86_400_000_000_000i64;
     let base_day = base.map(|b| b.0.div_euclid(day_ns)).unwrap_or(0);
     let date = base_day.checked_mul(day_ns)?;
-    let time = (h as i64 * 3600 + m as i64 * 60 + sec as i64)
-        .checked_mul(1_000_000_000)?;
+    let time = (h as i64 * 3600 + m as i64 * 60 + sec as i64).checked_mul(1_000_000_000)?;
     Some(Ts(date.checked_add(time)?.checked_add(ns as i64)?))
 }
 

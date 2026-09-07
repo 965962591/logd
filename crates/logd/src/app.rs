@@ -26,7 +26,7 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
     Root, Selectable as _, Sizable, WindowExt as _,
 };
-use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, TatFile};
+use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, LogdFile, TatFile};
 
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
@@ -115,6 +115,8 @@ pub struct LogdApp {
     filter_description: Entity<InputState>,
     filter_fore: Entity<ColorPickerState>,
     filter_back: Entity<ColorPickerState>,
+    filter_bold: bool,
+    filter_font_size: Option<u16>,
     filter_scope: FilterScope,
     selected_filter: Option<usize>,
     editing_filter: Option<usize>,
@@ -288,6 +290,8 @@ impl LogdApp {
             filter_description,
             filter_fore,
             filter_back,
+            filter_bold: false,
+            filter_font_size: None,
             filter_scope: FilterScope::default(),
             selected_filter: None,
             editing_filter: None,
@@ -392,6 +396,11 @@ impl LogdApp {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("tat"))
         {
             self.load_tat(path, cx);
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("logd"))
+        {
+            self.load_logd(path, cx);
         } else {
             self.open_log(path, window, cx);
         }
@@ -541,14 +550,22 @@ impl LogdApp {
             };
             _ = window.update(|_, cx| {
                 _ = this.update(cx, |this, cx| {
-                    if path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tat"))
-                    {
-                        this.load_tat(&path, cx);
+                    if path.extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("tat") || ext.eq_ignore_ascii_case("logd")
+                    }) {
+                        if path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("logd"))
+                        {
+                            this.load_logd(&path, cx);
+                        } else {
+                            this.load_tat(&path, cx);
+                        }
                     } else {
-                        this.status =
-                            Some(format!("{}: .tat", text(Key::ImportFilters, this.language)));
+                        this.status = Some(format!(
+                            "{}: .logd / .tat",
+                            text(Key::ImportFilters, this.language)
+                        ));
                         cx.notify();
                     }
                 });
@@ -780,6 +797,8 @@ impl LogdApp {
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_scope = FilterScope::default();
+        self.filter_bold = false;
+        self.filter_font_size = None;
         // New filters start with the editor's neutral/default colors. Colors
         // are opt-in and can be assigned from the editor when needed.
         self.filter_fore
@@ -827,6 +846,8 @@ impl LogdApp {
             state.set_value(filter.description, window, cx)
         });
         self.filter_scope = filter.scope;
+        self.filter_bold = filter.bold;
+        self.filter_font_size = filter.font_size;
         set_picker_color(&self.filter_fore, filter.fore, window, cx);
         set_picker_color(&self.filter_back, filter.back, window, cx);
         window.focus(&self.filter_text.read(cx).focus_handle(cx), cx);
@@ -847,6 +868,8 @@ impl LogdApp {
                 self.filters[index].fore = fore;
                 self.filters[index].back = back;
                 self.filters[index].scope = self.filter_scope;
+                self.filters[index].bold = self.filter_bold;
+                self.filters[index].font_size = self.filter_font_size;
                 self.selected_filter = Some(index);
             }
             _ => {
@@ -857,6 +880,8 @@ impl LogdApp {
                     fore,
                     back,
                     scope: self.filter_scope,
+                    bold: self.filter_bold,
+                    font_size: self.filter_font_size,
                     ..Default::default()
                 });
                 self.selected_filter = Some(self.filters.len() - 1);
@@ -955,7 +980,9 @@ impl LogdApp {
             Ok(tat) => {
                 self.filters = tat.filters;
                 self.show_only_filtered = tat.show_only_filtered;
-                self.tat_path = Some(path.to_path_buf());
+                // `.tat` is a compatibility import. Subsequent saves use the
+                // native `.logd` format and leave the source TAT untouched.
+                self.tat_path = Some(path.with_extension("logd"));
                 self.selected_filter = (!self.filters.is_empty()).then_some(0);
                 self.status = Some(format!(
                     "{}: {}",
@@ -972,21 +999,43 @@ impl LogdApp {
         }
     }
 
+    fn load_logd(&mut self, path: &Path, cx: &mut Context<Self>) {
+        match LogdFile::load(path) {
+            Ok(file) => {
+                self.filters = file.filters;
+                self.show_only_filtered = file.show_only_filtered;
+                self.tat_path = Some(path.to_path_buf());
+                self.selected_filter = (!self.filters.is_empty()).then_some(0);
+                self.status = Some(format!(
+                    "{}: {}",
+                    text(Key::Filters, self.language),
+                    self.filters.len()
+                ));
+                self.filters_changed(cx);
+                self.filters_dirty = false;
+            }
+            Err(error) => {
+                self.status = Some(format!(".logd: {error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
     fn save_tat(&mut self, window: &mut Window, close_after_save: bool, cx: &mut Context<Self>) {
         let path = self.tat_path.clone().or_else(|| {
             self.tabs
                 .get(self.active)
-                .map(|tab| tab.path.with_extension("tat"))
+                .map(|tab| tab.path.with_extension("logd"))
         });
         let Some(path) = path else {
             let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let target = cx.prompt_for_new_path(&directory, Some("filters.tat"));
+            let target = cx.prompt_for_new_path(&directory, Some("filters.logd"));
             cx.spawn_in(window, async move |this, window| {
                 let Some(path) = target.await.ok().and_then(Result::ok).flatten() else {
                     return;
                 };
                 _ = this.update_in(window, |this, window, cx| {
-                    if this.save_tat_to(path, cx) && close_after_save {
+                    if this.save_filters_to(path, cx) && close_after_save {
                         window.remove_window();
                     }
                 });
@@ -994,18 +1043,30 @@ impl LogdApp {
             .detach();
             return;
         };
-        if self.save_tat_to(path, cx) && close_after_save {
+        if self.save_filters_to(path, cx) && close_after_save {
             window.remove_window();
         }
     }
 
-    fn save_tat_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
-        let file = TatFile {
-            show_only_filtered: self.show_only_filtered,
-            filters: self.filters.clone(),
-            ..Default::default()
+    fn save_filters_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        let saved = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tat"))
+        {
+            TatFile {
+                show_only_filtered: self.show_only_filtered,
+                filters: self.filters.clone(),
+                ..Default::default()
+            }
+            .save(&path)
+        } else {
+            LogdFile {
+                show_only_filtered: self.show_only_filtered,
+                filters: self.filters.clone(),
+                ..Default::default()
+            }
+            .save(&path)
         };
-        let saved = file.save(&path);
         self.status = Some(match &saved {
             Ok(()) => {
                 self.tat_path = Some(path.clone());
@@ -1226,102 +1287,96 @@ impl LogdApp {
             .label(text(command_group, lang));
 
         match command_group {
-            Key::File => {
-                button
-                    .dropdown_menu(move |menu, window, cx| {
-                        let open_app = app.clone();
-                        let refresh_app = app.clone();
-                        let save_copy_app = app.clone();
-                        let menu = menu
-                            .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
-                                window.listener_for(&open_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::Open, window, cx)
+            Key::File => button
+                .dropdown_menu(move |menu, window, cx| {
+                    let open_app = app.clone();
+                    let refresh_app = app.clone();
+                    let save_copy_app = app.clone();
+                    let menu = menu
+                        .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
+                            window.listener_for(&open_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::Open, window, cx)
+                            }),
+                        ))
+                        .item(PopupMenuItem::new(text(Key::Refresh, lang)).on_click(
+                            window.listener_for(&refresh_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::Refresh, window, cx)
+                            }),
+                        ))
+                        .item(
+                            PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
+                                window.listener_for(&save_copy_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
                                 }),
-                            ))
-                            .item(PopupMenuItem::new(text(Key::Refresh, lang)).on_click(
-                                window.listener_for(&refresh_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::Refresh, window, cx)
-                                }),
-                            ))
-                            .item(
-                                PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
-                                    window.listener_for(&save_copy_app, |this, _, window, cx| {
-                                        this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
-                                    }),
-                                ),
-                            );
-                        let submenu_recent = recent.clone();
-                        let submenu_app = app.clone();
-                        let clear_recent_app = app.clone();
-                        menu.submenu(
-                            text(Key::RecentFiles, lang),
-                            window,
-                            cx,
-                            move |menu, window, _| {
-                                let menu = if submenu_recent.is_empty() {
-                                    menu.item(
-                                        PopupMenuItem::new(text(Key::NoRecentFiles, lang))
-                                            .disabled(true),
-                                    )
-                                } else {
-                                    submenu_recent.iter().enumerate().fold(
-                                        menu.max_w(px(480.)),
-                                        |menu, (index, path)| {
-                                            let target = path.clone();
-                                            let target_app = submenu_app.clone();
-                                            let full_path = path.display().to_string();
-                                            menu.item(
-                                                PopupMenuItem::element(move |_, _| {
-                                                    let label = full_path.clone();
-                                                    let tooltip = full_path.clone();
-                                                    div()
-                                                        .id(("recent-file-label", index))
-                                                        .w(px(440.))
-                                                        .overflow_hidden()
-                                                        .text_ellipsis_middle()
-                                                        .child(label)
-                                                        .tooltip(move |window, cx| {
-                                                            gpui_component::tooltip::Tooltip::new(
-                                                                tooltip.clone(),
-                                                            )
-                                                            .build(window, cx)
-                                                        })
-                                                })
-                                                .on_click(window.listener_for(
-                                                    &target_app,
-                                                    move |this, _, window, cx| {
-                                                        this.dispatch(
-                                                            MenuCommand::OpenRecent(target.clone()),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
-                                            )
-                                        },
-                                    )
-                                };
-                                let has_recent_files = !submenu_recent.is_empty();
-                                let clear_recent_app = clear_recent_app.clone();
-                                menu.separator().item(
-                                    PopupMenuItem::new(text(Key::ClearRecentFiles, lang))
-                                        .disabled(!has_recent_files)
-                                        .on_click(window.listener_for(
-                                            &clear_recent_app,
-                                            |this, _, window, cx| {
-                                                this.dispatch(
-                                                    MenuCommand::ClearRecentFiles,
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
+                            ),
+                        );
+                    let submenu_recent = recent.clone();
+                    let submenu_app = app.clone();
+                    let clear_recent_app = app.clone();
+                    menu.submenu(
+                        text(Key::RecentFiles, lang),
+                        window,
+                        cx,
+                        move |menu, window, _| {
+                            let menu = if submenu_recent.is_empty() {
+                                menu.item(
+                                    PopupMenuItem::new(text(Key::NoRecentFiles, lang))
+                                        .disabled(true),
                                 )
-                            },
-                        )
-                    })
-                    .into_any_element()
-            }
+                            } else {
+                                submenu_recent.iter().enumerate().fold(
+                                    menu.max_w(px(480.)),
+                                    |menu, (index, path)| {
+                                        let target = path.clone();
+                                        let target_app = submenu_app.clone();
+                                        let full_path = path.display().to_string();
+                                        menu.item(
+                                            PopupMenuItem::element(move |_, _| {
+                                                let label = full_path.clone();
+                                                let tooltip = full_path.clone();
+                                                div()
+                                                    .id(("recent-file-label", index))
+                                                    .w(px(440.))
+                                                    .overflow_hidden()
+                                                    .text_ellipsis_middle()
+                                                    .child(label)
+                                                    .tooltip(move |window, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            tooltip.clone(),
+                                                        )
+                                                        .build(window, cx)
+                                                    })
+                                            })
+                                            .on_click(window.listener_for(
+                                                &target_app,
+                                                move |this, _, window, cx| {
+                                                    this.dispatch(
+                                                        MenuCommand::OpenRecent(target.clone()),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
+                                        )
+                                    },
+                                )
+                            };
+                            let has_recent_files = !submenu_recent.is_empty();
+                            let clear_recent_app = clear_recent_app.clone();
+                            menu.separator().item(
+                                PopupMenuItem::new(text(Key::ClearRecentFiles, lang))
+                                    .disabled(!has_recent_files)
+                                    .on_click(window.listener_for(
+                                        &clear_recent_app,
+                                        |this, _, window, cx| {
+                                            this.dispatch(MenuCommand::ClearRecentFiles, window, cx)
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                })
+                .into_any_element(),
             Key::View => button
                 .dropdown_menu(move |menu, window, cx| {
                     let all_app = app.clone();
@@ -1824,6 +1879,8 @@ impl LogdApp {
             filter_fore,
             filter_back,
             filter_scope,
+            filter_bold,
+            filter_font_size,
             filter_counts,
             filter_counts_pending,
             lang,
@@ -1840,6 +1897,8 @@ impl LogdApp {
                 state.filter_fore.clone(),
                 state.filter_back.clone(),
                 state.filter_scope,
+                state.filter_bold,
+                state.filter_font_size,
                 filter_counts.clone(),
                 active_view.is_some() && filter_counts.is_none(),
                 state.language,
@@ -1850,6 +1909,7 @@ impl LogdApp {
         let cancel_app = app.clone();
         let reset_fore_app = app.clone();
         let reset_back_app = app.clone();
+        let bold_app = app.clone();
 
         v_flex()
             .size_full()
@@ -2017,6 +2077,39 @@ impl LogdApp {
                                                         )),
                                                 ),
                                         )),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("filter-bold")
+                                        .label("B")
+                                        .selected(filter_bold)
+                                        .when(filter_bold, |button| button.primary())
+                                        .accessibility_label(text(Key::FilterBold, lang))
+                                        .on_click(window.listener_for(
+                                            &bold_app,
+                                            |this, _, _, cx| {
+                                                this.filter_bold = !this.filter_bold;
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Button::new("filter-font-size")
+                                        .label(filter_font_size.map_or_else(
+                                            || "A".to_string(),
+                                            |size| size.to_string(),
+                                        ))
+                                        .selected(filter_font_size.is_some())
+                                        .when(filter_font_size.is_some(), |button| button.primary())
+                                        .accessibility_label(text(Key::FilterFontSize, lang))
+                                        .on_click(window.listener_for(app, |this, _, _, cx| {
+                                            this.filter_font_size =
+                                                next_filter_font_size(this.filter_font_size);
+                                            cx.notify();
+                                        })),
                                 ),
                         )
                         .child(
@@ -2905,6 +2998,17 @@ fn filter_scope_label(scope: FilterScope, lang: Language) -> &'static str {
         },
         lang,
     )
+}
+
+fn next_filter_font_size(size: Option<u16>) -> Option<u16> {
+    match size {
+        None => Some(12),
+        Some(12) => Some(14),
+        Some(14) => Some(16),
+        Some(16) => Some(18),
+        Some(18) => None,
+        Some(_) => Some(12),
+    }
 }
 
 pub fn run(initial: Vec<PathBuf>) {

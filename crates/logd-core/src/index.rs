@@ -80,7 +80,11 @@ impl LineIndex {
         let mut chunk = index_chunk(data, 0, end, complete, None);
         chunk.start_line = 0;
         let total_lines = chunk.line_count;
-        let chunks = if total_lines == 0 { Vec::new() } else { vec![chunk] };
+        let chunks = if total_lines == 0 {
+            Vec::new()
+        } else {
+            vec![chunk]
+        };
 
         LineIndex {
             chunks,

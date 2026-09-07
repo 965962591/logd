@@ -26,7 +26,12 @@ const HITS: &[&str] = &[
 ];
 
 const TAGS: &[&str] = &[
-    "AeAlgo", "Hal3Av3", "MtkCam", "CamAdapter", "ISP", "SensorDrv",
+    "AeAlgo",
+    "Hal3Av3",
+    "MtkCam",
+    "CamAdapter",
+    "ISP",
+    "SensorDrv",
 ];
 
 fn main() {

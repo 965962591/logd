@@ -242,7 +242,11 @@ impl FileSource {
     /// 用内存里的字节造一个 `FileSource`，只给单测用。
     #[cfg(test)]
     pub fn from_bytes_for_test(bytes: Vec<u8>, encoding: Encoding) -> Self {
-        let bom_len = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+        let bom_len = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            3
+        } else {
+            0
+        };
         Self {
             path: PathBuf::from("<memory>"),
             len: bytes.len() as u64,
@@ -318,7 +322,10 @@ fn detect_encoding(data: &[u8]) -> Result<(Encoding, usize)> {
     match std::str::from_utf8(sample) {
         Ok(_) => Ok((Encoding::Utf8, 0)),
         // 采样正好切在多字节序列中间：error_len() == None，不算真错。
-        Err(e) if e.error_len().is_none() && std::str::from_utf8(&sample[..e.valid_up_to()]).is_ok() => {
+        Err(e)
+            if e.error_len().is_none()
+                && std::str::from_utf8(&sample[..e.valid_up_to()]).is_ok() =>
+        {
             Ok((Encoding::Utf8, 0))
         }
         Err(_) => Ok((Encoding::Gb18030, 0)),

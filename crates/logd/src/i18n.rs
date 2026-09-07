@@ -69,6 +69,8 @@ pub enum Key {
     FilterEnabled,
     FilterExcluding,
     FilterHighlightLine,
+    FilterBold,
+    FilterFontSize,
     FilterRegex,
     FilterCaseSensitive,
     FilterMatchCount,
@@ -146,8 +148,8 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::UnsavedFiltersDetail, Language::EnUs) => "Save filter changes before closing?",
         (Key::DontSave, Language::ZhCn) => "不保存",
         (Key::DontSave, Language::EnUs) => "Don't Save",
-        (Key::ImportFilters, Language::ZhCn) => "导入 .tat 过滤器",
-        (Key::ImportFilters, Language::EnUs) => "Import .tat Filters",
+        (Key::ImportFilters, Language::ZhCn) => "导入 .logd / .tat 过滤器",
+        (Key::ImportFilters, Language::EnUs) => "Import .logd / .tat Filters",
         (Key::SearchPlaceholder, Language::ZhCn) => {
             "搜索所有已导入文件（& 同时满足，| 任一满足），回车搜索"
         }
@@ -186,6 +188,10 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::FilterExcluding, Language::EnUs) => "Exclude matches",
         (Key::FilterHighlightLine, Language::ZhCn) => "整行高亮",
         (Key::FilterHighlightLine, Language::EnUs) => "Highlight whole line",
+        (Key::FilterBold, Language::ZhCn) => "加粗",
+        (Key::FilterBold, Language::EnUs) => "Bold",
+        (Key::FilterFontSize, Language::ZhCn) => "字体大小",
+        (Key::FilterFontSize, Language::EnUs) => "Font size",
         (Key::FilterRegex, Language::ZhCn) => "使用正则表达式",
         (Key::FilterRegex, Language::EnUs) => "Use regular expression",
         (Key::FilterCaseSensitive, Language::ZhCn) => "区分大小写",

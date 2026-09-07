@@ -146,7 +146,11 @@ mod tests {
     use super::*;
 
     fn span(start: usize, end: usize) -> Span {
-        Span { filter: 0, start, end }
+        Span {
+            filter: 0,
+            start,
+            end,
+        }
     }
 
     #[test]
@@ -303,7 +307,10 @@ mod tests {
         let cases: Vec<(Vec<u8>, Encoding)> = vec![
             ("曝光表 Magic: 42".as_bytes().to_vec(), Encoding::Utf8),
             (
-                encoding_rs::GB18030.encode("曝光表 Magic: 42").0.into_owned(),
+                encoding_rs::GB18030
+                    .encode("曝光表 Magic: 42")
+                    .0
+                    .into_owned(),
                 Encoding::Gb18030,
             ),
             (b"a\xff\xfeb Magic: 42".to_vec(), Encoding::Utf8),

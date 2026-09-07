@@ -281,7 +281,14 @@ mod tests {
     #[test]
     fn context_expands_around_match() {
         let c = ContextMap::build(&[10], 2, 100);
-        assert_eq!(c.segments(), &[Segment { start: 8, end: 13, gap_before: 8 }]);
+        assert_eq!(
+            c.segments(),
+            &[Segment {
+                start: 8,
+                end: 13,
+                gap_before: 8
+            }]
+        );
         assert_eq!(c.total_rows(), 5);
         assert_eq!(c.row_to_line(0), Some(8));
         assert_eq!(c.row_to_line(4), Some(12));
@@ -292,7 +299,14 @@ mod tests {
         // 10 和 13 的 ±2 上下文重叠，应并成 8..16
         let c = ContextMap::build(&[10, 13], 2, 100);
         assert_eq!(c.segments().len(), 1);
-        assert_eq!(c.segments()[0], Segment { start: 8, end: 16, gap_before: 8 });
+        assert_eq!(
+            c.segments()[0],
+            Segment {
+                start: 8,
+                end: 16,
+                gap_before: 8
+            }
+        );
         assert_eq!(c.total_rows(), 8);
     }
 
@@ -304,7 +318,14 @@ mod tests {
         // 12 的 ±1 = 11..14，正好接上 9..12 → 合并
         let c = ContextMap::build(&[10, 12], 1, 100);
         assert_eq!(c.segments().len(), 1);
-        assert_eq!(c.segments()[0], Segment { start: 9, end: 14, gap_before: 9 });
+        assert_eq!(
+            c.segments()[0],
+            Segment {
+                start: 9,
+                end: 14,
+                gap_before: 9
+            }
+        );
     }
 
     #[test]

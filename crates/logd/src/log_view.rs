@@ -1248,6 +1248,7 @@ impl LogView {
     ) -> AnyElement {
         let filters = self.doc.matcher().filters();
         let line_spec = row.line_filter.and_then(|i| filters.get(i));
+        let row_font_size = filter_font_size_for_row(row, filters);
         let selected = self
             .selection
             .is_some_and(|selection| selection.range().contains(&view_row));
@@ -1268,10 +1269,12 @@ impl LogView {
                     font: font(theme::MONO),
                     ..Default::default()
                 };
-                let shaped =
-                    window
-                        .text_system()
-                        .shape_line(text, px(self.font_size), &[run], None);
+                let shaped = window.text_system().shape_line(
+                    text,
+                    px(row_font_size.unwrap_or(self.font_size)),
+                    &[run],
+                    None,
+                );
                 let start_x = f32::from(shaped.x_for_index(range.start));
                 let end_x = f32::from(shaped.x_for_index(range.end));
                 Some((8.0 + start_x - h_scroll, (end_x - start_x).max(1.0)))
@@ -1287,6 +1290,9 @@ impl LogView {
                 el.font_weight(FontWeight::BOLD)
             })
             .when(line_spec.is_some_and(|f| f.italic), |el| el.italic());
+        if let Some(size) = row_font_size {
+            content = content.text_size(px(size));
+        }
 
         if let Some(edited) = edited {
             content = content.child(edited.clone());
@@ -1320,8 +1326,10 @@ impl LogView {
             .focus_bordered(false)
             .readonly(!is_editing)
             .px_0()
-            .text_size(px(self.font_size))
-            .line_height(px(self.line_height));
+            .text_size(px(row_font_size.unwrap_or(self.font_size)))
+            .line_height(px(
+                row_font_size.map_or(self.line_height, |size| size + LINE_HEIGHT_PADDING)
+            ));
         input.style().size.height = Some(relative(1.).into());
         let input = if is_editing {
             input
@@ -1476,6 +1484,18 @@ impl Focusable for LogView {
     }
 }
 
+fn filter_font_size_for_row(row: &RenderRow, filters: &[FilterSpec]) -> Option<f32> {
+    row.line_filter
+        .and_then(|index| filters.get(index))
+        .and_then(|filter| filter.font_size)
+        .or_else(|| {
+            row.spans
+                .iter()
+                .find_map(|span| filters.get(span.filter)?.font_size)
+        })
+        .map(f32::from)
+}
+
 impl Render for LogView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = theme::palette(cx);
@@ -1489,6 +1509,23 @@ impl Render for LogView {
         }
 
         let gutter_w = self.gutter_width();
+        let configured_line_height = self
+            .doc
+            .matcher()
+            .filters()
+            .iter()
+            .filter(|filter| filter.is_active())
+            .filter_map(|filter| filter.font_size)
+            .map(f32::from)
+            .fold(self.font_size + LINE_HEIGHT_PADDING, |height, size| {
+                height.max(size + LINE_HEIGHT_PADDING)
+            });
+        if (configured_line_height - self.line_height).abs() > f32::EPSILON {
+            self.line_height = configured_line_height;
+            self.doc
+                .viewport_mut()
+                .set_line_height(configured_line_height);
+        }
         let rows = self.doc.rows();
         let editing_line = self.editing_line;
         let editing_text = editing_line
@@ -1505,10 +1542,12 @@ impl Render for LogView {
                         .map(String::as_str)
                         .unwrap_or(&row.text)
                 };
+                let font_size = filter_font_size_for_row(row, self.doc.matcher().filters())
+                    .unwrap_or(self.font_size);
                 text.chars()
                     .map(|ch| if ch.is_ascii() { 0.62 } else { 1.0 })
                     .sum::<f32>()
-                    * self.font_size
+                    * font_size
             })
             .fold(0.0, f32::max);
         // Rendered text has the same left padding as `line_content` below.
@@ -1782,7 +1821,10 @@ impl Render for LogView {
                                     palette.scroll_thumb
                                 })
                                 .group_hover("log-hscrollbar", |style| {
-                                    style.bottom(px(2.)).h(px(8.)).bg(palette.scroll_thumb_hover)
+                                    style
+                                        .bottom(px(2.))
+                                        .h(px(8.))
+                                        .bg(palette.scroll_thumb_hover)
                                 }),
                         ),
                 )

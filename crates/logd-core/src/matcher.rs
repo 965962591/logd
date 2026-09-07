@@ -12,11 +12,13 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use serde::{Deserialize, Serialize};
 
 use crate::source::Encoding;
 
 /// 单条过滤器命中后怎么上色。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HighlightMode {
     /// 整行上色。TAT.NET 的原生语义，也是缺省。
     #[default]
@@ -42,7 +44,8 @@ impl HighlightMode {
 }
 
 /// Which imported log files a configured filter applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FilterScope {
     /// Preserve the historical behavior of filters loaded from `.tat` files.
     #[default]
@@ -51,7 +54,8 @@ pub enum FilterScope {
     CurrentFile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FilterSpec {
     pub enabled: bool,
     /// `.tat` 的 `excluding="y"`：命中就把整行藏掉。
@@ -65,9 +69,12 @@ pub struct FilterSpec {
     /// 0xRRGGBB
     pub fore: Option<u32>,
     pub back: Option<u32>,
-    // 以下是 logd 扩展，写进 .tat 时用 `logd_` 前缀的普通属性
+    // 以下是 logd 扩展；原生写入 `.logd`，导出 `.tat` 时用 `logd_` 前缀属性
     pub bold: bool,
     pub italic: bool,
+    /// Optional per-filter font size in logical pixels. `None` means inherit the
+    /// log view's default size; it is deliberately omitted from new filters.
+    pub font_size: Option<u16>,
     pub mode: HighlightMode,
     /// Whether this filter is shared by all imported files or only the active file.
     pub scope: FilterScope,
@@ -89,6 +96,7 @@ impl Default for FilterSpec {
             back: None,
             bold: false,
             italic: false,
+            font_size: None,
             mode: HighlightMode::default(),
             scope: FilterScope::default(),
             extra: Vec::new(),
@@ -358,7 +366,11 @@ impl MatcherSet {
                     // 下标越小优先级越高
                     line_filter = Some(line_filter.map_or(f, |cur| cur.min(f)));
                 }
-                HighlightMode::Field => spans.push(Span { filter: f, start, end }),
+                HighlightMode::Field => spans.push(Span {
+                    filter: f,
+                    start,
+                    end,
+                }),
             }
         };
 
@@ -564,7 +576,14 @@ mod tests {
         let v = m.analyze(b"[AE] Magic: 42", &mut spans);
         assert!(v.visible);
         assert_eq!(v.line_filter, None);
-        assert_eq!(spans, vec![Span { filter: 0, start: 5, end: 11 }]);
+        assert_eq!(
+            spans,
+            vec![Span {
+                filter: 0,
+                start: 5,
+                end: 11
+            }]
+        );
     }
 
     #[test]
@@ -588,15 +607,31 @@ mod tests {
     #[test]
     fn flatten_resolves_overlap_by_priority() {
         let mut s = vec![
-            Span { filter: 1, start: 2, end: 8 },
-            Span { filter: 0, start: 0, end: 5 },
+            Span {
+                filter: 1,
+                start: 2,
+                end: 8,
+            },
+            Span {
+                filter: 0,
+                start: 0,
+                end: 5,
+            },
         ];
         flatten_spans(&mut s);
         assert_eq!(
             s,
             vec![
-                Span { filter: 0, start: 0, end: 5 },
-                Span { filter: 1, start: 5, end: 8 },
+                Span {
+                    filter: 0,
+                    start: 0,
+                    end: 5
+                },
+                Span {
+                    filter: 1,
+                    start: 5,
+                    end: 8
+                },
             ]
         );
     }
@@ -604,11 +639,26 @@ mod tests {
     #[test]
     fn flatten_drops_fully_covered() {
         let mut s = vec![
-            Span { filter: 0, start: 0, end: 10 },
-            Span { filter: 1, start: 3, end: 6 },
+            Span {
+                filter: 0,
+                start: 0,
+                end: 10,
+            },
+            Span {
+                filter: 1,
+                start: 3,
+                end: 6,
+            },
         ];
         flatten_spans(&mut s);
-        assert_eq!(s, vec![Span { filter: 0, start: 0, end: 10 }]);
+        assert_eq!(
+            s,
+            vec![Span {
+                filter: 0,
+                start: 0,
+                end: 10
+            }]
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! TextAnalysisTool.NET `.tat` 配置的读写。
 //!
-//! 目标是**双向兼容**：读得懂现有文件，写出来的文件 TAT.NET 还能打开。
+//! 目标是**双向兼容**：读得懂现有文件，显式导出的文件 TAT.NET 还能打开。
 //! 做法是保留所有不认识的属性（[`FilterSpec::extra`]），logd 自己的新特性
 //! 用 `logd_` 前缀的普通属性承载（例如高亮样式和搜索作用域）。
 //!
@@ -73,7 +73,9 @@ impl TatFile {
                             for (k, v) in attrs(&e)? {
                                 match k.as_str() {
                                     "version" => out.version = v,
-                                    "showOnlyFilteredLines" => out.show_only_filtered = parse_bool(&v),
+                                    "showOnlyFilteredLines" => {
+                                        out.show_only_filtered = parse_bool(&v)
+                                    }
                                     _ => out.root_extra.push((k, v)),
                                 }
                             }
@@ -111,7 +113,11 @@ impl TatFile {
         attr(
             &mut s,
             "showOnlyFilteredLines",
-            if self.show_only_filtered { "True" } else { "False" },
+            if self.show_only_filtered {
+                "True"
+            } else {
+                "False"
+            },
         );
         for (k, v) in &self.root_extra {
             attr(&mut s, k, v);
@@ -145,6 +151,9 @@ impl TatFile {
             }
             if f.italic {
                 attr(&mut s, "logd_italic", "y");
+            }
+            if let Some(size) = f.font_size {
+                attr(&mut s, "logd_font_size", &size.to_string());
             }
             if f.scope != FilterScope::default() {
                 attr(
@@ -201,6 +210,7 @@ fn parse_filter(attrs: &[(String, String)]) -> FilterSpec {
             "logd_mode" => f.mode = HighlightMode::parse(v),
             "logd_bold" => f.bold = parse_bool(v),
             "logd_italic" => f.italic = parse_bool(v),
+            "logd_font_size" => f.font_size = v.trim().parse().ok(),
             "logd_scope" => {
                 f.scope = match v.trim().to_ascii_lowercase().as_str() {
                     "current" | "file" => FilterScope::CurrentFile,
@@ -276,16 +286,16 @@ mod tests {
         assert_eq!(f.back, Some(0xffff00));
 
         // 关键字里带方括号，不能被 XML 或正则逻辑搞坏
-        assert!(t
-            .filters
-            .iter()
-            .any(|f| f.text == "[getAEPLineMappingID]"));
+        assert!(t.filters.iter().any(|f| f.text == "[getAEPLineMappingID]"));
     }
 
     #[test]
     fn parses_show_only_filtered_true() {
         let t = TatFile::parse(SPRD).unwrap();
-        assert!(t.show_only_filtered, "展锐ae.tat 的 showOnlyFilteredLines 是 True");
+        assert!(
+            t.show_only_filtered,
+            "展锐ae.tat 的 showOnlyFilteredLines 是 True"
+        );
         assert!(!t.filters.is_empty());
     }
 
@@ -302,6 +312,7 @@ mod tests {
         t.filters[0].mode = HighlightMode::Field;
         t.filters[0].bold = true;
         t.filters[1].italic = true;
+        t.filters[1].font_size = Some(16);
         t.filters[2].scope = FilterScope::CurrentFile;
         t.show_only_filtered = true;
 
@@ -309,6 +320,7 @@ mod tests {
         assert!(xml.contains("logd_mode=\"field\""));
         assert!(xml.contains("logd_bold=\"y\""));
         assert!(xml.contains("logd_scope=\"current\""));
+        assert!(xml.contains("logd_font_size=\"16\""));
         assert!(xml.contains("showOnlyFilteredLines=\"True\""));
 
         let back = TatFile::parse(xml.as_bytes()).unwrap();

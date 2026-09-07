@@ -1,10 +1,11 @@
-//! logd 引擎层：内存映射、稀疏行索引、多关键字匹配、并行筛选、`.tat` 配置读写。
+//! logd 引擎层：内存映射、稀疏行索引、多关键字匹配、并行筛选、`.logd`/`.tat` 配置读写。
 //!
 //! 这一层完全不依赖 UI，可以单独 `cargo test -p logd-core`。
 
 pub mod cache;
 pub mod document;
 pub mod index;
+pub mod logd;
 pub mod logline;
 pub mod matcher;
 pub mod merge;
@@ -19,6 +20,7 @@ pub mod viewport;
 
 pub use document::{Document, RenderRow};
 pub use index::{ChunkIndex, LineIndex, ANCHOR_STRIDE};
+pub use logd::LogdFile;
 pub use logline::{Level, LogLine, Ts};
 pub use matcher::{FilterScope, FilterSpec, HighlightMode, MatcherSet, Span, Verdict};
 pub use merge::{MergedRow, MergedView, TimedLine};
