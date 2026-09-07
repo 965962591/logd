@@ -23,8 +23,8 @@ use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all_with_query_and_counts_for_filters, scan_query_all,
-    CompileOptions, Document, Encoding, FileSource, FilterSpec, LineIndex, MatcherSet, Progress,
-    Query, RenderRow, ScanOutcome, ScrollTo,
+    CompileOptions, Document, Encoding, FileSource, FilterScanResult, FilterSpec, LineIndex,
+    MatcherSet, Progress, Query, RenderRow, ScanOutcome, ScrollTo,
 };
 
 use crate::theme;
@@ -543,12 +543,16 @@ impl LogView {
                     return;
                 }
                 match out {
-                    Some(result) => {
-                        this.filter_match_counts = Some(Arc::new(result.filter_counts));
+                    Some(FilterScanResult {
+                        outcome,
+                        filter_counts,
+                        selected_filter_lines,
+                    }) => {
+                        this.filter_match_counts = Some(Arc::new(filter_counts));
                         this.multi_file_filter_matches = this
                             .has_multi_file_filter_results()
-                            .then(|| Arc::new(result.selected_filter_lines));
-                        match result.outcome {
+                            .then(|| Arc::new(selected_filter_lines));
+                        match outcome {
                             ScanOutcome::Matched(lines) => {
                                 this.doc.set_matches(Some(Arc::new(lines)))
                             }

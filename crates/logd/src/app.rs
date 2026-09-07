@@ -1,8 +1,9 @@
 //! Desktop shell and application command routing.
 //!
-//! Configured filters can target one tab or all imported tabs. Only the active
-//! tab is rescanned immediately after a filter edit; inactive tabs are marked
-//! dirty until activated. Title-bar searches are temporary and scan every tab.
+//! Configured filters can target one tab or all imported tabs. Current-file
+//! changes can defer inactive-tab scans; all-files filters rescan every tab so
+//! the multi-file results panel stays current. Title-bar searches are temporary
+//! and scan every tab.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
