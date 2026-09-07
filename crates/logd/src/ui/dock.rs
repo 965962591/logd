@@ -2,16 +2,19 @@
 
 use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{
     panel_handle, register_panel, BasePanel, BasePanelView, DockArea, DockAreaRenderer,
-    DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelInfo,
-    PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
+    DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelHandle,
+    PanelInfo, PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::{h_flex, IconName, Sizable as _};
 
 use crate::app::LogdApp;
-use crate::i18n::{text, Key};
+use crate::i18n::{text, Key, Language};
+use crate::theme;
 
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
 pub const FILTER_PANEL: &str = "logd.filters";
@@ -22,6 +25,7 @@ pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
 pub fn logd_dock_area(
     id: impl Into<SharedString>,
     version: Option<usize>,
+    app: WeakEntity<LogdApp>,
     window: &mut Window,
     cx: &mut App,
 ) -> (Entity<DockArea>, Rc<DockSkin>) {
@@ -29,7 +33,8 @@ pub fn logd_dock_area(
     let area = cx.new(|cx| {
         let skin = DockSkin::new(cx);
         component_skin = Some(skin.clone());
-        DockArea::new(id, version, window, cx).with_renderer(Rc::new(LogdDockSkin { inner: skin }))
+        DockArea::new(id, version, window, cx)
+            .with_renderer(Rc::new(LogdDockSkin { inner: skin, app }))
     });
     (
         area,
@@ -39,6 +44,7 @@ pub fn logd_dock_area(
 
 struct LogdDockSkin {
     inner: Rc<DockSkin>,
+    app: WeakEntity<LogdApp>,
 }
 
 impl DockAreaRenderer for LogdDockSkin {
@@ -82,6 +88,7 @@ impl DockAreaRenderer for LogdDockSkin {
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
         Rc::new(LogdTabGroupSkin {
             inner: self.inner.tab_group_renderer(),
+            app: self.app.clone(),
         })
     }
 
@@ -92,6 +99,164 @@ impl DockAreaRenderer for LogdDockSkin {
 
 struct LogdTabGroupSkin {
     inner: Rc<dyn TabGroupRenderer>,
+    app: WeakEntity<LogdApp>,
+}
+
+const DRAG_PREVIEW_SIZE: Size<Pixels> = size(px(96.), px(30.));
+
+struct LogdPanelDragPreview {
+    panel: Arc<dyn BasePanelView>,
+}
+
+impl Render for LogdPanelDragPreview {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
+        div()
+            .id("logd-dock-drag-preview")
+            .cursor_grab()
+            .h(DRAG_PREVIEW_SIZE.height)
+            .w(DRAG_PREVIEW_SIZE.width)
+            .px_3()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .border_1()
+            .border_color(palette.border)
+            .rounded_sm()
+            .text_color(palette.tab_foreground)
+            .bg(palette.tab_active)
+            .opacity(0.75)
+            .child(panel_title(&self.panel, window, cx))
+    }
+}
+
+fn panel_title(panel: &Arc<dyn BasePanelView>, window: &mut Window, cx: &mut App) -> AnyElement {
+    PanelHandle::of(panel)
+        .map(|handle| handle.title(window, cx))
+        .unwrap_or_else(|| SharedString::from(panel.panel_name(cx)).into_any_element())
+}
+
+fn close_tool_panel_button(
+    id: &'static str,
+    panel_name: &'static str,
+    app: WeakEntity<LogdApp>,
+    language: Language,
+) -> Button {
+    Button::new(id)
+        .icon(IconName::Close)
+        .accessibility_label(text(Key::Close, language))
+        .tooltip(text(Key::Close, language))
+        .on_click(move |_, window, cx| {
+            app.update(cx, |app, cx| match panel_name {
+                FILTER_PANEL => app.show_filter_panel(false, window, cx),
+                SEARCH_RESULTS_PANEL => app.show_search_results(false, window, cx),
+                _ => {}
+            })
+            .ok();
+        })
+}
+
+impl LogdTabGroupSkin {
+    fn render_tool_panel_title(
+        &self,
+        group: &TabGroupContext,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let panel = &group.panels()[ix];
+        let Some(handle) = PanelHandle::of(panel) else {
+            return self.inner.render_tab_bar(group, window, cx);
+        };
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        let zoomed = group.is_zoomed();
+        let title = handle.title(window, cx);
+        let title_suffix = handle.title_suffix(window, cx);
+        let toolbar_buttons = handle.toolbar_buttons(window, cx);
+        let drag = group
+            .is_draggable()
+            .then(|| group.drag_panel(ix, cx))
+            .flatten();
+
+        h_flex()
+            .justify_between()
+            .h(px(30.))
+            .py_2()
+            .pl_3()
+            .pr_2()
+            .child(
+                div()
+                    .id("logd-tool-panel-tab")
+                    .flex_1()
+                    .min_w_16()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(title)
+                    .when_some(drag, |this, drag| {
+                        this.on_drag(drag, {
+                            let panel = panel.clone();
+                            move |drag, offset, _, cx| {
+                                cx.stop_propagation();
+                                drag.set_drag_offset(offset);
+                                drag.set_preview_size(DRAG_PREVIEW_SIZE);
+                                cx.new(|_| LogdPanelDragPreview {
+                                    panel: panel.clone(),
+                                })
+                            }
+                        })
+                    }),
+            )
+            .children(title_suffix)
+            .when(!group.is_collapsed(), |this| {
+                this.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .ml_1()
+                        .gap_1()
+                        .child(
+                            Button::new(if zoomed {
+                                "restore-tool-panel"
+                            } else {
+                                "maximize-tool-panel"
+                            })
+                            .icon(if zoomed {
+                                IconName::Minimize
+                            } else {
+                                IconName::Maximize
+                            })
+                            .xsmall()
+                            .ghost()
+                            .tab_stop(false)
+                            .accessibility_label(text(
+                                if zoomed { Key::Restore } else { Key::Maximize },
+                                language,
+                            ))
+                            .tooltip(text(
+                                if zoomed { Key::Restore } else { Key::Maximize },
+                                language,
+                            ))
+                            .on_click({
+                                let group = group.clone();
+                                move |_, window, cx| group.toggle_zoom(window, cx)
+                            }),
+                        )
+                        .when_some(toolbar_buttons, |this, buttons| {
+                            this.children(
+                                buttons
+                                    .into_iter()
+                                    .map(|button| button.xsmall().ghost().tab_stop(false)),
+                            )
+                        }),
+                )
+            })
+            .into_any_element()
+    }
 }
 
 impl TabGroupRenderer for LogdTabGroupSkin {
@@ -117,16 +282,22 @@ impl TabGroupRenderer for LogdTabGroupSkin {
         let visible_panels = group
             .panels()
             .iter()
-            .filter(|panel| panel.visible(cx))
-            .count();
-        if visible_panels == 1
-            && group
-                .active_panel()
-                .is_some_and(|panel| panel.panel_name(cx) == WORKSPACE_PANEL)
-        {
-            Empty.into_any_element()
-        } else {
-            self.inner.render_tab_bar(group, window, cx)
+            .enumerate()
+            .filter(|(_, panel)| panel.visible(cx))
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>();
+        match visible_panels.as_slice() {
+            [ix] if group.panels()[*ix].panel_name(cx) == WORKSPACE_PANEL => {
+                Empty.into_any_element()
+            }
+            [ix] if matches!(
+                group.panels()[*ix].panel_name(cx),
+                FILTER_PANEL | SEARCH_RESULTS_PANEL
+            ) =>
+            {
+                self.render_tool_panel_title(group, *ix, window, cx)
+            }
+            _ => self.inner.render_tab_bar(group, window, cx),
         }
     }
 
@@ -313,28 +484,56 @@ impl Panel for FilterPanel {
             .unwrap_or_else(|| "Filters".to_string())
     }
 
+    fn title_suffix(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        let app = self.app.clone();
+        Some(
+            Button::new("filter-add")
+                .icon(IconName::Plus)
+                .xsmall()
+                .ghost()
+                .tab_stop(false)
+                .accessibility_label(text(Key::AddFilter, language))
+                .tooltip(text(Key::AddFilter, language))
+                .on_click(move |_, window, cx| {
+                    app.update(cx, |app, cx| app.begin_add_filter(window, cx))
+                        .ok();
+                }),
+        )
+    }
+
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
 
-    fn dropdown_menu(
+    fn toolbar_buttons(
         &mut self,
-        menu: PopupMenu,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> PopupMenu {
-        let app = self.app.clone();
-        let lang = self
+    ) -> Option<Vec<Button>> {
+        let language = self
             .app
             .upgrade()
             .map(|app| app.read(cx).language())
-            .unwrap_or(crate::i18n::Language::EnUs);
-        menu.item(
-            PopupMenuItem::new(text(Key::Close, lang)).on_click(move |_, window, cx| {
-                app.update(cx, |app, cx| app.show_filter_panel(false, window, cx))
-                    .ok();
-            }),
-        )
+            .unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button(
+            "close-filter-panel",
+            FILTER_PANEL,
+            self.app.clone(),
+            language,
+        )])
+    }
+
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 
@@ -440,28 +639,57 @@ impl Panel for SearchResultsPanel {
             .unwrap_or_else(|| "Search Results".to_string())
     }
 
+    fn title_suffix(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let palette = theme::palette(cx);
+        let (summary, progress) = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).search_results_title_status(cx))
+            .unwrap_or_else(|| ("0 Matches  |  0 Files".to_string(), None));
+
+        Some(
+            h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(palette.muted)
+                .child(summary)
+                .children(
+                    progress.map(|progress| {
+                        div().text_color(palette.search_foreground).child(progress)
+                    }),
+                ),
+        )
+    }
+
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
 
-    fn dropdown_menu(
+    fn toolbar_buttons(
         &mut self,
-        menu: PopupMenu,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> PopupMenu {
-        let app = self.app.clone();
-        let lang = self
+    ) -> Option<Vec<Button>> {
+        let language = self
             .app
             .upgrade()
             .map(|app| app.read(cx).language())
-            .unwrap_or(crate::i18n::Language::EnUs);
-        menu.item(
-            PopupMenuItem::new(text(Key::Close, lang)).on_click(move |_, window, cx| {
-                app.update(cx, |app, cx| app.show_search_results(false, window, cx))
-                    .ok();
-            }),
-        )
+            .unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button(
+            "close-search-results-panel",
+            SEARCH_RESULTS_PANEL,
+            self.app.clone(),
+            language,
+        )])
+    }
+
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 

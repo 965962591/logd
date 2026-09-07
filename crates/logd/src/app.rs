@@ -211,11 +211,12 @@ impl LogdApp {
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
-        let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app, cx));
+        let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
         register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
-        let (dock_area, skin) = logd_dock_area("logd.main", Some(DOCK_LAYOUT_VERSION), window, cx);
+        let (dock_area, skin) =
+            logd_dock_area("logd.main", Some(DOCK_LAYOUT_VERSION), app, window, cx);
         // The View menu is the single visibility control; avoid a duplicate dock toggle button.
         skin.set_toggle_button_visible(false, cx);
         let restored = crate::settings::load_dock_layout()
@@ -793,7 +794,7 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn begin_add_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn begin_add_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter_editor_open = true;
         self.editing_filter = None;
         self.filter_text
@@ -1243,6 +1244,43 @@ impl LogdApp {
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
+    }
+
+    pub(crate) fn search_results_title_status(&self, cx: &App) -> (String, Option<String>) {
+        let has_search = !self.search_query.is_empty();
+        let mut total_matches = 0usize;
+        let mut matched_files = 0usize;
+        let mut scanning = 0usize;
+
+        for tab in &self.tabs {
+            let view = tab.view.read(cx);
+            if has_search
+                && (view.search_scanning_progress().is_some() || view.indexing_progress().is_some())
+            {
+                scanning += 1;
+            }
+            if let Some(lines) = view.search_matches().filter(|lines| !lines.is_empty()) {
+                total_matches = total_matches.saturating_add(lines.len());
+                matched_files += 1;
+            }
+        }
+
+        let summary = format!(
+            "{} {}  |  {} {}",
+            group(total_matches as u64),
+            text(Key::Matches, self.language),
+            group(matched_files as u64),
+            text(Key::Files, self.language)
+        );
+        let progress = (scanning > 0).then(|| {
+            format!(
+                "{} {}/{}",
+                text(Key::SearchInProgress, self.language),
+                self.tabs.len().saturating_sub(scanning),
+                self.tabs.len(),
+            )
+        });
+        (summary, progress)
     }
 
     fn dispatch(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -1980,7 +2018,6 @@ impl LogdApp {
             )
         };
 
-        let add_app = app.clone();
         let cancel_app = app.clone();
         let reset_fore_app = app.clone();
         let reset_back_app = app.clone();
@@ -1991,33 +2028,6 @@ impl LogdApp {
             .bg(palette.background)
             .text_color(palette.foreground)
             .text_size(px(12.))
-            .child(
-                h_flex()
-                    .h(px(32.))
-                    .px_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(palette.border)
-                    .child(control_tooltip(
-                        "filter-add-tooltip",
-                        text(Key::AddFilter, lang),
-                        ButtonGroup::new("filter-toolbar")
-                            .compact()
-                            .xsmall()
-                            .outline()
-                            .child(
-                                Button::new("filter-add")
-                                    .icon(IconName::Plus)
-                                    .accessibility_label(text(Key::AddFilter, lang))
-                                    .on_click(
-                                        window.listener_for(&add_app, |this, _, window, cx| {
-                                            this.begin_add_filter(window, cx)
-                                        }),
-                                    ),
-                            ),
-                    ))
-                    .child(div().flex_1()),
-            )
             .when(editor_open, |column| {
                 column.child(
                     v_flex()
@@ -2275,7 +2285,7 @@ impl LogdApp {
         cx: &mut Context<SearchResultsPanel>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
-        let (has_search, files, total_matches, tree_rows, scanning, file_count, lang) = {
+        let (has_search, files, total_matches, tree_rows, scanning, lang) = {
             let state = app.read(cx);
             let has_search = !state.search_query.is_empty();
             let mut files = Vec::new();
@@ -2317,43 +2327,16 @@ impl LogdApp {
                 total_matches,
                 tree_rows,
                 scanning,
-                state.tabs.len(),
                 state.language,
             )
         };
 
-        let summary = format!(
-            "{} {}  |  {} {}",
-            group(total_matches as u64),
-            text(Key::Matches, lang),
-            group(files.len() as u64),
-            text(Key::Files, lang)
-        );
         let panel = v_flex()
             .size_full()
             .min_h_0()
             .bg(palette.background)
             .text_color(palette.foreground)
-            .text_size(px(12.))
-            .child(
-                h_flex()
-                    .h(px(28.))
-                    .flex_none()
-                    .px_2()
-                    .gap_3()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(palette.border)
-                    .child(summary)
-                    .when(scanning > 0, |header| {
-                        header.child(div().text_color(palette.search_foreground).child(format!(
-                            "{} {}/{}",
-                            text(Key::SearchInProgress, lang),
-                            file_count.saturating_sub(scanning),
-                            file_count,
-                        )))
-                    }),
-            );
+            .text_size(px(12.));
 
         if !has_search {
             return panel
