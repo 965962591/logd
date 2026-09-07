@@ -102,6 +102,14 @@ jobs:
             throw "logd.exe uses PE subsystem $subsystem; expected WINDOWS_GUI (2)"
           }
 
+          $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          if ($versionInfo.FileDescription -ne "logd") {
+            throw "Unexpected FileDescription '$($versionInfo.FileDescription)'; expected 'logd'"
+          }
+          if ($versionInfo.ProductName -ne "logd") {
+            throw "Unexpected ProductName '$($versionInfo.ProductName)'; expected 'logd'"
+          }
+
       - name: Collect Windows packages
         shell: pwsh
         run: |

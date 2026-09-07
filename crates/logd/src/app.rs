@@ -3091,6 +3091,7 @@ fn next_filter_font_size(size: Option<u16>) -> Option<u16> {
 pub fn run(initial: Vec<PathBuf>) {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
+        cx.set_app_identity("com.github.965962591.logd", "logd");
         gpui_component::init(cx);
         gpui_component::Theme::change(crate::settings::load_theme_mode(), None, cx);
         crate::theme::apply_dark_surface(cx);

@@ -166,10 +166,10 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::ImportFilters, Language::ZhCn) => "导入 .logd / .tat 过滤器",
         (Key::ImportFilters, Language::EnUs) => "Import .logd / .tat Filters",
         (Key::SearchPlaceholder, Language::ZhCn) => {
-            "搜索所有已导入文件（& 同时满足，| 任一满足），回车搜索"
+            "& 同时满足，| 任一满足"
         }
         (Key::SearchPlaceholder, Language::EnUs) => {
-            "Search all imported files (& means AND, | means OR), press Enter"
+            "& means AND, | means OR"
         }
         (Key::SearchHistory, Language::ZhCn) => "搜索历史",
         (Key::SearchHistory, Language::EnUs) => "Search history",

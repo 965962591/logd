@@ -8,7 +8,7 @@ pub fn window_options(cx: &App) -> WindowOptions {
         // explicit transparent titlebar also enables GPUI's Windows hit-test
         // callback instead of creating a native titlebar above our content.
         titlebar: Some(TitlebarOptions {
-            title: None,
+            title: Some("logd".into()),
             appears_transparent: true,
             ..Default::default()
         }),
@@ -17,6 +17,7 @@ pub fn window_options(cx: &App) -> WindowOptions {
         window_min_size: Some(size(px(760.), px(480.))),
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
+        app_id: Some("com.github.965962591.logd".into()),
         ..Default::default()
     }
 }

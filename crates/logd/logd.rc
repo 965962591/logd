@@ -1,1 +1,38 @@
+#pragma code_page(65001)
+
+#define STRINGIFY_INNER(value) #value
+#define STRINGIFY(value) STRINGIFY_INNER(value)
+#define LOGD_VERSION_STRING \
+    STRINGIFY(LOGD_VERSION_MAJOR) "." \
+    STRINGIFY(LOGD_VERSION_MINOR) "." \
+    STRINGIFY(LOGD_VERSION_PATCH) ".0"
+
 1 ICON "../../public/logd.ico"
+
+1 VERSIONINFO
+FILEVERSION LOGD_VERSION_MAJOR, LOGD_VERSION_MINOR, LOGD_VERSION_PATCH, 0
+PRODUCTVERSION LOGD_VERSION_MAJOR, LOGD_VERSION_MINOR, LOGD_VERSION_PATCH, 0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "barry chen\0"
+            VALUE "FileDescription", "logd\0"
+            VALUE "FileVersion", LOGD_VERSION_STRING "\0"
+            VALUE "InternalName", "logd\0"
+            VALUE "OriginalFilename", "logd.exe\0"
+            VALUE "ProductName", "logd\0"
+            VALUE "ProductVersion", LOGD_VERSION_STRING "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
