@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -22,6 +22,7 @@ jobs:
     outputs:
       value: ${{ steps.package.outputs.version }}
       tag: ${{ steps.package.outputs.tag }}
+      commit: ${{ steps.package.outputs.commit }}
 
     env:
       RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -53,11 +54,13 @@ jobs:
               exit 1
             fi
           else
-            echo "No release tag for event '$GITHUB_EVENT_NAME'; building artifacts without publishing a GitHub release."
+            RELEASE_TAG="v$version"
+            echo "Event '$GITHUB_EVENT_NAME' will publish release '$RELEASE_TAG'."
           fi
 
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   package-windows:
     name: Package Windows x64
@@ -71,7 +74,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.tag || github.sha }}
+          ref: ${{ needs.version.outputs.commit }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -86,6 +89,18 @@ jobs:
 
       - name: Build executable and MSI
         run: cargo packager --release -p logd --formats wix
+
+      - name: Verify Windows GUI executable
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/logd.exe).Path
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeader = $peOffset + 24
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+          if ($subsystem -ne 2) {
+            throw "logd.exe uses PE subsystem $subsystem; expected WINDOWS_GUI (2)"
+          }
 
       - name: Collect Windows packages
         shell: pwsh
@@ -118,7 +133,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.tag || github.sha }}
+          ref: ${{ needs.version.outputs.commit }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,6 +148,35 @@ jobs:
 
       - name: Build DMG
         run: cargo packager --release -p logd --formats dmg
+
+      - name: Verify macOS application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find target/release -type f -name '*.dmg' -print -quit)"
+          if [[ -z "$package" ]]; then
+            echo "Cannot find the packaged DMG" >&2
+            exit 1
+          fi
+
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet || true
+            rmdir "$mount_dir" || true
+          }
+          trap cleanup EXIT
+          hdiutil attach "$package" -readonly -nobrowse -mountpoint "$mount_dir" -quiet
+
+          app="$(find "$mount_dir" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app" ]]; then
+            echo "DMG does not contain a macOS .app bundle" >&2
+            exit 1
+          fi
+          bundle_type="$(plutil -extract CFBundlePackageType raw "$app/Contents/Info.plist")"
+          if [[ "$bundle_type" != "APPL" ]]; then
+            echo "Unexpected macOS bundle type '$bundle_type'; expected APPL" >&2
+            exit 1
+          fi
 
       - name: Collect macOS package
         shell: bash
@@ -162,11 +206,12 @@ jobs:
       - version
       - package-windows
       - package-macos
-    if: needs.version.outputs.tag != ''
     runs-on: ubuntu-latest
     env:
+      GH_REPO: ${{ github.repository }}
       RELEASE_VERSION: ${{ needs.version.outputs.value }}
       RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
 
     steps:
       - name: Download release packages
@@ -187,8 +232,18 @@ jobs:
             exit 1
           fi
 
-          gh release create "$RELEASE_TAG" \
-            "${assets[@]}" \
-            --verify-tag \
-            --generate-notes \
-            --title "logd $RELEASE_VERSION"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --draft=false \
+              --prerelease=false \
+              --title "logd $RELEASE_VERSION"
+          else
+            gh release create "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --target "$RELEASE_COMMIT" \
+              --generate-notes \
+              --draft=false \
+              --prerelease=false \
+              --title "logd $RELEASE_VERSION"
+          fi
