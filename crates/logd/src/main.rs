@@ -13,8 +13,11 @@ mod platform;
 mod settings;
 mod theme;
 mod ui;
+mod updater;
 
 fn main() {
+    updater::start_auto_update();
+
     // 命令行可以直接给若干路径：日志文件开标签页，.logd/.tat 当配置加载。
     // 方便拿大文件做性能验收。
     let initial: Vec<_> = std::env::args()

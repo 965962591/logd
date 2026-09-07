@@ -20,6 +20,7 @@ use gpui_component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
@@ -54,6 +55,9 @@ struct SearchResultFile {
 }
 
 const DOCK_LAYOUT_VERSION: usize = 2;
+const DEVELOPER: &str = "barry chen";
+const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
+const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
 
 #[derive(Clone)]
 struct TabDrag {
@@ -1159,6 +1163,62 @@ impl LogdApp {
         });
     }
 
+    fn show_about_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let language = self.language;
+        window.open_alert_dialog(cx, move |alert, window, _| {
+            alert
+                .title("logd")
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().w(px(100.)).child(text(Key::Version, language)))
+                                .child(env!("CARGO_PKG_VERSION")),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().w(px(100.)).child(text(Key::Developer, language)))
+                                .child(DEVELOPER),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .w(px(100.))
+                                        .child(text(Key::GitHubRepository, language)),
+                                )
+                                .child(
+                                    Link::new("about-github")
+                                        .href(GITHUB_REPOSITORY)
+                                        .child(GITHUB_REPOSITORY),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().w(px(100.)).child(text(Key::Email, language)))
+                                .child(
+                                    Link::new("about-email")
+                                        .href(format!("mailto:{CONTACT_EMAIL}"))
+                                        .child(CONTACT_EMAIL),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("close-about")
+                            .primary()
+                            .label(text(Key::Close, language))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+    }
+
     pub(crate) fn show_filter_panel(
         &mut self,
         show: bool,
@@ -1558,6 +1618,20 @@ impl LogdApp {
         }
     }
 
+    fn about_button(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let app = cx.entity();
+        Button::new("menu-about")
+            .xsmall()
+            .ghost()
+            .text_color(theme::palette(cx).foreground)
+            .label(text(Key::About, self.language))
+            .on_click(window.listener_for(&app, |this, _, window, cx| {
+                cx.stop_propagation();
+                this.show_about_dialog(window, cx);
+            }))
+            .into_any_element()
+    }
+
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette(cx);
         let app = cx.entity();
@@ -1589,6 +1663,7 @@ impl LogdApp {
             .child(self.menu_button(Key::View, window, cx))
             .child(self.menu_button(Key::Encoding, window, cx))
             .child(self.menu_button(Key::Filters, window, cx))
+            .child(self.about_button(window, cx))
             .into_any_element();
         let right = h_flex()
             .h_full()
@@ -2556,6 +2631,7 @@ impl LogdApp {
 
 impl Render for LogdApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dialog_layer = Root::render_dialog_layer(window, cx);
         let palette = theme::palette(cx);
         let title = self.render_title_bar(window, cx);
         let tabs = self.render_tabs(cx);
@@ -2576,6 +2652,7 @@ impl Render for LogdApp {
                     .child(self.dock_area.clone()),
             )
             .child(status)
+            .children(dialog_layer)
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 for path in paths.paths() {
                     this.open_path(path, window, cx);

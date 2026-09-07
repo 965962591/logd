@@ -113,6 +113,8 @@ jobs:
           New-Item -ItemType Directory -Path release-assets | Out-Null
           Copy-Item target/release/logd.exe release-assets/logd.exe
           Copy-Item $packages[0].FullName "release-assets/logd-$env:RELEASE_VERSION-windows-x86_64.msi"
+          $target = (rustc -vV | Select-String '^host: ').Line.Substring(6)
+          Compress-Archive -LiteralPath target/release/logd.exe -DestinationPath "release-assets/logd-$target.zip"
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
@@ -209,8 +211,13 @@ jobs:
 
           package="$(find target/release -type f -name '*.dmg' -print -quit)"
           arch="$(uname -m)"
+          target="$(rustc -vV | sed -n 's/^host: //p')"
           mkdir -p release-assets
           cp "$package" "release-assets/logd-${RELEASE_VERSION}-macos-${arch}.dmg"
+          cp target/release/logd release-assets/logd
+          chmod +x release-assets/logd
+          (cd release-assets && zip "logd-${target}.zip" logd)
+          rm release-assets/logd
 
       - name: Upload macOS package
         uses: actions/upload-artifact@v4
@@ -246,8 +253,8 @@ jobs:
         run: |
           set -euo pipefail
           assets=(release-assets/*)
-          if [[ ${#assets[@]} -ne 3 ]]; then
-            echo "Expected three release files, found ${#assets[@]}" >&2
+          if [[ ${#assets[@]} -ne 5 ]]; then
+            echo "Expected five release files, found ${#assets[@]}" >&2
             exit 1
           fi
 
