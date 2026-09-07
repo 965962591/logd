@@ -19,7 +19,7 @@ use gpui_component::dialog::DialogFooter;
 use gpui_component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Enter, Input, InputEvent, InputState};
 use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
@@ -1767,6 +1767,9 @@ impl LogdApp {
                             .flex_1()
                             .h_full()
                             .on_click(|_, _, cx| cx.stop_propagation())
+                            // Keep Enter in the text input; otherwise the enclosing
+                            // combobox treats it as a request to open history.
+                            .on_action(|_: &Enter, _, cx| cx.stop_propagation())
                             .child(Input::new(&keyword).small().appearance(false)),
                     )
                     .child(control_tooltip(
