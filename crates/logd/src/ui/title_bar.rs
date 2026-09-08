@@ -14,7 +14,9 @@ use crate::theme;
 
 const HEIGHT: f32 = 34.0;
 const CONTROL_WIDTH: f32 = 46.0;
+const WINDOW_CONTROLS_WIDTH: f32 = CONTROL_WIDTH * 3.0;
 const SIDE_DRAG_MIN_WIDTH: f32 = 64.0;
+const SEARCH_MIN_WIDTH: f32 = 300.0;
 const SEARCH_MAX_WIDTH: f32 = 720.0;
 const CENTER_DRAG_MIN_WIDTH: f32 = 20.0;
 const APP_ICON_BYTES: &[u8] =
@@ -113,14 +115,15 @@ pub fn render(
     let maximized = window.is_maximized();
     let palette = theme::palette(cx);
 
-    div()
+    h_flex()
         .id("app-title-bar")
         .relative()
-        .grid()
-        .grid_cols(4)
         .flex_none()
         .w_full()
         .h(px(HEIGHT))
+        // Window controls are absolutely positioned below. Reserve their
+        // width from the shared flex area so no title-bar content overlaps.
+        .pr(px(WINDOW_CONTROLS_WIDTH))
         .items_center()
         .bg(palette.title_bar)
         .border_b_1()
@@ -135,8 +138,9 @@ pub fn render(
         .child(
             h_flex()
                 .h_full()
-                .min_w_0()
                 .flex_1()
+                .min_w_0()
+                .overflow_hidden()
                 .items_center()
                 .child(left)
                 .child(drag_region("title-drag-left", SIDE_DRAG_MIN_WIDTH)),
@@ -144,13 +148,22 @@ pub fn render(
         .child(
             h_flex()
                 .h_full()
-                .w_full()
+                .flex_1()
                 .min_w_0()
-                .col_span(2)
+                .min_w(px(SEARCH_MIN_WIDTH + CENTER_DRAG_MIN_WIDTH * 2.))
                 .justify_center()
-                .child(drag_region("title-drag-center-left", CENTER_DRAG_MIN_WIDTH))
-                .child(div().w_full().max_w(px(SEARCH_MAX_WIDTH)).child(center))
-                .child(drag_region(
+                .child(fixed_drag_region(
+                    "title-drag-center-left",
+                    CENTER_DRAG_MIN_WIDTH,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(SEARCH_MIN_WIDTH))
+                        .max_w(px(SEARCH_MAX_WIDTH))
+                        .child(center),
+                )
+                .child(fixed_drag_region(
                     "title-drag-center-right",
                     CENTER_DRAG_MIN_WIDTH,
                 )),
@@ -158,13 +171,25 @@ pub fn render(
         .child(
             h_flex()
                 .h_full()
-                .w_full()
+                .flex_1()
                 .min_w_0()
+                .overflow_hidden()
                 .justify_end()
                 // The space before the window controls needs its own hitbox;
                 // otherwise it cannot move the window on Windows.
                 .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
-                .child(right)
+                .child(right),
+        )
+        // Keep native window controls out of the flex flow. They remain
+        // anchored to the window edge when the title bar is space-constrained.
+        .child(
+            h_flex()
+                .id("window-controls")
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .flex_none()
                 .child(control(
                     "window-minimize",
                     IconName::WindowMinimize,
@@ -214,6 +239,15 @@ fn drag_region(id: &'static str, min_width: f32) -> impl IntoElement {
         // Keep a real, non-zero hitbox even when the title bar is narrow or
         // the neighboring search/menu content is measured as min-content.
         .min_w(px(min_width))
+        .window_control_area(WindowControlArea::Drag)
+}
+
+fn fixed_drag_region(id: &'static str, width: f32) -> impl IntoElement {
+    div()
+        .id(id)
+        .h_full()
+        .w(px(width))
+        .flex_none()
         .window_control_area(WindowControlArea::Drag)
 }
 
