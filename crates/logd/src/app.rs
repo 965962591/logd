@@ -1982,6 +1982,7 @@ impl LogdApp {
         let filter_toggle_app = app.clone();
         let search_results_toggle_app = app.clone();
         let analysis_toggle_app = app.clone();
+        let show_only_app = app.clone();
         let analysis_open = self.analysis_dock_panel.read(cx).visible();
         let left = h_flex()
             .h_full()
@@ -2009,6 +2010,17 @@ impl LogdApp {
             .flex_none()
             .items_center()
             .gap_1()
+            .child(title_bar::show_only_toggle(
+                self.show_only_filtered,
+                self.tabs.is_empty(),
+                lang,
+                palette,
+                move |window, cx| {
+                    show_only_app.update(cx, |app, cx| {
+                        app.set_show_only(!app.show_only_filtered, window, cx)
+                    });
+                },
+            ))
             .child(title_bar::panel_toggle(
                 "title-toggle-filters",
                 IconName::PanelLeft,
