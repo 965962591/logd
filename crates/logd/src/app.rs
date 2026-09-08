@@ -27,13 +27,14 @@ use gpui_component::progress::Progress;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
-    Root, Selectable as _, Sizable, WindowExt as _,
+    h_flex, h_resizable, resizable_panel, v_flex, ActiveTheme as _, Disableable as _, Icon,
+    IconName, InteractiveElementExt as _, Root, Selectable as _, Sizable, WindowExt as _,
 };
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, LogdFile, TatFile};
 
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
+use crate::log_analysis::LogAnalysisPanel;
 use crate::theme;
 use crate::ui::dock::{
     logd_dock_area, register_logd_panels, FilterPanel, LogPanel, SearchResultsPanel,
@@ -271,6 +272,8 @@ pub struct LogdApp {
     tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
     search_results_panel: Entity<SearchResultsPanel>,
+    analysis_panel: Entity<LogAnalysisPanel>,
+    analysis_open: bool,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
     language: Language,
@@ -354,6 +357,7 @@ impl LogdApp {
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
+        let analysis_panel = cx.new(|_| LogAnalysisPanel::new());
         register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
@@ -447,6 +451,8 @@ impl LogdApp {
             tab_scroll: ScrollHandle::new(),
             filter_panel,
             search_results_panel,
+            analysis_panel,
+            analysis_open: false,
             last_layout_state,
             save_layout_task: None,
             language,
@@ -1874,6 +1880,7 @@ impl LogdApp {
         let lang = self.language;
         let filter_toggle_app = app.clone();
         let search_results_toggle_app = app.clone();
+        let analysis_toggle_app = app.clone();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -1905,6 +1912,7 @@ impl LogdApp {
                 IconName::PanelLeft,
                 IconName::PanelLeftOpen,
                 filters_open,
+                false,
                 text(
                     if filters_open {
                         Key::HideFilters
@@ -1924,6 +1932,7 @@ impl LogdApp {
                 IconName::PanelBottom,
                 IconName::PanelBottomOpen,
                 search_results_open,
+                false,
                 text(
                     if search_results_open {
                         Key::HideSearchResults
@@ -1936,6 +1945,17 @@ impl LogdApp {
                     search_results_toggle_app.update(cx, |app, cx| {
                         app.show_search_results(!search_results_open, window, cx)
                     });
+                },
+            ))
+            .child(title_bar::panel_toggle(
+                "title-toggle-analysis",
+                IconName::PanelLeft,
+                IconName::PanelLeft,
+                self.analysis_open,
+                self.tabs.is_empty(),
+                "LogDrain 日志分析",
+                move |_, window, cx| {
+                    analysis_toggle_app.update(cx, |app, cx| app.toggle_analysis(window, cx));
                 },
             ))
             .into_any_element();
@@ -2161,7 +2181,7 @@ impl LogdApp {
     }
 
     pub fn render_workspace(&self, cx: &App) -> AnyElement {
-        self.active_view()
+        let view = self.active_view()
             .cloned()
             .map(IntoElement::into_any_element)
             .unwrap_or_else(|| {
@@ -2169,7 +2189,34 @@ impl LogdApp {
                     .size_full()
                     .bg(theme::palette(cx).background)
                     .into_any_element()
-            })
+            });
+        if self.analysis_open {
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    h_resizable("log-analysis-split")
+                        .child(resizable_panel().min_w_0().child(view))
+                        .child(
+                            resizable_panel()
+                                .size(px(460.))
+                                .size_range(px(260.)..Pixels::MAX)
+                                .flex_none()
+                                .child(self.analysis_panel.clone()),
+                        ),
+                )
+                .into_any_element()
+        } else { view }
+    }
+
+    fn toggle_analysis(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.analysis_open = !self.analysis_open;
+        if self.analysis_open {
+            if let Some(tab) = self.tabs.get(self.active) {
+                self.analysis_panel.update(cx, |panel, cx| panel.analyze(&tab.path, window, cx));
+            }
+        } else { self.analysis_panel.update(cx, |panel, cx| panel.clear(cx)); }
+        cx.notify();
     }
 
     pub fn render_filters(

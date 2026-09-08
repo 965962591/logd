@@ -21,6 +21,7 @@ use gpui::*;
 use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
+use gpui_component::scroll::{AutoScroll, Scrollbar, ScrollbarHandle, ScrollbarMode};
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all_with_query_and_counts_for_filters, scan_query_all,
     CompileOptions, Document, Encoding, FileSource, FilterScanResult, FilterSpec, LineIndex,
@@ -28,6 +29,47 @@ use logd_core::{
 };
 
 use crate::theme;
+
+#[derive(Clone)]
+struct LogScrollHandle {
+    area: Rc<Cell<Bounds<Pixels>>>,
+    fraction: Rc<Cell<Point<f32>>>,
+    content: Rc<Cell<Size<Pixels>>>,
+    changed: Rc<Cell<bool>>,
+}
+
+impl LogScrollHandle {
+    fn new(area: Rc<Cell<Bounds<Pixels>>>) -> Self {
+        Self {
+            area,
+            fraction: Rc::new(Cell::new(point(0., 0.))),
+            content: Rc::new(Cell::new(size(px(1.), px(1.)))),
+            changed: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
+impl ScrollbarHandle for LogScrollHandle {
+    fn viewport_bounds(&self) -> Bounds<Pixels> { self.area.get() }
+    fn offset(&self) -> Point<Pixels> {
+        let content = self.content.get();
+        let viewport = self.area.get().size;
+        point((content.width - viewport.width).max(px(0.)) * -self.fraction.get().x,
+              (content.height - viewport.height).max(px(0.)) * -self.fraction.get().y)
+    }
+    fn set_offset(&self, offset: Point<Pixels>) {
+        let content = self.content.get();
+        let viewport = self.area.get().size;
+        let max_x = (content.width - viewport.width).max(px(0.));
+        let max_y = (content.height - viewport.height).max(px(0.));
+        self.fraction.set(point(
+            if max_x > px(0.) { (-offset.x / max_x).clamp(0., 1.) } else { 0. },
+            if max_y > px(0.) { (-offset.y / max_y).clamp(0., 1.) } else { 0. },
+        ));
+        self.changed.set(true);
+    }
+    fn content_size(&self) -> Size<Pixels> { self.content.get() }
+}
 
 const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 32.0;
@@ -77,6 +119,10 @@ pub struct LogView {
     selecting: bool,
     text_selection: Option<TextSelection>,
     text_selecting: bool,
+    selection_auto_scroll: AutoScroll,
+    selection_h_auto_scroll: AutoScroll,
+    selection_drag_position: Option<Point<Pixels>>,
+    scrollbar_handle: LogScrollHandle,
     edits: BTreeMap<u64, String>,
     /// 修改是否已经写入编辑副本。保存后仍保留编辑内容用于显示。
     edits_saved: bool,
@@ -173,10 +219,11 @@ impl LogView {
     pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let complete = loaded.index.complete;
         let search_query = Arc::new(Query::always_true());
+        let area = Rc::new(Cell::new(Bounds::default()));
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
             focus: cx.focus_handle(),
-            area: Rc::new(Cell::new(Bounds::default())),
+            area: area.clone(),
             last_area: Bounds::default(),
             drag_grab: None,
             h_drag_grab: None,
@@ -200,6 +247,10 @@ impl LogView {
             selecting: false,
             text_selection: None,
             text_selecting: false,
+            selection_auto_scroll: AutoScroll::default(),
+            selection_h_auto_scroll: AutoScroll::default(),
+            selection_drag_position: None,
+            scrollbar_handle: LogScrollHandle::new(area.clone()),
             edits: BTreeMap::new(),
             edits_saved: true,
             max_line_width: 0.0,
@@ -753,23 +804,50 @@ impl LogView {
         }
     }
 
-    fn begin_text_selection(&mut self, view_row: u64, cx: &mut Context<Self>) {
+    fn text_byte_at_x(
+        &self,
+        text: &str,
+        x: Pixels,
+        gutter_w: f32,
+        font_size: f32,
+        window: &mut Window,
+    ) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: font(theme::MONO),
+            ..Default::default()
+        };
+        let local_x = f32::from(x) - f32::from(self.last_area.origin.x) - gutter_w - 8.0
+            + self.doc.viewport().h_scroll();
+        window
+            .text_system()
+            .shape_line(text.into(), px(font_size), &[run], None)
+            .closest_index_for_x(px(local_x.max(0.0)))
+    }
+
+    fn begin_text_selection(
+        &mut self,
+        view_row: u64,
+        position: Point<Pixels>,
+        gutter_w: f32,
+        font_size: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(file_line) = self.doc.row_to_file_line(view_row) else {
             return;
         };
-        let Some(input) = self.line_inputs.get(&file_line) else {
+        let Some(input) = self.line_inputs.get(&file_line).cloned() else {
             return;
         };
-        let state = input.read(cx);
-        let range = state.selected_range();
-        let active_byte = state.cursor();
-        let anchor_byte = if range.is_empty() {
-            active_byte
-        } else if active_byte == range.start {
-            range.end
-        } else {
-            range.start
+        let active_byte = {
+            let state = input.read(cx);
+            self.text_byte_at_x(&state.value(), position.x, gutter_w, font_size, window)
         };
+        let anchor_byte = active_byte;
 
         self.selection = None;
         self.selecting = false;
@@ -785,6 +863,10 @@ impl LogView {
             },
         });
         self.text_selecting = true;
+        input.update(cx, |state, cx| {
+            state.set_selected_range(active_byte..active_byte, cx)
+        });
+        window.focus(&self.focus, cx);
         self.apply_text_selection(cx);
         cx.notify();
     }
@@ -809,18 +891,7 @@ impl LogView {
         let byte = if text.is_empty() {
             0
         } else {
-            let run = TextRun {
-                len: text.len(),
-                font: font(theme::MONO),
-                ..Default::default()
-            };
-            let local_x =
-                f32::from(position.x) - f32::from(self.last_area.origin.x) - gutter_w - 8.0
-                    + self.doc.viewport().h_scroll();
-            window
-                .text_system()
-                .shape_line(text, px(self.font_size), &[run], None)
-                .closest_index_for_x(px(local_x))
+            self.text_byte_at_x(&text, position.x, gutter_w, self.font_size, window)
         };
         let Some(selection) = &mut self.text_selection else {
             return;
@@ -832,6 +903,66 @@ impl LogView {
         selection.active = active;
         self.apply_text_selection(cx);
         cx.notify();
+    }
+
+    fn update_selection_auto_scroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selection_drag_position = Some(position);
+        let delta = AutoScroll::compute_delta(position.y, self.last_area);
+        self.selection_auto_scroll.set(delta, cx, |delta, this, cx| {
+            this.doc.viewport_mut().scroll_by_pixels(f32::from(delta));
+            if this.selecting {
+                if let Some(position) = this.selection_drag_position {
+                    this.extend_selection_to_y(f32::from(position.y), cx);
+                }
+            } else if this.text_selecting {
+                if let Some(position) = this.selection_drag_position {
+                    if let Some(view_row) = this.row_at_y(f32::from(position.y)) {
+                        let Some(selection) = this.text_selection.as_mut() else { return };
+                        selection.active.view_row = view_row;
+                        this.apply_text_selection(cx);
+                    }
+                }
+            }
+            cx.notify();
+        });
+        let bounds = self.last_area;
+        let edge = 16.0;
+        let x = f32::from(position.x);
+        let left = f32::from(bounds.origin.x) + edge;
+        let right = f32::from(bounds.right()) - edge;
+        let h_delta = if x < left {
+            Some(px(-((left - x).clamp(12.0, 64.0))))
+        } else if x > right {
+            Some(px((x - right).clamp(12.0, 64.0)))
+        } else {
+            None
+        };
+        self.selection_h_auto_scroll.set(h_delta, cx, |delta, this, cx| {
+            this.doc.viewport_mut().scroll_h_by(f32::from(delta));
+            if let Some(selection) = this.text_selection.as_mut() {
+                if let Some(file_line) = this.doc.row_to_file_line(selection.active.view_row) {
+                    let text = this
+                        .edits
+                        .get(&file_line)
+                        .cloned()
+                        .or_else(|| this.doc.line_text(file_line))
+                        .unwrap_or_default();
+                    let steps = (f32::from(delta).abs() / (this.font_size * 0.62).max(1.0))
+                        .ceil() as usize;
+                    if delta > px(0.) {
+                        for _ in 0..steps {
+                            selection.active.byte = next_char_boundary(&text, selection.active.byte);
+                        }
+                    } else {
+                        for _ in 0..steps {
+                            selection.active.byte = prev_char_boundary(&text, selection.active.byte);
+                        }
+                    }
+                    this.apply_text_selection(cx);
+                }
+            }
+            cx.notify();
+        });
     }
 
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1057,10 +1188,14 @@ impl LogView {
 
     fn row_at_y(&self, y: f32) -> Option<u64> {
         let area = self.last_area;
-        let local = y - f32::from(area.origin.y);
-        if local < 0. || local > f32::from(area.size.height) {
+        if area.size.height <= px(0.) {
             return None;
         }
+        // Clamp to the viewport edge. This is important during a drag: once
+        // the pointer leaves the view, the endpoint should remain on the first
+        // or last visible row while auto-scroll advances the viewport.
+        let local = (y - f32::from(area.origin.y))
+            .clamp(0.0, f32::from(area.size.height).max(1.0));
         let visible_offset = ((local + self.doc.viewport().pixel_offset()) / self.line_height)
             .floor()
             .max(0.) as u64;
@@ -1203,24 +1338,6 @@ impl LogView {
         (f32::from(a.origin.y), height)
     }
 
-    fn on_scrollbar_down(&mut self, y: f32, cx: &mut Context<Self>) {
-        let (top, len) = self.track();
-        let (thumb_off, thumb_len) = self.doc.viewport().thumb(len, theme::MIN_THUMB);
-        let local = y - top;
-        if local >= thumb_off && local <= thumb_off + thumb_len {
-            // 抓住滑块本体，拖动时保持相对位置
-            self.drag_grab = Some(local - thumb_off);
-        } else {
-            // 点空白轨道：滑块中心跳到点击处
-            let grab = thumb_len / 2.0;
-            self.drag_grab = Some(grab);
-            self.doc
-                .viewport_mut()
-                .set_thumb_offset(local - grab, len, theme::MIN_THUMB);
-        }
-        cx.notify();
-    }
-
     fn on_drag_move(&mut self, y: f32, cx: &mut Context<Self>) {
         let Some(grab) = self.drag_grab else { return };
         let (top, len) = self.track();
@@ -1237,35 +1354,6 @@ impl LogView {
             (f32::from(a.size.width) - gutter_w - if vertical { theme::SCROLLBAR_W } else { 0.0 })
                 .max(0.0);
         (left, width)
-    }
-
-    fn on_hscrollbar_down(
-        &mut self,
-        x: f32,
-        gutter_w: f32,
-        vertical: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let (left, track) = self.h_track(gutter_w, vertical);
-        let viewport_width = track;
-        let (thumb_off, thumb_len) =
-            self.doc
-                .viewport()
-                .h_thumb(track, viewport_width, theme::MIN_THUMB);
-        let local = x - left;
-        if local >= thumb_off && local <= thumb_off + thumb_len {
-            self.h_drag_grab = Some(local - thumb_off);
-        } else {
-            let grab = thumb_len / 2.0;
-            self.h_drag_grab = Some(grab);
-            self.doc.viewport_mut().set_h_thumb_offset(
-                local - grab,
-                track,
-                viewport_width,
-                theme::MIN_THUMB,
-            );
-        }
-        cx.notify();
     }
 
     fn on_hdrag_move(&mut self, x: f32, gutter_w: f32, vertical: bool, cx: &mut Context<Self>) {
@@ -1321,6 +1409,25 @@ impl LogView {
                 let start_x = f32::from(shaped.x_for_index(range.start));
                 let end_x = f32::from(shaped.x_for_index(range.end));
                 Some((8.0 + start_x - h_scroll, (end_x - start_x).max(1.0)))
+            });
+        let caret_x = self
+            .text_selection
+            .filter(|selection| selection.is_empty() && selection.active.view_row == view_row)
+            .map(|selection| {
+                let text = input.read(cx).value();
+                let run = TextRun {
+                    len: text.len(),
+                    font: font(theme::MONO),
+                    ..Default::default()
+                };
+                let shaped = window.text_system().shape_line(
+                    text,
+                    px(row_font_size.unwrap_or(self.font_size)),
+                    &[run],
+                    None,
+                );
+                8.0 + f32::from(shaped.x_for_index(selection.active.byte.min(shaped.len())))
+                    - h_scroll
             });
 
         let mut content = div()
@@ -1401,6 +1508,17 @@ impl LogView {
                         .bg(palette.selection),
                 )
             })
+            .when_some(caret_x, |el, left| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .bottom(px(2.))
+                        .left(px(left))
+                        .w(px(1.))
+                        .bg(palette.foreground),
+                )
+            })
             .when(!is_editing, |el| {
                 el.child(
                     div()
@@ -1415,7 +1533,12 @@ impl LogView {
                         .child(content),
                 )
             })
-            .child(input);
+            // InputState is only mounted while editing. Keeping a transparent
+            // read-only Input over every row steals pointer hit-testing from the
+            // viewport (its caret snaps to the line end and it consumes wheel
+            // events), which makes drag selection feel offset and prevents
+            // scrolling. Read-only rows use the LogView selection model below.
+            .when(is_editing, |el| el.child(input));
         let line_content = if let Some((_, epoch)) = self
             .search_result_flash
             .filter(|(file_line, _)| *file_line == row.file_line)
@@ -1458,7 +1581,14 @@ impl LogView {
                     let in_content = f32::from(event.position.x)
                         >= f32::from(this.last_area.origin.x) + gutter_w;
                     if in_content {
-                        this.begin_text_selection(view_row, cx);
+                        this.begin_text_selection(
+                            view_row,
+                            event.position,
+                            gutter_w,
+                            row_font_size.unwrap_or(this.font_size),
+                            window,
+                            cx,
+                        );
                         return;
                     }
                     if this.editing_line.is_some() {
@@ -1550,6 +1680,11 @@ impl Render for LogView {
                 .viewport_mut()
                 .set_height(f32::from(area.size.height));
         }
+        if self.scrollbar_handle.changed.replace(false) {
+            let requested = self.scrollbar_handle.fraction.get();
+            self.doc.viewport_mut().set_scroll_fraction(requested.y);
+            self.doc.viewport_mut().set_h_scroll_fraction(requested.x);
+        }
 
         let gutter_w = self.gutter_width();
         let configured_line_height = self
@@ -1620,9 +1755,9 @@ impl Render for LogView {
             })
         .max(0.0);
         self.doc.viewport_mut().set_height(viewport_height);
-        let (thumb_off, thumb_len) = self.doc.viewport().thumb(viewport_height, theme::MIN_THUMB);
-        let (h_track_left, h_track_len) = self.h_track(gutter_w, show_vertical);
-        let (h_thumb_off, h_thumb_len) =
+        let (_thumb_off, _thumb_len) = self.doc.viewport().thumb(viewport_height, theme::MIN_THUMB);
+        let (_h_track_left, h_track_len) = self.h_track(gutter_w, show_vertical);
+        let (_h_thumb_off, _h_thumb_len) =
             self.doc
                 .viewport()
                 .h_thumb(h_track_len, h_track_len, theme::MIN_THUMB);
@@ -1630,6 +1765,25 @@ impl Render for LogView {
         let h_scroll = vp.h_scroll();
         let pixel_offset = vp.pixel_offset();
         let first_row = vp.anchor_line();
+        self.scrollbar_handle.fraction.set(point(
+            if self.doc.viewport().max_h_scroll() > 0.0 {
+                self.doc.viewport().h_scroll() / self.doc.viewport().max_h_scroll()
+            } else { 0.0 },
+            self.doc.viewport().scroll_fraction(),
+        ));
+        let content_height = (self.doc.display_rows() as f32 * self.line_height).max(full_height);
+        self.scrollbar_handle.content.set(size(
+            px(self.max_line_width.max(content_viewport_width)),
+            px(content_height),
+        ));
+        let scrollbar = Scrollbar::vertical(&self.scrollbar_handle)
+            .id("logd-native-vscrollbar")
+            .mode(ScrollbarMode::Always)
+            .viewport_bounds(area);
+        let h_scrollbar = Scrollbar::horizontal(&self.scrollbar_handle)
+            .id("logd-native-hscrollbar")
+            .mode(ScrollbarMode::Always)
+            .viewport_bounds(area);
         self.sync_line_inputs(&rows, h_scroll, window, cx);
         let rendered_rows = rows
             .iter()
@@ -1680,8 +1834,10 @@ impl Render for LogView {
                 }
                 if this.text_selecting && ev.pressed_button == Some(MouseButton::Left) {
                     this.extend_text_selection(ev.position, gutter_w, window, cx);
+                    this.update_selection_auto_scroll(ev.position, cx);
                 } else if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
                     this.extend_selection_to_y(f32::from(ev.position.y), cx);
+                    this.update_selection_auto_scroll(ev.position, cx);
                 }
             }))
             .on_mouse_up(
@@ -1689,6 +1845,9 @@ impl Render for LogView {
                 cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
                     this.selecting = false;
                     this.text_selecting = false;
+                    this.selection_drag_position = None;
+                    this.selection_auto_scroll.stop();
+                    this.selection_h_auto_scroll.stop();
                 }),
             )
             // 量视口尺寸：prepaint 回填，尺寸真变了才 notify，避免每帧重画
@@ -1709,9 +1868,8 @@ impl Render for LogView {
                     move |bounds, _, window, _| {
                         window.on_mouse_event({
                             let scroll_handle = drag_handle.clone();
-                            move |ev: &ScrollWheelEvent, phase, window, cx| {
-                                if phase != DispatchPhase::Capture || !bounds.contains(&ev.position)
-                                {
+                            move |ev: &ScrollWheelEvent, _phase, window, cx| {
+                                if !bounds.contains(&ev.position) {
                                     return;
                                 }
                                 if scroll_handle
@@ -1727,7 +1885,7 @@ impl Render for LogView {
                         });
                         window.on_mouse_event({
                             let drag_handle = drag_handle.clone();
-                            move |ev: &MouseMoveEvent, phase, _, cx| {
+                            move |ev: &MouseMoveEvent, phase, window, cx| {
                                 if phase != DispatchPhase::Capture
                                     || ev.pressed_button != Some(MouseButton::Left)
                                 {
@@ -1744,6 +1902,21 @@ impl Render for LogView {
                                             );
                                         } else if this.drag_grab.is_some() {
                                             this.on_drag_move(f32::from(ev.position.y), cx);
+                                        } else if this.text_selecting {
+                                            // This listener is registered on the window in
+                                            // capture phase, so it continues receiving pointer
+                                            // moves after the cursor leaves the viewport. That
+                                            // is what enables edge auto-scroll during selection.
+                                            this.extend_text_selection(
+                                                ev.position,
+                                                gutter_w,
+                                                window,
+                                                cx,
+                                            );
+                                            this.update_selection_auto_scroll(ev.position, cx);
+                                        } else if this.selecting {
+                                            this.extend_selection_to_y(f32::from(ev.position.y), cx);
+                                            this.update_selection_auto_scroll(ev.position, cx);
                                         }
                                     })
                                     .ok();
@@ -1761,6 +1934,14 @@ impl Render for LogView {
                                         let was_dragging = this.drag_grab.take().is_some();
                                         let was_h_dragging = this.h_drag_grab.take().is_some();
                                         if was_dragging || was_h_dragging {
+                                            cx.notify();
+                                        }
+                                        if this.text_selecting || this.selecting {
+                                            this.text_selecting = false;
+                                            this.selecting = false;
+                                            this.selection_drag_position = None;
+                                            this.selection_auto_scroll.stop();
+                                            this.selection_h_auto_scroll.stop();
                                             cx.notify();
                                         }
                                     })
@@ -1782,97 +1963,25 @@ impl Render for LogView {
                     .flex_col()
                     .children(rendered_rows),
             )
-            .when(show_vertical, |el| {
-                el.child(
-                    div()
-                        .id("vscrollbar")
-                        .absolute()
-                        .top_0()
-                        .bottom(if show_horizontal {
-                            px(theme::SCROLLBAR_W)
-                        } else {
-                            px(0.)
-                        })
-                        .right_0()
-                        .w(px(theme::SCROLLBAR_W))
-                        .cursor_default()
-                        .group("log-vscrollbar")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                                cx.stop_propagation();
-                                this.on_scrollbar_down(f32::from(ev.position.y), cx);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(thumb_off))
-                                .right(px(4.))
-                                .w(px(4.))
-                                .h(px(thumb_len))
-                                .rounded_sm()
-                                .bg(if self.drag_grab.is_some() {
-                                    palette.scroll_thumb_hover
-                                } else {
-                                    palette.scroll_thumb
-                                })
-                                .group_hover("log-vscrollbar", |style| {
-                                    style.right(px(2.)).w(px(8.)).bg(palette.scroll_thumb_hover)
-                                }),
-                        ),
-                )
-            })
-            .when(show_horizontal, |el| {
-                el.child(
-                    div()
-                        .id("hscrollbar")
-                        .absolute()
-                        .left(px(h_track_left - f32::from(area.origin.x)))
-                        .right(if show_vertical {
-                            px(theme::SCROLLBAR_W)
-                        } else {
-                            px(0.)
-                        })
-                        .bottom_0()
-                        .h(px(theme::SCROLLBAR_W))
-                        .cursor_default()
-                        .group("log-hscrollbar")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                                cx.stop_propagation();
-                                this.on_hscrollbar_down(
-                                    f32::from(ev.position.x),
-                                    gutter_w,
-                                    show_vertical,
-                                    cx,
-                                );
-                            }),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(h_thumb_off))
-                                .bottom(px(4.))
-                                .h(px(4.))
-                                .w(px(h_thumb_len))
-                                .rounded_sm()
-                                .bg(if self.h_drag_grab.is_some() {
-                                    palette.scroll_thumb_hover
-                                } else {
-                                    palette.scroll_thumb
-                                })
-                                .group_hover("log-hscrollbar", |style| {
-                                    style
-                                        .bottom(px(2.))
-                                        .h(px(8.))
-                                        .bg(palette.scroll_thumb_hover)
-                                }),
-                        ),
-                )
-            })
+            .when(show_vertical, |el| el.child(scrollbar))
+            .when(show_horizontal, |el| el.child(h_scrollbar))
     }
+}
+
+fn next_char_boundary(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    if byte == text.len() { return byte; }
+    byte += 1;
+    while byte < text.len() && !text.is_char_boundary(byte) { byte += 1; }
+    byte
+}
+
+fn prev_char_boundary(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    if byte == 0 { return 0; }
+    byte -= 1;
+    while byte > 0 && !text.is_char_boundary(byte) { byte -= 1; }
+    byte
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ semver = "1.0.27"
 ureq = "3.4.1"
 kaishin = "0.7.1"
 tokio = { version = "1.53.1", features = ["rt", "net", "time"] }
+logdrain = "0.3.2"
 # zed 这两条必须用**原始 github 地址**，不能走 gh-proxy 镜像：
 # gpui-component 自己的 manifest 里写死的是 https://github.com/zed-industries/zed，
 # cargo 按 URL 字符串区分 source，地址不一致就会拉进两份 gpui，

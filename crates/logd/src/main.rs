@@ -12,6 +12,7 @@
 mod app;
 mod i18n;
 mod log_view;
+mod log_analysis;
 mod platform;
 mod settings;
 mod theme;

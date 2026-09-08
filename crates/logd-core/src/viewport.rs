@@ -246,6 +246,17 @@ impl Viewport {
         (self.scroll_lines() / max).clamp(0.0, 1.0) as f32
     }
 
+    /// Set vertical position from a normalized scrollbar fraction.
+    pub fn set_scroll_fraction(&mut self, fraction: f32) {
+        let max = self.max_scroll_lines();
+        self.set_scroll_lines((fraction.clamp(0.0, 1.0) as f64) * max);
+    }
+
+    /// Set horizontal position from a normalized scrollbar fraction.
+    pub fn set_h_scroll_fraction(&mut self, fraction: f32) {
+        self.h_scroll = fraction.clamp(0.0, 1.0) * self.max_h_scroll;
+    }
+
     /// 返回 `(滑块顶端在轨道上的偏移, 滑块长度)`，单位像素。
     ///
     /// 内容装得下时返回整条轨道，调用方可据此隐藏滚动条。

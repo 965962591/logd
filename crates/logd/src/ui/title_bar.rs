@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{h_flex, Icon, IconName, InteractiveElementExt as _, Sizable as _};
+use gpui_component::{h_flex, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _};
 
 use crate::i18n::{text, Key, Language};
 use crate::theme;
@@ -30,6 +30,7 @@ pub fn panel_toggle(
     open_icon: IconName,
     closed_icon: IconName,
     open: bool,
+    disabled: bool,
     tooltip: impl Into<SharedString>,
     action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -38,6 +39,7 @@ pub fn panel_toggle(
         .small()
         .ghost()
         .toggled(open)
+        .disabled(disabled)
         .tab_stop(false)
         .tooltip(tooltip)
         .on_click(move |event, window, cx| {

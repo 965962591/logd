@@ -26,6 +26,7 @@ semver.workspace = true
 ureq.workspace = true
 kaishin.workspace = true
 tokio.workspace = true
+logdrain.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0.11"
