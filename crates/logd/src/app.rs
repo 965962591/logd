@@ -246,20 +246,20 @@ impl Render for UpdateDialog {
                             });
                         }),
                 )
-                .child(
-                    Button::new("close-about")
-                        .label(text(Key::Close, language))
-                        .disabled(matches!(
-                            self.status,
-                            UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
-                        ))
-                        .on_click(window.listener_for(
-                            &close,
-                            |_: &mut UpdateDialog, _, window, cx| {
-                                window.close_dialog(cx);
-                            },
-                        )),
-                ),
+                // .child(
+                //     Button::new("close-about")
+                //         .label(text(Key::Close, language))
+                //         .disabled(matches!(
+                //             self.status,
+                //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+                //         ))
+                //         .on_click(window.listener_for(
+                //             &close,
+                //             |_: &mut UpdateDialog, _, window, cx| {
+                //                 window.close_dialog(cx);
+                //             },
+                //         )),
+                // ),
         )
     }
 }
