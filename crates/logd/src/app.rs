@@ -58,7 +58,10 @@ struct SearchResultFile {
     expanded: bool,
 }
 
-const DOCK_LAYOUT_VERSION: usize = 3;
+// Nested splits keep one flexible child.  Older layouts used fixed sizes for
+// both the Filters and LogDrain children; when one hidden panel was measured
+// as zero-sized, gpui-kit repeatedly renormalized the split during a drag.
+const DOCK_LAYOUT_VERSION: usize = 4;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
@@ -569,7 +572,7 @@ impl LogdApp {
                     .child(
                         DockLayout::v_split()
                             .child(filters, Some(px(360.)))
-                            .child(analysis, Some(px(360.))),
+                            .child(analysis, None),
                         Some(px(360.)),
                     )
                     .child(
@@ -582,7 +585,7 @@ impl LogdApp {
                     DockLayout::h_split().child(search_results, None).child(
                         DockLayout::v_split()
                             .child(filters, Some(px(240.)))
-                            .child(analysis, Some(px(240.))),
+                            .child(analysis, None),
                         Some(px(360.)),
                     ),
                     Some(px(240.)),
@@ -597,7 +600,7 @@ impl LogdApp {
                     .child(
                         DockLayout::v_split()
                             .child(filters, Some(px(360.)))
-                            .child(analysis, Some(px(360.))),
+                            .child(analysis, None),
                         Some(px(360.)),
                     ),
             };
@@ -1510,6 +1513,7 @@ impl LogdApp {
     ) {
         self.filter_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
+        self.normalize_hidden_dock_panels(window, cx);
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
@@ -1523,6 +1527,7 @@ impl LogdApp {
     ) {
         self.search_results_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
+        self.normalize_hidden_dock_panels(window, cx);
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
@@ -2301,6 +2306,7 @@ impl LogdApp {
     ) {
         self.analysis_dock_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
+        self.normalize_hidden_dock_panels(window, cx);
         if show {
             self.refresh_analysis_if_open(cx);
         } else {
@@ -2309,6 +2315,47 @@ impl LogdApp {
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
+    }
+
+    /// gpui-component keeps hidden split children in their original index so
+    /// their state can be restored. Its resize handles, however, are indexed
+    /// by the original child position. If a middle child is hidden, the next
+    /// visible child then owns a handle for the hidden slot and the remaining
+    /// visible panels can no longer be resized against each other. Rebuild the
+    /// current Dock state with hidden children trailing each StackPanel and
+    /// keep the matching size entries together.
+    fn normalize_hidden_dock_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.dock_area.read(cx).dump(cx);
+        let Ok(mut value) = serde_json::to_value(&state) else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(center) = value.get_mut("center") {
+            changed |= normalize_hidden_stack_children(center);
+        }
+        for dock_key in ["left_dock", "right_dock", "bottom_dock"] {
+            if let Some(panel) = value
+                .get_mut(dock_key)
+                .and_then(|dock| dock.get_mut("panel"))
+            {
+                changed |= normalize_hidden_stack_children(panel);
+            }
+        }
+        if !changed {
+            return;
+        }
+        let Ok(normalized) = serde_json::from_value::<DockAreaState>(value) else {
+            return;
+        };
+        if self
+            .dock_area
+            .update(cx, |dock, cx| dock.load(normalized, window, cx))
+            .is_ok()
+        {
+            // Leave `last_layout_state` untouched. The caller schedules a
+            // debounced save after visibility changes; seeing this normalized
+            // tree as a difference ensures the repaired ordering is persisted.
+        }
     }
 
     /// Keep an open LogDrain panel synchronized with the active imported log.
@@ -3410,6 +3457,86 @@ fn parse_time_shorthand(value: &str) -> Option<String> {
 
 fn quote_query_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn normalize_hidden_stack_children(value: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    if let Some(children) = value.get_mut("children").and_then(|v| v.as_array_mut()) {
+        for child in children.iter_mut() {
+            changed |= normalize_hidden_stack_children(child);
+        }
+    }
+
+    let is_stack = value
+        .get("info")
+        .and_then(|info| info.get("stack"))
+        .is_some();
+    if !is_stack {
+        return changed;
+    }
+
+    let Some(children_snapshot) = value.get("children").and_then(|v| v.as_array()).cloned() else {
+        return changed;
+    };
+    let Some(sizes_snapshot) = value
+        .get("info")
+        .and_then(|info| info.get("stack"))
+        .and_then(|stack| stack.get("sizes"))
+        .and_then(|sizes| sizes.as_array())
+        .cloned()
+    else {
+        return changed;
+    };
+    if children_snapshot.len() <= 1 || sizes_snapshot.len() != children_snapshot.len() {
+        return changed;
+    }
+
+    let mut visible = Vec::with_capacity(children_snapshot.len());
+    let mut hidden = Vec::with_capacity(children_snapshot.len());
+    for (index, child) in children_snapshot.into_iter().enumerate() {
+        let size = sizes_snapshot
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0));
+        if panel_state_visible(&child) {
+            visible.push((child, size));
+        } else {
+            hidden.push((child, size));
+        }
+    }
+    if hidden.is_empty() || visible.is_empty() {
+        return changed;
+    }
+
+    let mut ordered = visible;
+    ordered.extend(hidden);
+    let children = ordered.iter().map(|(child, _)| child.clone()).collect();
+    let sizes = ordered.into_iter().map(|(_, size)| size).collect();
+    if let Some(target) = value.get_mut("children").and_then(|v| v.as_array_mut()) {
+        *target = children;
+    }
+    if let Some(target) = value
+        .get_mut("info")
+        .and_then(|info| info.get_mut("stack"))
+        .and_then(|stack| stack.get_mut("sizes"))
+        .and_then(|sizes| sizes.as_array_mut())
+    {
+        *target = sizes;
+    }
+    true
+}
+
+fn panel_state_visible(value: &serde_json::Value) -> bool {
+    if let Some(panel) = value.get("info").and_then(|info| info.get("panel")) {
+        return panel
+            .get("visible")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+    }
+    value
+        .get("children")
+        .and_then(|children| children.as_array())
+        .is_some_and(|children| children.iter().any(panel_state_visible))
 }
 
 fn filter_scope_label(scope: FilterScope, lang: Language) -> &'static str {
