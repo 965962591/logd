@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -22,6 +23,7 @@ use gpui_component::dock::{
 };
 use gpui_component::input::{Enter, Input, InputEvent, InputState};
 use gpui_component::link::Link;
+use gpui_component::progress::Progress;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
@@ -59,6 +61,114 @@ const DOCK_LAYOUT_VERSION: usize = 2;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
+
+struct UpdateDialog {
+    language: Language,
+    sender: Sender<crate::updater::ManualUpdateEvent>,
+    receiver: Receiver<crate::updater::ManualUpdateEvent>,
+    status: UpdateStatus,
+}
+
+enum UpdateStatus {
+    Idle,
+    Checking,
+    Available(crate::updater::ManualRelease),
+    Downloading { version: String, downloaded: u64, total: u64 },
+    UpToDate,
+    Error(String),
+    Restarting,
+}
+
+impl UpdateDialog {
+    fn new(language: Language) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        Self { language, sender, receiver, status: UpdateStatus::Idle }
+    }
+
+    fn check(&mut self) {
+        if matches!(self.status, UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Restarting) {
+            return;
+        }
+        self.status = UpdateStatus::Checking;
+        crate::updater::check_manual_update(self.sender.clone());
+    }
+
+    fn download(&mut self) {
+        let UpdateStatus::Available(release) = &self.status else { return; };
+        let release = release.clone();
+        self.status = UpdateStatus::Downloading { version: release.version.clone(), downloaded: 0, total: release.size };
+        crate::updater::download_and_restart(release, self.sender.clone());
+    }
+
+    fn poll(&mut self) -> bool {
+        let mut restarting = false;
+        while let Ok(event) = self.receiver.try_recv() {
+            match event {
+                crate::updater::ManualUpdateEvent::Available(release) => self.status = UpdateStatus::Available(release),
+                crate::updater::ManualUpdateEvent::UpToDate => self.status = UpdateStatus::UpToDate,
+                crate::updater::ManualUpdateEvent::Progress { downloaded, total } => {
+                    let version = match &self.status {
+                        UpdateStatus::Downloading { version, .. } => version.clone(),
+                        _ => String::new(),
+                    };
+                    self.status = UpdateStatus::Downloading { version, downloaded, total };
+                }
+                crate::updater::ManualUpdateEvent::Restarting => {
+                    self.status = UpdateStatus::Restarting;
+                    restarting = true;
+                }
+                crate::updater::ManualUpdateEvent::Error(error) => self.status = UpdateStatus::Error(error),
+            }
+        }
+        restarting
+    }
+}
+
+impl Render for UpdateDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        let check = cx.entity().clone();
+        let download = cx.entity().clone();
+        let (status_text, progress, can_download) = match &self.status {
+            UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
+            UpdateStatus::Checking => (text(Key::CheckingForUpdates, language).to_string(), None, false),
+            UpdateStatus::Available(release) => (format!("{}: {}", text(Key::UpdateAvailable, language), release.version), None, true),
+            UpdateStatus::Downloading { version, downloaded, total } => {
+                let percent = if *total == 0 { 0.0 } else { (*downloaded as f32 / *total as f32) * 100.0 };
+                (format!("{} {} ({:.0}%)", text(Key::DownloadingUpdate, language), version, percent), Some(percent), false)
+            }
+            UpdateStatus::UpToDate => (text(Key::AlreadyUpToDate, language).to_string(), None, false),
+            UpdateStatus::Error(error) => (format!("{}: {}", text(Key::UpdateFailed, language), error), None, false),
+            UpdateStatus::Restarting => (text(Key::Restarting, language).to_string(), None, false),
+        };
+        let mut content = v_flex().gap_2().child(status_text);
+        if let Some(value) = progress {
+            content = content.child(Progress::new("update-progress").value(value).w_full());
+        }
+        content
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("check-update")
+                            .label(text(Key::CheckForUpdates, language))
+                            .disabled(matches!(self.status, UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Restarting))
+                            .on_click(move |_, _, cx| {
+                                check.update(cx, |this, cx| { this.check(); cx.notify(); });
+                            }),
+                    )
+                    .child(
+                        Button::new("download-update")
+                            .primary()
+                            .label(text(Key::InstallUpdate, language))
+                            .disabled(!can_download)
+                            .on_click(move |_, _, cx| {
+                                download.update(cx, |this, cx| { this.download(); cx.notify(); });
+                            }),
+                    ),
+            )
+    }
+}
 
 #[derive(Clone)]
 struct TabDrag {
@@ -1184,7 +1294,21 @@ impl LogdApp {
 
     fn show_about_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let language = self.language;
-        window.open_alert_dialog(cx, move |alert, window, _| {
+        let update = cx.new(|_| UpdateDialog::new(language));
+        let poll_update = update.clone();
+        cx.spawn(async move |_app, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(50)).await;
+            let mut restarting = false;
+            poll_update.update(cx, |this, cx| {
+                restarting = this.poll();
+                cx.notify();
+            });
+            if restarting {
+                std::process::exit(0);
+            }
+        })
+        .detach();
+        window.open_alert_dialog(cx, move |alert, _window, _| {
             alert
                 .title("logd")
                 .description(
@@ -1225,7 +1349,8 @@ impl LogdApp {
                                         .href(format!("mailto:{CONTACT_EMAIL}"))
                                         .child(CONTACT_EMAIL),
                                 ),
-                        ),
+                        )
+                        .child(div().mt_2().w_full().child(update.clone())),
                 )
                 .footer(
                     DialogFooter::new().child(

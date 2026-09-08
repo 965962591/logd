@@ -3788,8 +3788,11 @@ dependencies = [
  "logd-core",
  "parking_lot",
  "rayon",
+ "semver",
+ "serde",
  "serde_json",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
