@@ -121,9 +121,6 @@ pub fn render(
         .flex_none()
         .w_full()
         .h(px(HEIGHT))
-        // Window controls are absolutely positioned below. Reserve their
-        // width from the shared flex area so no title-bar content overlaps.
-        .pr(px(WINDOW_CONTROLS_WIDTH))
         .items_center()
         .bg(palette.title_bar)
         .border_b_1()
@@ -175,10 +172,20 @@ pub fn render(
                 .min_w_0()
                 .overflow_hidden()
                 .justify_end()
-                // The space before the window controls needs its own hitbox;
-                // otherwise it cannot move the window on Windows.
-                .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
-                .child(right),
+                .child(
+                    h_flex()
+                        .h_full()
+                        .flex_1()
+                        .min_w_0()
+                        // Reserve the absolutely positioned window controls
+                        // without changing the slot width used for centering.
+                        .pr(px(WINDOW_CONTROLS_WIDTH))
+                        .justify_end()
+                        // The space before the window controls needs its own
+                        // hitbox; otherwise it cannot move the window on Windows.
+                        .child(drag_region("title-drag-right", SIDE_DRAG_MIN_WIDTH))
+                        .child(right),
+                ),
         )
         // Keep native window controls out of the flex flow. They remain
         // anchored to the window edge when the title bar is space-constrained.
