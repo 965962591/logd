@@ -5,7 +5,9 @@ use std::sync::{Arc, LazyLock};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{h_flex, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _};
+use gpui_component::{
+    h_flex, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
+};
 
 use crate::i18n::{text, Key, Language};
 use crate::theme;

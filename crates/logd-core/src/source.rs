@@ -138,6 +138,12 @@ impl Encoding {
         }
     }
 
+    /// Decode one independently-addressable log line with this encoding.
+    /// Invalid byte sequences are replaced instead of failing the scan.
+    pub fn decode_bytes(self, bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+        self.codec().decode_without_bom_handling(bytes).0
+    }
+
     pub(crate) fn codec(self) -> &'static encoding_rs::Encoding {
         match self {
             Encoding::Utf8 => encoding_rs::UTF_8,
@@ -304,7 +310,7 @@ impl FileSource {
             s = self.bom_len.min(e);
         }
         let bytes = &data[s..e];
-        self.encoding.codec().decode_without_bom_handling(bytes).0
+        self.encoding.decode_bytes(bytes)
     }
 }
 

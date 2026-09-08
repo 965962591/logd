@@ -14,11 +14,13 @@ use gpui_component::{h_flex, IconName, Sizable as _};
 
 use crate::app::LogdApp;
 use crate::i18n::{text, Key, Language};
+use crate::log_analysis::LogAnalysisPanel;
 use crate::theme;
 
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
 pub const FILTER_PANEL: &str = "logd.filters";
 pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
+pub const ANALYSIS_PANEL: &str = "logd.analysis";
 
 /// Builds the normal component dock, except that the central log workspace
 /// does not draw redundant single-panel chrome above its content.
@@ -151,6 +153,7 @@ fn close_tool_panel_button(
             app.update(cx, |app, cx| match panel_name {
                 FILTER_PANEL => app.show_filter_panel(false, window, cx),
                 SEARCH_RESULTS_PANEL => app.show_search_results(false, window, cx),
+                ANALYSIS_PANEL => app.show_analysis_panel(false, window, cx),
                 _ => {}
             })
             .ok();
@@ -292,7 +295,7 @@ impl TabGroupRenderer for LogdTabGroupSkin {
             }
             [ix] if matches!(
                 group.panels()[*ix].panel_name(cx),
-                FILTER_PANEL | SEARCH_RESULTS_PANEL
+                FILTER_PANEL | SEARCH_RESULTS_PANEL | ANALYSIS_PANEL
             ) =>
             {
                 self.render_tool_panel_title(group, *ix, window, cx)
@@ -334,6 +337,7 @@ pub fn register_logd_panels(
     workspace: &Entity<LogPanel>,
     filters: &Entity<FilterPanel>,
     search_results: &Entity<SearchResultsPanel>,
+    analysis: &Entity<AnalysisPanel>,
     cx: &mut App,
 ) {
     register_panel(cx, WORKSPACE_PANEL, {
@@ -356,6 +360,15 @@ pub fn register_logd_panels(
                 search_results.update(cx, |panel, cx| panel.set_visible(visible, cx));
             }
             panel_handle(search_results.clone())
+        }
+    });
+    register_panel(cx, ANALYSIS_PANEL, {
+        let analysis = analysis.clone();
+        move |context, _, cx| {
+            if let Some(visible) = restored_visibility(context.info()) {
+                analysis.update(cx, |panel, cx| panel.set_visible(visible, cx));
+            }
+            panel_handle(analysis.clone())
         }
     });
 }
@@ -561,6 +574,90 @@ pub struct SearchResultsPanel {
     collapsed_files: HashSet<PathBuf>,
     content_width: f32,
     visible: bool,
+}
+
+pub struct AnalysisPanel {
+    app: WeakEntity<LogdApp>,
+    content: Entity<LogAnalysisPanel>,
+    focus: FocusHandle,
+    visible: bool,
+}
+
+impl AnalysisPanel {
+    pub fn new(
+        app: WeakEntity<LogdApp>,
+        content: Entity<LogAnalysisPanel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if let Some(app) = app.upgrade() {
+            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        }
+        Self {
+            app,
+            content,
+            focus: cx.focus_handle(),
+            visible: false,
+        }
+    }
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
+    }
+}
+
+impl BasePanel for AnalysisPanel {
+    fn panel_name(&self) -> &'static str {
+        ANALYSIS_PANEL
+    }
+    fn visible(&self, _: &App) -> bool {
+        self.visible
+    }
+    fn closable(&self, _: &App) -> bool {
+        false
+    }
+    fn dump(&self, _: &App) -> PanelState {
+        visibility_state(ANALYSIS_PANEL, self.visible)
+    }
+}
+impl Panel for AnalysisPanel {
+    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        "LogDrain 分析"
+    }
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
+    fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        let language = self
+            .app
+            .upgrade()
+            .map(|a| a.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button(
+            "close-analysis-panel",
+            ANALYSIS_PANEL,
+            self.app.clone(),
+            language,
+        )])
+    }
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
+    }
+}
+impl EventEmitter<PanelEvent> for AnalysisPanel {}
+impl Focusable for AnalysisPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+impl Render for AnalysisPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.content.clone().into_any_element()
+    }
 }
 
 impl SearchResultsPanel {

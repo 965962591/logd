@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -23,21 +23,21 @@ use gpui_component::dock::{
 };
 use gpui_component::input::{Enter, Input, InputEvent, InputState};
 use gpui_component::link::Link;
-use gpui_component::progress::Progress;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_component::progress::Progress;
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::{
-    h_flex, h_resizable, resizable_panel, v_flex, ActiveTheme as _, Disableable as _, Icon,
-    IconName, InteractiveElementExt as _, Root, Selectable as _, Sizable, WindowExt as _,
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
+    Root, Selectable as _, Sizable, WindowExt as _,
 };
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, LogdFile, TatFile};
 
 use crate::i18n::{text, Key, Language};
-use crate::log_view::LogView;
 use crate::log_analysis::LogAnalysisPanel;
+use crate::log_view::LogView;
 use crate::theme;
 use crate::ui::dock::{
-    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, SearchResultsPanel,
+    logd_dock_area, register_logd_panels, AnalysisPanel, FilterPanel, LogPanel, SearchResultsPanel,
 };
 use crate::ui::title_bar;
 
@@ -58,7 +58,7 @@ struct SearchResultFile {
     expanded: bool,
 }
 
-const DOCK_LAYOUT_VERSION: usize = 2;
+const DOCK_LAYOUT_VERSION: usize = 3;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
@@ -74,7 +74,11 @@ enum UpdateStatus {
     Idle,
     Checking,
     Available(crate::updater::ManualRelease),
-    Downloading { version: String, downloaded: u64, total: u64 },
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: u64,
+    },
     UpToDate,
     Error(String),
     Restarting,
@@ -83,11 +87,19 @@ enum UpdateStatus {
 impl UpdateDialog {
     fn new(language: Language) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
-        Self { language, sender, receiver, status: UpdateStatus::Idle }
+        Self {
+            language,
+            sender,
+            receiver,
+            status: UpdateStatus::Idle,
+        }
     }
 
     fn check(&mut self) {
-        if matches!(self.status, UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Restarting) {
+        if matches!(
+            self.status,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+        ) {
             return;
         }
         self.status = UpdateStatus::Checking;
@@ -95,9 +107,15 @@ impl UpdateDialog {
     }
 
     fn download(&mut self) {
-        let UpdateStatus::Available(release) = &self.status else { return; };
+        let UpdateStatus::Available(release) = &self.status else {
+            return;
+        };
         let release = release.clone();
-        self.status = UpdateStatus::Downloading { version: release.version.clone(), downloaded: 0, total: release.size };
+        self.status = UpdateStatus::Downloading {
+            version: release.version.clone(),
+            downloaded: 0,
+            total: release.size,
+        };
         crate::updater::download_and_restart(release, self.sender.clone());
     }
 
@@ -105,20 +123,28 @@ impl UpdateDialog {
         let mut restarting = false;
         while let Ok(event) = self.receiver.try_recv() {
             match event {
-                crate::updater::ManualUpdateEvent::Available(release) => self.status = UpdateStatus::Available(release),
+                crate::updater::ManualUpdateEvent::Available(release) => {
+                    self.status = UpdateStatus::Available(release)
+                }
                 crate::updater::ManualUpdateEvent::UpToDate => self.status = UpdateStatus::UpToDate,
                 crate::updater::ManualUpdateEvent::Progress { downloaded, total } => {
                     let version = match &self.status {
                         UpdateStatus::Downloading { version, .. } => version.clone(),
                         _ => String::new(),
                     };
-                    self.status = UpdateStatus::Downloading { version, downloaded, total };
+                    self.status = UpdateStatus::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    };
                 }
                 crate::updater::ManualUpdateEvent::Restarting => {
                     self.status = UpdateStatus::Restarting;
                     restarting = true;
                 }
-                crate::updater::ManualUpdateEvent::Error(error) => self.status = UpdateStatus::Error(error),
+                crate::updater::ManualUpdateEvent::Error(error) => {
+                    self.status = UpdateStatus::Error(error)
+                }
             }
         }
         restarting
@@ -133,10 +159,30 @@ impl Render for UpdateDialog {
         let close = cx.entity().clone();
         let (status_text, progress, can_download) = match &self.status {
             UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
-            UpdateStatus::Checking => (text(Key::CheckingForUpdates, language).to_string(), None, false),
-            UpdateStatus::Available(release) => (format!("{}: {}", text(Key::UpdateAvailable, language), release.version), None, true),
-            UpdateStatus::Downloading { version, downloaded, total } => {
-                let percent = if *total == 0 { 0.0 } else { (*downloaded as f32 / *total as f32) * 100.0 };
+            UpdateStatus::Checking => (
+                text(Key::CheckingForUpdates, language).to_string(),
+                None,
+                false,
+            ),
+            UpdateStatus::Available(release) => (
+                format!(
+                    "{}: {}",
+                    text(Key::UpdateAvailable, language),
+                    release.version
+                ),
+                None,
+                true,
+            ),
+            UpdateStatus::Downloading {
+                version,
+                downloaded,
+                total,
+            } => {
+                let percent = if *total == 0 {
+                    0.0
+                } else {
+                    (*downloaded as f32 / *total as f32) * 100.0
+                };
                 (
                     format!(
                         "{} {} ({:.0}%, {} / {})",
@@ -150,50 +196,68 @@ impl Render for UpdateDialog {
                     false,
                 )
             }
-            UpdateStatus::UpToDate => (text(Key::AlreadyUpToDate, language).to_string(), None, false),
-            UpdateStatus::Error(error) => (format!("{}: {}", text(Key::UpdateFailed, language), error), None, false),
+            UpdateStatus::UpToDate => (
+                text(Key::AlreadyUpToDate, language).to_string(),
+                None,
+                false,
+            ),
+            UpdateStatus::Error(error) => (
+                format!("{}: {}", text(Key::UpdateFailed, language), error),
+                None,
+                false,
+            ),
             UpdateStatus::Restarting => (text(Key::Restarting, language).to_string(), None, false),
         };
         let mut content = v_flex().gap_2().child(status_text);
         if let Some(value) = progress {
             content = content.child(Progress::new("update-progress").value(value).w_full());
         }
-        content
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("check-update")
-                            .label(text(Key::CheckForUpdates, language))
-                            .disabled(matches!(self.status, UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Restarting))
-                            .on_click(move |_, _, cx| {
-                                check.update(cx, |this, cx| { this.check(); cx.notify(); });
-                            }),
-                    )
-                    .child(
-                        Button::new("download-update")
-                            .primary()
-                            .label(text(Key::InstallUpdate, language))
-                            .disabled(!can_download)
-                            .on_click(move |_, _, cx| {
-                                download.update(cx, |this, cx| { this.download(); cx.notify(); });
-                            }),
-                    )
-                    .child(
-                        Button::new("close-about")
-                            .label(text(Key::Close, language))
-                            .disabled(matches!(
-                                self.status,
-                                UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
-                            ))
-                            .on_click(window.listener_for(
-                                &close,
-                                |_: &mut UpdateDialog, _, window, cx| {
-                                    window.close_dialog(cx);
-                                },
-                            )),
-                    ),
-            )
+        content.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("check-update")
+                        .label(text(Key::CheckForUpdates, language))
+                        .disabled(matches!(
+                            self.status,
+                            UpdateStatus::Checking
+                                | UpdateStatus::Downloading { .. }
+                                | UpdateStatus::Restarting
+                        ))
+                        .on_click(move |_, _, cx| {
+                            check.update(cx, |this, cx| {
+                                this.check();
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("download-update")
+                        .primary()
+                        .label(text(Key::InstallUpdate, language))
+                        .disabled(!can_download)
+                        .on_click(move |_, _, cx| {
+                            download.update(cx, |this, cx| {
+                                this.download();
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("close-about")
+                        .label(text(Key::Close, language))
+                        .disabled(matches!(
+                            self.status,
+                            UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+                        ))
+                        .on_click(window.listener_for(
+                            &close,
+                            |_: &mut UpdateDialog, _, window, cx| {
+                                window.close_dialog(cx);
+                            },
+                        )),
+                ),
+        )
     }
 }
 
@@ -273,7 +337,7 @@ pub struct LogdApp {
     filter_panel: Entity<FilterPanel>,
     search_results_panel: Entity<SearchResultsPanel>,
     analysis_panel: Entity<LogAnalysisPanel>,
-    analysis_open: bool,
+    analysis_dock_panel: Entity<AnalysisPanel>,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
     language: Language,
@@ -358,7 +422,15 @@ impl LogdApp {
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
         let analysis_panel = cx.new(|_| LogAnalysisPanel::new());
-        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
+        let analysis_dock_panel =
+            cx.new(|cx| AnalysisPanel::new(app.clone(), analysis_panel.clone(), cx));
+        register_logd_panels(
+            &log_panel,
+            &filter_panel,
+            &search_results_panel,
+            &analysis_dock_panel,
+            cx,
+        );
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
         let (dock_area, skin) =
@@ -378,6 +450,7 @@ impl LogdApp {
                 &log_panel,
                 &filter_panel,
                 &search_results_panel,
+                &analysis_dock_panel,
                 legacy_filter_placement,
                 window,
                 cx,
@@ -452,7 +525,7 @@ impl LogdApp {
             filter_panel,
             search_results_panel,
             analysis_panel,
-            analysis_open: false,
+            analysis_dock_panel,
             last_layout_state,
             save_layout_task: None,
             language,
@@ -470,6 +543,7 @@ impl LogdApp {
         workspace: &Entity<LogPanel>,
         filters: &Entity<FilterPanel>,
         search_results: &Entity<SearchResultsPanel>,
+        analysis: &Entity<AnalysisPanel>,
         filter_placement: DockPlacement,
         window: &mut Window,
         cx: &mut App,
@@ -486,20 +560,31 @@ impl LogdApp {
             let filters = DockLayout::tabs().panel_view(panel_handle(filters.clone()), cx);
             let search_results =
                 DockLayout::tabs().panel_view(panel_handle(search_results.clone()), cx);
+            let analysis = DockLayout::tabs().panel_view(panel_handle(analysis.clone()), cx);
 
             // An outer dock protects its last visible panel from being
             // dragged away. One split tree keeps these tool panels movable.
             let center = match filter_placement {
-                DockPlacement::Left => DockLayout::h_split().child(filters, Some(px(360.))).child(
-                    DockLayout::v_split()
-                        .child(workspace, None)
-                        .child(search_results, Some(px(240.))),
-                    None,
-                ),
+                DockPlacement::Left => DockLayout::h_split()
+                    .child(
+                        DockLayout::v_split()
+                            .child(filters, Some(px(360.)))
+                            .child(analysis, Some(px(360.))),
+                        Some(px(360.)),
+                    )
+                    .child(
+                        DockLayout::v_split()
+                            .child(workspace, None)
+                            .child(search_results, Some(px(240.))),
+                        None,
+                    ),
                 DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
-                    DockLayout::h_split()
-                        .child(search_results, None)
-                        .child(filters, Some(px(360.))),
+                    DockLayout::h_split().child(search_results, None).child(
+                        DockLayout::v_split()
+                            .child(filters, Some(px(240.)))
+                            .child(analysis, Some(px(240.))),
+                        Some(px(360.)),
+                    ),
                     Some(px(240.)),
                 ),
                 DockPlacement::Right | DockPlacement::Center => DockLayout::h_split()
@@ -509,7 +594,12 @@ impl LogdApp {
                             .child(search_results, Some(px(240.))),
                         None,
                     )
-                    .child(filters, Some(px(360.))),
+                    .child(
+                        DockLayout::v_split()
+                            .child(filters, Some(px(360.)))
+                            .child(analysis, Some(px(360.))),
+                        Some(px(360.)),
+                    ),
             };
             dock.set_center(center, window, cx);
         });
@@ -1334,7 +1424,9 @@ impl LogdApp {
         let update = cx.new(|_| UpdateDialog::new(language));
         let poll_update = update.downgrade();
         cx.spawn(async move |_app, cx| loop {
-            cx.background_executor().timer(Duration::from_millis(50)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
             let mut restarting = false;
             if poll_update
                 .update(cx, |this, cx| {
@@ -1392,17 +1484,17 @@ impl LogdApp {
                                         .href(format!("mailto:{CONTACT_EMAIL}"))
                                         .child(CONTACT_EMAIL),
                                 ),
-                    )
-                    .child(div().mt_2().w_full().child(update.clone())),
-            )
-            .footer(
-                DialogFooter::new().child(
-                    Button::new("close-about-footer")
-                        .primary()
-                        .label(text(Key::Close, language))
-                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                ),
-            )
+                        )
+                        .child(div().mt_2().w_full().child(update.clone())),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("close-about-footer")
+                            .primary()
+                            .label(text(Key::Close, language))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
         });
     }
 
@@ -1881,6 +1973,7 @@ impl LogdApp {
         let filter_toggle_app = app.clone();
         let search_results_toggle_app = app.clone();
         let analysis_toggle_app = app.clone();
+        let analysis_open = self.analysis_dock_panel.read(cx).visible();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -1951,11 +2044,13 @@ impl LogdApp {
                 "title-toggle-analysis",
                 IconName::PanelLeft,
                 IconName::PanelLeft,
-                self.analysis_open,
+                analysis_open,
                 self.tabs.is_empty(),
                 "LogDrain 日志分析",
                 move |_, window, cx| {
-                    analysis_toggle_app.update(cx, |app, cx| app.toggle_analysis(window, cx));
+                    analysis_toggle_app.update(cx, |app, cx| {
+                        app.show_analysis_panel(!analysis_open, window, cx)
+                    });
                 },
             ))
             .into_any_element();
@@ -2181,7 +2276,8 @@ impl LogdApp {
     }
 
     pub fn render_workspace(&self, cx: &App) -> AnyElement {
-        let view = self.active_view()
+        let view = self
+            .active_view()
             .cloned()
             .map(IntoElement::into_any_element)
             .unwrap_or_else(|| {
@@ -2190,32 +2286,34 @@ impl LogdApp {
                     .bg(theme::palette(cx).background)
                     .into_any_element()
             });
-        if self.analysis_open {
-            div()
-                .size_full()
-                .flex()
-                .child(
-                    h_resizable("log-analysis-split")
-                        .child(resizable_panel().min_w_0().child(view))
-                        .child(
-                            resizable_panel()
-                                .size(px(460.))
-                                .size_range(px(260.)..Pixels::MAX)
-                                .flex_none()
-                                .child(self.analysis_panel.clone()),
-                        ),
-                )
-                .into_any_element()
-        } else { view }
+        view
     }
 
-    fn toggle_analysis(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.analysis_open = !self.analysis_open;
-        if self.analysis_open {
+    pub(crate) fn show_analysis_panel(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.analysis_dock_panel
+            .update(cx, |panel, cx| panel.set_visible(show, cx));
+        if show {
             if let Some(tab) = self.tabs.get(self.active) {
-                self.analysis_panel.update(cx, |panel, cx| panel.analyze(&tab.path, window, cx));
+                let view = tab.view.read(cx);
+                let source = view.doc().source().clone();
+                let encoding = view.doc().encoding();
+                // Only imported/configured filters participate here. Title-bar
+                // search filters are intentionally excluded from LogDrain.
+                let filters = self.filters.clone();
+                self.analysis_panel.update(cx, |panel, cx| {
+                    panel.analyze(source, filters, encoding, window, cx)
+                });
             }
-        } else { self.analysis_panel.update(cx, |panel, cx| panel.clear(cx)); }
+        } else {
+            self.analysis_panel.update(cx, |panel, cx| panel.clear(cx));
+        }
+        let dock_area = self.dock_area.clone();
+        self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
     }
 
@@ -2598,8 +2696,7 @@ impl LogdApp {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .text_color(palette.muted)
-                        // .child(text(Key::SearchResultsPrompt, lang)),
+                        .text_color(palette.muted), // .child(text(Key::SearchResultsPrompt, lang)),
                 )
                 .into_any_element();
         }

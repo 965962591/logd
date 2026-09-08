@@ -70,9 +70,8 @@ pub fn download_and_restart(release: ManualRelease, events: Sender<ManualUpdateE
 }
 
 fn fetch_manual_release() -> anyhow::Result<Option<ManualRelease>> {
-    let url = format!(
-        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPOSITORY}/releases/latest"
-    );
+    let url =
+        format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPOSITORY}/releases/latest");
     let mut response = ureq::get(&url)
         .header("User-Agent", concat!("logd/", env!("CARGO_PKG_VERSION")))
         .call()?;
@@ -90,7 +89,13 @@ fn fetch_manual_release() -> anyhow::Result<Option<ManualRelease>> {
         .assets
         .into_iter()
         .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| anyhow::anyhow!("release {} 缺少当前平台资源 {}", release.tag_name, asset_name))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "release {} 缺少当前平台资源 {}",
+                release.tag_name,
+                asset_name
+            )
+        })?;
     Ok(Some(ManualRelease {
         version: release.tag_name,
         download_url: asset.browser_download_url,
@@ -169,13 +174,20 @@ fn download_file(
     }
     file.sync_all()?;
     if release.size > 0 && downloaded != release.size {
-        anyhow::bail!("下载大小不匹配：预期 {} 字节，实际 {} 字节", release.size, downloaded);
+        anyhow::bail!(
+            "下载大小不匹配：预期 {} 字节，实际 {} 字节",
+            release.size,
+            downloaded
+        );
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn launch_replacement_helper(staged: &std::path::Path, executable: &std::path::Path) -> anyhow::Result<()> {
+fn launch_replacement_helper(
+    staged: &std::path::Path,
+    executable: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = concat!(
@@ -185,7 +197,14 @@ fn launch_replacement_helper(staged: &std::path::Path, executable: &std::path::P
         "Start-Process -FilePath $target }"
     );
     std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
         .arg(std::process::id().to_string())
         .arg(staged)
         .arg(executable)
@@ -195,7 +214,10 @@ fn launch_replacement_helper(staged: &std::path::Path, executable: &std::path::P
 }
 
 #[cfg(unix)]
-fn launch_replacement_helper(staged: &std::path::Path, executable: &std::path::Path) -> anyhow::Result<()> {
+fn launch_replacement_helper(
+    staged: &std::path::Path,
+    executable: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o755))?;
     std::process::Command::new("sh")
