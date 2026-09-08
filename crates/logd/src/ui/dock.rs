@@ -592,6 +592,11 @@ impl AnalysisPanel {
         if let Some(app) = app.upgrade() {
             cx.observe(&app, |_, _, cx| cx.notify()).detach();
         }
+        // The analysis task updates the content entity directly.  Observe it
+        // here as well so the Dock panel invalidates while it remains open;
+        // otherwise the new rows only become visible after closing/reopening
+        // the panel (which happens to force a Dock tree rebuild).
+        cx.observe(&content, |_, _, cx| cx.notify()).detach();
         Self {
             app,
             content,

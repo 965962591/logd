@@ -705,6 +705,7 @@ impl LogdApp {
                 self.apply_search_to_view(&view, cx);
                 self.remember_file(path);
                 self.status = None;
+                self.refresh_analysis_if_open(cx);
             }
             Err(error) => {
                 self.status = Some(format!("{}: {error:#}", text(Key::Open, self.language)))
@@ -841,6 +842,7 @@ impl LogdApp {
                     text(Key::Refresh, self.language),
                     path.display()
                 ));
+                self.refresh_analysis_if_open(cx);
             }
             Err(error) => {
                 self.status = Some(format!("{}: {error:#}", text(Key::Refresh, self.language)))
@@ -866,6 +868,7 @@ impl LogdApp {
         {
             self.apply_filters_to_view(index, &view, cx);
         }
+        self.refresh_analysis_if_open(cx);
         cx.notify();
     }
 
@@ -998,6 +1001,7 @@ impl LogdApp {
             panel.reset_scroll();
             cx.notify();
         });
+        self.refresh_analysis_if_open(cx);
         cx.notify();
     }
 
@@ -2298,23 +2302,31 @@ impl LogdApp {
         self.analysis_dock_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
         if show {
-            if let Some(tab) = self.tabs.get(self.active) {
-                let view = tab.view.read(cx);
-                let source = view.doc().source().clone();
-                let encoding = view.doc().encoding();
-                // Only imported/configured filters participate here. Title-bar
-                // search filters are intentionally excluded from LogDrain.
-                let filters = self.filters.clone();
-                self.analysis_panel.update(cx, |panel, cx| {
-                    panel.analyze(source, filters, encoding, window, cx)
-                });
-            }
+            self.refresh_analysis_if_open(cx);
         } else {
             self.analysis_panel.update(cx, |panel, cx| panel.clear(cx));
         }
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
         cx.notify();
+    }
+
+    /// Keep an open LogDrain panel synchronized with the active imported log.
+    /// Configured filters take priority; title-bar search filters are excluded.
+    fn refresh_analysis_if_open(&self, cx: &mut App) {
+        if !self.analysis_dock_panel.read(cx).visible() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.analysis_panel.update(cx, |panel, cx| panel.clear(cx));
+            return;
+        };
+        let view = tab.view.read(cx);
+        let source = view.doc().source().clone();
+        let encoding = view.doc().encoding();
+        let filters = self.filters.clone();
+        self.analysis_panel
+            .update(cx, |panel, cx| panel.analyze(source, filters, encoding, cx));
     }
 
     pub fn render_filters(

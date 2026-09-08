@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::*;
-use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::{h_flex, v_flex};
 use logd_core::{Encoding, FileSource, FilterSpec, MatcherSet};
 use logdrain::Miner;
@@ -24,6 +24,7 @@ pub struct LogAnalysisPanel {
     generation: u64,
     enabled_filter_count: usize,
     analyzed_line_count: u64,
+    scroll: UniformListScrollHandle,
 }
 
 impl LogAnalysisPanel {
@@ -36,6 +37,7 @@ impl LogAnalysisPanel {
             generation: 0,
             enabled_filter_count: 0,
             analyzed_line_count: 0,
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -44,7 +46,6 @@ impl LogAnalysisPanel {
         source: Arc<FileSource>,
         filters: Vec<FilterSpec>,
         encoding: Encoding,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.generation = self.generation.wrapping_add(1);
@@ -53,31 +54,31 @@ impl LogAnalysisPanel {
         self.running = true;
         self.error = None;
         self.rows.clear();
+        self.reset_scroll_position();
         self.enabled_filter_count = filters.iter().filter(|filter| filter.is_active()).count();
         self.analyzed_line_count = 0;
         cx.notify();
         let weak = cx.entity().downgrade();
         let executor = cx.background_executor().clone();
-        cx.spawn_in(window, async move |_, window| {
+        cx.spawn(async move |_, cx| {
             let result = executor
                 .spawn(async move { analyze_source(source, filters, encoding) })
                 .await;
-            let _ = window.update(|_, cx| {
-                weak.update(cx, |panel, cx| {
-                    if panel.generation != generation {
-                        return;
+            weak.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
+                panel.running = false;
+                match result {
+                    Ok((rows, analyzed_line_count)) => {
+                        panel.rows = rows;
+                        panel.analyzed_line_count = analyzed_line_count;
                     }
-                    panel.running = false;
-                    match result {
-                        Ok((rows, analyzed_line_count)) => {
-                            panel.rows = rows;
-                            panel.analyzed_line_count = analyzed_line_count;
-                        }
-                        Err(error) => panel.error = Some(error),
-                    }
-                    cx.notify();
-                })
-            });
+                    Err(error) => panel.error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -90,7 +91,17 @@ impl LogAnalysisPanel {
         self.generation = self.generation.wrapping_add(1);
         self.enabled_filter_count = 0;
         self.analyzed_line_count = 0;
+        self.reset_scroll_position();
         cx.notify();
+    }
+
+    fn reset_scroll_position(&mut self) {
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
     }
 }
 
@@ -164,7 +175,7 @@ impl Render for LogAnalysisPanel {
         } else {
             format!("基于 {} 个已启用过滤器", self.enabled_filter_count)
         };
-        let content = if self.running {
+        let message = if self.running {
             v_flex()
                 .gap_2()
                 .p_3()
@@ -195,20 +206,131 @@ impl Render for LogAnalysisPanel {
                         .child(filter_status)
                         .child(format!("已分析 {} 行", self.analyzed_line_count)),
                 )
-                .children(self.rows.iter().enumerate().map(|(i, row)| {
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(format!("{:>4}", i + 1))
-                        .child(format!("{}  ×{}", row.template, row.count))
-                }))
                 .into_any_element()
         };
+        if self.running || self.error.is_some() || self.rows.is_empty() {
+            return v_flex()
+                .size_full()
+                .bg(palette.background)
+                .text_color(palette.foreground)
+                .text_size(px(theme::FONT_SIZE))
+                .line_height(px(theme::LINE_HEIGHT))
+                .font_family(theme::MONO)
+                .child(message);
+        }
+
+        let rows = self.rows.clone();
+        let scroll = self.scroll.clone();
+        // Keep every row at the widest measured template width.  A fixed row
+        // width is important here: UniformList's unconstrained mode can only
+        // expose horizontal overflow when its children report their real
+        // content width (a flex child with `min_w_0` would otherwise shrink).
+        let content_width = rows
+            .iter()
+            .map(|row| {
+                let text_width = row
+                    .template
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { 0.62 } else { 1.0 })
+                    .sum::<f32>()
+                    * theme::FONT_SIZE;
+                text_width + 130.0
+            })
+            .fold(900.0, f32::max);
+        let list = uniform_list(
+            "logdrain-analysis-results",
+            rows.len(),
+            move |range, _window, _cx| {
+                range
+                    .map(|index| {
+                        let row = &rows[index];
+                        h_flex()
+                            .id(("logdrain-analysis-row", index))
+                            .h(px(theme::LINE_HEIGHT))
+                            .w(px(content_width))
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(palette.border)
+                            .child(
+                                div()
+                                    .w(px(42.))
+                                    .flex_none()
+                                    .text_color(palette.muted)
+                                    .child(format!("{:>4}", index + 1)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .child(row.template.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .flex_none()
+                                    .text_color(palette.muted)
+                                    .child(format!("×{}", row.count)),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .size_full()
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .track_scroll(&scroll);
+        let scrollbar_width = Scrollbar::width();
         v_flex()
             .size_full()
             .bg(palette.background)
             .text_color(palette.foreground)
+            .text_size(px(theme::FONT_SIZE))
+            .line_height(px(theme::LINE_HEIGHT))
             .font_family(theme::MONO)
-            .child(div().flex_1().overflow_y_scrollbar().child(content))
+            .child(message)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right(scrollbar_width)
+                            .bottom(scrollbar_width)
+                            .child(list),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom(scrollbar_width)
+                            .w(scrollbar_width)
+                            .child(
+                                Scrollbar::vertical(&scroll)
+                                    .id("logdrain-vscrollbar")
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right(scrollbar_width)
+                            .bottom_0()
+                            .h(scrollbar_width)
+                            .child(
+                                Scrollbar::horizontal(&scroll)
+                                    .id("logdrain-hscrollbar")
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    ),
+            )
     }
 }
