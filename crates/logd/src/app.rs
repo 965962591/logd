@@ -125,17 +125,29 @@ impl UpdateDialog {
 }
 
 impl Render for UpdateDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
         let check = cx.entity().clone();
         let download = cx.entity().clone();
+        let close = cx.entity().clone();
         let (status_text, progress, can_download) = match &self.status {
             UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
             UpdateStatus::Checking => (text(Key::CheckingForUpdates, language).to_string(), None, false),
             UpdateStatus::Available(release) => (format!("{}: {}", text(Key::UpdateAvailable, language), release.version), None, true),
             UpdateStatus::Downloading { version, downloaded, total } => {
                 let percent = if *total == 0 { 0.0 } else { (*downloaded as f32 / *total as f32) * 100.0 };
-                (format!("{} {} ({:.0}%)", text(Key::DownloadingUpdate, language), version, percent), Some(percent), false)
+                (
+                    format!(
+                        "{} {} ({:.0}%, {} / {})",
+                        text(Key::DownloadingUpdate, language),
+                        version,
+                        percent,
+                        format_download_size(*downloaded),
+                        format_download_size(*total),
+                    ),
+                    Some(percent),
+                    false,
+                )
             }
             UpdateStatus::UpToDate => (text(Key::AlreadyUpToDate, language).to_string(), None, false),
             UpdateStatus::Error(error) => (format!("{}: {}", text(Key::UpdateFailed, language), error), None, false),
@@ -165,9 +177,28 @@ impl Render for UpdateDialog {
                             .on_click(move |_, _, cx| {
                                 download.update(cx, |this, cx| { this.download(); cx.notify(); });
                             }),
+                    )
+                    .child(
+                        Button::new("close-about")
+                            .label(text(Key::Close, language))
+                            .disabled(matches!(
+                                self.status,
+                                UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+                            ))
+                            .on_click(window.listener_for(
+                                &close,
+                                |_: &mut UpdateDialog, _, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            )),
                     ),
             )
     }
+}
+
+fn format_download_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    format!("{:.1} MB", bytes as f64 / MIB)
 }
 
 #[derive(Clone)]
@@ -1295,14 +1326,19 @@ impl LogdApp {
     fn show_about_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let language = self.language;
         let update = cx.new(|_| UpdateDialog::new(language));
-        let poll_update = update.clone();
+        let poll_update = update.downgrade();
         cx.spawn(async move |_app, cx| loop {
             cx.background_executor().timer(Duration::from_millis(50)).await;
             let mut restarting = false;
-            poll_update.update(cx, |this, cx| {
-                restarting = this.poll();
-                cx.notify();
-            });
+            if poll_update
+                .update(cx, |this, cx| {
+                    restarting = this.poll();
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
             if restarting {
                 std::process::exit(0);
             }
@@ -1311,6 +1347,7 @@ impl LogdApp {
         window.open_alert_dialog(cx, move |alert, _window, _| {
             alert
                 .title("logd")
+                .keyboard(false)
                 .description(
                     v_flex()
                         .gap_2()
@@ -1349,17 +1386,17 @@ impl LogdApp {
                                         .href(format!("mailto:{CONTACT_EMAIL}"))
                                         .child(CONTACT_EMAIL),
                                 ),
-                        )
-                        .child(div().mt_2().w_full().child(update.clone())),
-                )
-                .footer(
-                    DialogFooter::new().child(
-                        Button::new("close-about")
-                            .primary()
-                            .label(text(Key::Close, language))
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    ),
-                )
+                    )
+                    .child(div().mt_2().w_full().child(update.clone())),
+            )
+            .footer(
+                DialogFooter::new().child(
+                    Button::new("close-about-footer")
+                        .primary()
+                        .label(text(Key::Close, language))
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                ),
+            )
         });
     }
 

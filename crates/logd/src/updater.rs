@@ -125,7 +125,9 @@ fn download_and_stage(
     }
     launch_replacement_helper(&staged, &executable)?;
     let _ = events.send(ManualUpdateEvent::Restarting);
-    Ok(())
+    // The helper now owns the replacement/relaunch sequence. Exit immediately
+    // so the current executable is no longer locked on Windows.
+    std::process::exit(0);
 }
 
 fn staged_update_path(executable: &std::path::Path) -> PathBuf {
