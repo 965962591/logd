@@ -121,10 +121,10 @@ pub fn palette(cx: &App) -> Palette {
         scroll_thumb_hover: active.scrollbar_thumb_hover,
         tab_bar: active.tab_bar,
         tab: active.tab,
-        tab_active: active.accent.opacity(0.18),
+        tab_active: active.tab_active,
         tab_foreground: active.tab_foreground,
         tab_active_foreground: active.tab_active_foreground,
-        tab_active_indicator: active.accent,
+        tab_active_indicator: active.primary,
         search_foreground: active.yellow,
     }
 }

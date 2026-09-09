@@ -2186,7 +2186,7 @@ impl LogdApp {
                         palette.tab_foreground
                     })
                     .when(active, |tab| {
-                        tab.font_weight(FontWeight::SEMIBOLD).child(
+                        tab.child(
                             div()
                                 .absolute()
                                 .left_0()
