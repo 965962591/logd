@@ -969,6 +969,27 @@ impl LogdApp {
         cx.notify();
     }
 
+    pub fn has_filters(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    pub fn all_filters_enabled(&self) -> bool {
+        self.filters.iter().all(|filter| filter.enabled)
+    }
+
+    pub fn set_all_filters_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for filter in &mut self.filters {
+            if filter.enabled != enabled {
+                filter.enabled = enabled;
+                changed = true;
+            }
+        }
+        if changed {
+            self.filters_changed(cx);
+        }
+    }
+
     fn set_global_search(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
         let value = value.trim().to_string();
         if !value.is_empty() {

@@ -5,6 +5,7 @@ use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::dock::{
     panel_handle, register_panel, BasePanel, BasePanelView, DockArea, DockAreaRenderer,
     DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelHandle,
@@ -494,19 +495,49 @@ impl Panel for FilterPanel {
             .upgrade()
             .map(|app| app.read(cx).language())
             .unwrap_or(Language::EnUs);
-        let app = self.app.clone();
+        let (has_filters, all_filters_enabled) = self
+            .app
+            .upgrade()
+            .map(|app| {
+                let state = app.read(cx);
+                (state.has_filters(), state.all_filters_enabled())
+            })
+            .unwrap_or((false, false));
+        let select_all_app = self.app.clone();
+        let add_filter_app = self.app.clone();
         Some(
-            Button::new("filter-add")
-                .icon(IconName::Plus)
-                .xsmall()
-                .ghost()
-                .tab_stop(false)
-                .accessibility_label(text(Key::AddFilter, language))
-                .tooltip(text(Key::AddFilter, language))
-                .on_click(move |_, window, cx| {
-                    app.update(cx, |app, cx| app.begin_add_filter(window, cx))
-                        .ok();
-                }),
+            h_flex()
+                .items_center()
+                .gap_1()
+                .when(has_filters, |controls| {
+                    controls.child(
+                        Checkbox::new("filter-select-all")
+                            .small()
+                            .checked(all_filters_enabled)
+                            .tab_stop(false)
+                            .accessibility_label(text(Key::SelectAll, language))
+                            .tooltip(text(Key::SelectAll, language))
+                            .on_click(move |checked, _, cx| {
+                                select_all_app
+                                    .update(cx, |app, cx| app.set_all_filters_enabled(*checked, cx))
+                                    .ok();
+                            }),
+                    )
+                })
+                .child(
+                    Button::new("filter-add")
+                        .icon(IconName::Plus)
+                        .xsmall()
+                        .ghost()
+                        .tab_stop(false)
+                        .accessibility_label(text(Key::AddFilter, language))
+                        .tooltip(text(Key::AddFilter, language))
+                        .on_click(move |_, window, cx| {
+                            add_filter_app
+                                .update(cx, |app, cx| app.begin_add_filter(window, cx))
+                                .ok();
+                        }),
+                ),
         )
     }
 
