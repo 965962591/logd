@@ -33,11 +33,10 @@ use gpui_component::{
 use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, LogdFile, TatFile};
 
 use crate::i18n::{text, Key, Language};
-use crate::log_analysis::LogAnalysisPanel;
 use crate::log_view::LogView;
 use crate::theme;
 use crate::ui::dock::{
-    logd_dock_area, register_logd_panels, AnalysisPanel, FilterPanel, LogPanel, SearchResultsPanel,
+    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, SearchResultsPanel,
 };
 use crate::ui::title_bar;
 
@@ -58,10 +57,9 @@ struct SearchResultFile {
     expanded: bool,
 }
 
-// Nested splits keep one flexible child.  Older layouts used fixed sizes for
-// both the Filters and LogDrain children; when one hidden panel was measured
-// as zero-sized, gpui-kit repeatedly renormalized the split during a drag.
-const DOCK_LAYOUT_VERSION: usize = 4;
+// Increment when the registered panel tree changes so stale persisted layouts
+// cannot restore panels that no longer exist.
+const DOCK_LAYOUT_VERSION: usize = 5;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
@@ -337,8 +335,6 @@ pub struct LogdApp {
     tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
     search_results_panel: Entity<SearchResultsPanel>,
-    analysis_panel: Entity<LogAnalysisPanel>,
-    analysis_dock_panel: Entity<AnalysisPanel>,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
     language: Language,
@@ -422,16 +418,7 @@ impl LogdApp {
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
-        let analysis_panel = cx.new(|_| LogAnalysisPanel::new());
-        let analysis_dock_panel =
-            cx.new(|cx| AnalysisPanel::new(app.clone(), analysis_panel.clone(), cx));
-        register_logd_panels(
-            &log_panel,
-            &filter_panel,
-            &search_results_panel,
-            &analysis_dock_panel,
-            cx,
-        );
+        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
         let (dock_area, skin) =
@@ -451,7 +438,6 @@ impl LogdApp {
                 &log_panel,
                 &filter_panel,
                 &search_results_panel,
-                &analysis_dock_panel,
                 legacy_filter_placement,
                 window,
                 cx,
@@ -525,8 +511,6 @@ impl LogdApp {
             tab_scroll: ScrollHandle::new(),
             filter_panel,
             search_results_panel,
-            analysis_panel,
-            analysis_dock_panel,
             last_layout_state,
             save_layout_task: None,
             language,
@@ -544,7 +528,6 @@ impl LogdApp {
         workspace: &Entity<LogPanel>,
         filters: &Entity<FilterPanel>,
         search_results: &Entity<SearchResultsPanel>,
-        analysis: &Entity<AnalysisPanel>,
         filter_placement: DockPlacement,
         window: &mut Window,
         cx: &mut App,
@@ -561,31 +544,20 @@ impl LogdApp {
             let filters = DockLayout::tabs().panel_view(panel_handle(filters.clone()), cx);
             let search_results =
                 DockLayout::tabs().panel_view(panel_handle(search_results.clone()), cx);
-            let analysis = DockLayout::tabs().panel_view(panel_handle(analysis.clone()), cx);
 
             // An outer dock protects its last visible panel from being
             // dragged away. One split tree keeps these tool panels movable.
             let center = match filter_placement {
-                DockPlacement::Left => DockLayout::h_split()
-                    .child(
-                        DockLayout::v_split()
-                            .child(filters, Some(px(360.)))
-                            .child(analysis, None),
-                        Some(px(360.)),
-                    )
-                    .child(
-                        DockLayout::v_split()
-                            .child(workspace, None)
-                            .child(search_results, Some(px(240.))),
-                        None,
-                    ),
+                DockPlacement::Left => DockLayout::h_split().child(filters, Some(px(360.))).child(
+                    DockLayout::v_split()
+                        .child(workspace, None)
+                        .child(search_results, Some(px(240.))),
+                    None,
+                ),
                 DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
-                    DockLayout::h_split().child(search_results, None).child(
-                        DockLayout::v_split()
-                            .child(filters, Some(px(240.)))
-                            .child(analysis, None),
-                        Some(px(360.)),
-                    ),
+                    DockLayout::h_split()
+                        .child(search_results, None)
+                        .child(filters, Some(px(360.))),
                     Some(px(240.)),
                 ),
                 DockPlacement::Right | DockPlacement::Center => DockLayout::h_split()
@@ -595,12 +567,7 @@ impl LogdApp {
                             .child(search_results, Some(px(240.))),
                         None,
                     )
-                    .child(
-                        DockLayout::v_split()
-                            .child(filters, Some(px(360.)))
-                            .child(analysis, None),
-                        Some(px(360.)),
-                    ),
+                    .child(filters, Some(px(360.))),
             };
             dock.set_center(center, window, cx);
         });
@@ -706,7 +673,6 @@ impl LogdApp {
                 self.apply_search_to_view(&view, cx);
                 self.remember_file(path);
                 self.status = None;
-                self.refresh_analysis_if_open(cx);
             }
             Err(error) => {
                 self.status = Some(format!("{}: {error:#}", text(Key::Open, self.language)))
@@ -843,7 +809,6 @@ impl LogdApp {
                     text(Key::Refresh, self.language),
                     path.display()
                 ));
-                self.refresh_analysis_if_open(cx);
             }
             Err(error) => {
                 self.status = Some(format!("{}: {error:#}", text(Key::Refresh, self.language)))
@@ -869,7 +834,6 @@ impl LogdApp {
         {
             self.apply_filters_to_view(index, &view, cx);
         }
-        self.refresh_analysis_if_open(cx);
         cx.notify();
     }
 
@@ -1002,7 +966,6 @@ impl LogdApp {
             panel.reset_scroll();
             cx.notify();
         });
-        self.refresh_analysis_if_open(cx);
         cx.notify();
     }
 
@@ -1959,9 +1922,7 @@ impl LogdApp {
         let lang = self.language;
         let filter_toggle_app = app.clone();
         let search_results_toggle_app = app.clone();
-        let analysis_toggle_app = app.clone();
         let show_only_app = app.clone();
-        let analysis_open = self.analysis_dock_panel.read(cx).visible();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -2036,19 +1997,6 @@ impl LogdApp {
                 move |_, window, cx| {
                     search_results_toggle_app.update(cx, |app, cx| {
                         app.show_search_results(!search_results_open, window, cx)
-                    });
-                },
-            ))
-            .child(title_bar::panel_toggle(
-                "title-toggle-analysis",
-                IconName::PanelLeft,
-                IconName::PanelLeft,
-                analysis_open,
-                self.tabs.is_empty(),
-                "LogDrain 日志分析",
-                move |_, window, cx| {
-                    analysis_toggle_app.update(cx, |app, cx| {
-                        app.show_analysis_panel(!analysis_open, window, cx)
                     });
                 },
             ))
@@ -2288,25 +2236,6 @@ impl LogdApp {
         view
     }
 
-    pub(crate) fn show_analysis_panel(
-        &mut self,
-        show: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.analysis_dock_panel
-            .update(cx, |panel, cx| panel.set_visible(show, cx));
-        self.normalize_hidden_dock_panels(window, cx);
-        if show {
-            self.refresh_analysis_if_open(cx);
-        } else {
-            self.analysis_panel.update(cx, |panel, cx| panel.clear(cx));
-        }
-        let dock_area = self.dock_area.clone();
-        self.schedule_layout_save(&dock_area, window, cx);
-        cx.notify();
-    }
-
     /// gpui-component keeps hidden split children in their original index so
     /// their state can be restored. Its resize handles, however, are indexed
     /// by the original child position. If a middle child is hidden, the next
@@ -2346,24 +2275,6 @@ impl LogdApp {
             // debounced save after visibility changes; seeing this normalized
             // tree as a difference ensures the repaired ordering is persisted.
         }
-    }
-
-    /// Keep an open LogDrain panel synchronized with the active imported log.
-    /// Configured filters take priority; title-bar search filters are excluded.
-    fn refresh_analysis_if_open(&self, cx: &mut App) {
-        if !self.analysis_dock_panel.read(cx).visible() {
-            return;
-        }
-        let Some(tab) = self.tabs.get(self.active) else {
-            self.analysis_panel.update(cx, |panel, cx| panel.clear(cx));
-            return;
-        };
-        let view = tab.view.read(cx);
-        let source = view.doc().source().clone();
-        let encoding = view.doc().encoding();
-        let filters = self.filters.clone();
-        self.analysis_panel
-            .update(cx, |panel, cx| panel.analyze(source, filters, encoding, cx));
     }
 
     pub fn render_filters(
