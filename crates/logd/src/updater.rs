@@ -11,6 +11,7 @@ use std::time::Duration;
 const GITHUB_OWNER: &str = "965962591";
 const GITHUB_REPOSITORY: &str = "logd";
 const BINARY_NAME: &str = "logd";
+const GITHUB_DOWNLOAD_PROXY: &str = "https://gh-proxy.com/";
 
 #[derive(Clone, Debug)]
 pub struct ManualRelease {
@@ -95,10 +96,13 @@ fn fetch_manual_release() -> anyhow::Result<Option<ManualRelease>> {
                 release.tag_name,
                 asset_name
             )
-        })?;
+    })?;
     Ok(Some(ManualRelease {
         version: release.tag_name,
-        download_url: asset.browser_download_url,
+        download_url: format!(
+            "{GITHUB_DOWNLOAD_PROXY}{}",
+            asset.browser_download_url
+        ),
         size: asset.size,
     }))
 }

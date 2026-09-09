@@ -90,6 +90,19 @@ jobs:
       - name: Build executable and MSI
         run: cargo packager --release -p logd --formats wix
 
+      - name: Install UPX
+        shell: pwsh
+        run: choco install upx --yes --no-progress
+
+      - name: Compress Windows executable with UPX
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/logd.exe).Path
+          & upx.exe -1 $exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "UPX failed to compress '$exe' (exit code $LASTEXITCODE)"
+          }
+
       - name: Verify Windows GUI executable
         shell: pwsh
         run: |
