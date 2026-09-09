@@ -1516,6 +1516,7 @@ impl LogView {
             .h_full()
             .pl_2()
             .overflow_hidden()
+            .cursor_text()
             .when_some(text_selection_bounds, |el, (left, width)| {
                 el.child(
                     div()
@@ -1534,8 +1535,8 @@ impl LogView {
                         .top(px(2.))
                         .bottom(px(2.))
                         .left(px(left))
-                        .w(px(1.))
-                        .bg(palette.foreground),
+                        .w(px(2.))
+                        .bg(palette.caret),
                 )
             })
             .when(!is_editing, |el| {

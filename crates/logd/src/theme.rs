@@ -41,6 +41,7 @@ pub struct Palette {
     pub control_hover: Hsla,
     pub danger: Hsla,
     pub danger_foreground: Hsla,
+    pub caret: Hsla,
     pub selection: Hsla,
     pub muted: Hsla,
     pub gutter: Hsla,
@@ -107,6 +108,7 @@ pub fn palette(cx: &App) -> Palette {
         control_hover: active.list_hover,
         danger: active.danger,
         danger_foreground: active.danger_foreground,
+        caret: active.caret,
         selection: active.selection,
         muted: active.muted_foreground,
         gutter: if active.mode.is_dark() {
