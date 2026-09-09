@@ -109,6 +109,13 @@ impl Document {
         self.matches.as_ref().map(|m| m.len())
     }
 
+    /// The complete set of file lines selected by the current filters/search.
+    /// `None` means every line is visible (there is no active restriction, or
+    /// the completed scan determined that all lines match).
+    pub fn matched_lines(&self) -> Option<Arc<Vec<u64>>> {
+        self.matches.clone()
+    }
+
     pub fn show_only_filtered(&self) -> bool {
         self.show_only_filtered
     }

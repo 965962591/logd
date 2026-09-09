@@ -397,10 +397,6 @@ impl LogView {
         self.dirty
     }
 
-    pub fn can_close_without_prompt(&self) -> bool {
-        !self.editing_changed && (self.edits.is_empty() || self.edits_saved)
-    }
-
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -1162,6 +1158,64 @@ impl LogView {
         .detach();
     }
 
+    /// Whether the current file has a complete, stable result that can be
+    /// exported without racing an index/filter scan.
+    pub fn can_export(&self) -> bool {
+        self.doc.index_complete()
+            && self.indexing.is_none()
+            && self.scanning.is_none()
+            && self.search_scanning.is_none()
+    }
+
+    pub fn export_filtered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_line.is_some() {
+            self.commit_edit(window, cx);
+        }
+        if !self.can_export() {
+            return;
+        }
+        let source = self.doc.source().clone();
+        let index = self.doc.index().clone();
+        let encoding = self.doc.encoding();
+        let lines = self.doc.matched_lines();
+        let edits = self.edits.clone();
+        let directory = source.path().parent().unwrap_or_else(|| Path::new("."));
+        let name = source
+            .path()
+            .file_name()
+            .map(|name| format!("{}.filtered", name.to_string_lossy()))
+            .unwrap_or_else(|| "log.filtered".to_string());
+        let target = cx.prompt_for_new_path(directory, Some(&name));
+        let executor = cx.background_executor().clone();
+
+        cx.spawn_in(window, async move |this, window| {
+            let Some(target) = target.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            if target == source.path() {
+                _ = window.update(|_, cx| {
+                    _ = this.update(cx, |this, cx| {
+                        this.error = Some("export must use a new path".to_string());
+                        cx.notify();
+                    });
+                });
+                return;
+            }
+            let result = executor
+                .spawn(async move {
+                    write_filtered_export(target, source, index, encoding, lines, edits)
+                })
+                .await;
+            _ = window.update(|_, cx| {
+                _ = this.update(cx, |this, cx| {
+                    this.error = result.err().map(|error| format!("{error:#}"));
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file_line) = self.editing_line.take() else {
             return;
@@ -1668,6 +1722,83 @@ fn write_edited_copy(
     }
     output.write_all(&data[cursor..])?;
     output.flush()?;
+    Ok(())
+}
+
+fn write_filtered_export(
+    target: PathBuf,
+    source: Arc<FileSource>,
+    index: Arc<LineIndex>,
+    encoding: Encoding,
+    lines: Option<Arc<Vec<u64>>>,
+    edits: BTreeMap<u64, String>,
+) -> anyhow::Result<()> {
+    let mut output = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    let data = source.data();
+    if source.bom_len() > 0 {
+        output.write_all(&data[..source.bom_len().min(data.len())])?;
+    }
+    let mut spans = Vec::with_capacity(1);
+    if let Some(lines) = lines {
+        for &file_line in lines.iter() {
+            write_filtered_line(
+                &mut output,
+                data,
+                &source,
+                &index,
+                encoding,
+                file_line,
+                &edits,
+                &mut spans,
+            )?;
+        }
+    } else {
+        for file_line in 0..index.total_lines {
+            write_filtered_line(
+                &mut output,
+                data,
+                &source,
+                &index,
+                encoding,
+                file_line,
+                &edits,
+                &mut spans,
+            )?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn write_filtered_line(
+    output: &mut std::io::BufWriter<std::fs::File>,
+    data: &[u8],
+    source: &FileSource,
+    index: &LineIndex,
+    encoding: Encoding,
+    file_line: u64,
+    edits: &BTreeMap<u64, String>,
+    spans: &mut Vec<(u64, u64)>,
+) -> anyhow::Result<()> {
+    index.line_spans(data, file_line, 1, spans);
+    let Some(&(raw_start, raw_end)) = spans.first() else {
+        return Ok(());
+    };
+    let raw_start = raw_start as usize;
+    let raw_end = raw_end as usize;
+    if let Some(edited) = edits.get(&file_line) {
+        output.write_all(&logd_core::matcher::encode_pattern(edited, encoding))?;
+    } else {
+        let content_start = if file_line == 0 {
+            source.bom_len().min(raw_end)
+        } else {
+            raw_start
+        };
+        output.write_all(&data[content_start..raw_end])?;
+    }
+    if let Some(next_start) = index.line_start(data, file_line + 1) {
+        output.write_all(&data[raw_end..next_start as usize])?;
+    }
     Ok(())
 }
 

@@ -291,6 +291,7 @@ enum MenuCommand {
     OpenRecent(PathBuf),
     ClearRecentFiles,
     Refresh,
+    Export,
     SaveEditedCopy,
     ImportFilters,
     SetEncoding(Encoding),
@@ -885,11 +886,11 @@ impl LogdApp {
         self.restore_active_path(active_path, cx);
     }
 
-    fn close_clean_tabs(&mut self, cx: &mut Context<Self>) {
-        let active_path = self.tabs.get(self.active).map(|tab| tab.path.clone());
-        self.tabs
-            .retain(|tab| tab.view.read(cx).can_close_without_prompt());
-        self.restore_active_path(active_path, cx);
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.tabs.clear();
+        self.active = 0;
+        self.notify_search_results(cx);
+        cx.notify();
     }
 
     fn restore_active_path(&mut self, active_path: Option<PathBuf>, cx: &mut Context<Self>) {
@@ -1571,6 +1572,11 @@ impl LogdApp {
             MenuCommand::OpenRecent(path) => self.open_path(&path, window, cx),
             MenuCommand::ClearRecentFiles => self.clear_recent_files(cx),
             MenuCommand::Refresh => self.refresh_active(window, cx),
+            MenuCommand::Export => {
+                if let Some(view) = self.active_view().cloned() {
+                    view.update(cx, |view, cx| view.export_filtered(window, cx));
+                }
+            }
             MenuCommand::SaveEditedCopy => {
                 if let Some(view) = self.active_view().cloned() {
                     view.update(cx, |view, cx| view.save_edited_copy(window, cx));
@@ -1645,6 +1651,9 @@ impl LogdApp {
         let recent = self.recent_files.clone();
         let selected = self.selected_filter.is_some();
         let has_view = self.active_view().is_some();
+        let can_export = self
+            .active_view()
+            .is_some_and(|view| view.read(cx).can_export());
         let active_encoding = self
             .active_view()
             .map(|view| view.read(cx).doc().encoding());
@@ -1677,6 +1686,7 @@ impl LogdApp {
                 .dropdown_menu(move |menu, window, cx| {
                     let open_app = app.clone();
                     let refresh_app = app.clone();
+                    let export_app = app.clone();
                     let save_copy_app = app.clone();
                     let menu = menu
                         .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
@@ -1689,6 +1699,16 @@ impl LogdApp {
                                 this.dispatch(MenuCommand::Refresh, window, cx)
                             }),
                         ))
+                        .item(
+                            PopupMenuItem::new(text(Key::Export, lang))
+                                .disabled(!can_export)
+                                .on_click(window.listener_for(
+                                    &export_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::Export, window, cx)
+                                    },
+                                )),
+                        )
                         .item(
                             PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
                                 window.listener_for(&save_copy_app, |this, _, window, cx| {
@@ -2185,7 +2205,7 @@ impl LogdApp {
                         let close_app = close_app.clone();
                         let before_app = context_app.clone();
                         let after_app = context_app.clone();
-                        let clean_app = drop_app.clone();
+                        let all_app = drop_app.clone();
                         menu.item(PopupMenuItem::new(text(Key::CloseTab, lang)).on_click(
                             window.listener_for(&close_app, move |this, _, _, cx| {
                                 this.close_tab(index, cx);
@@ -2206,9 +2226,9 @@ impl LogdApp {
                             ),
                         )
                         .item(
-                            PopupMenuItem::new(text(Key::CloseCleanTabs, lang)).on_click(
-                                window.listener_for(&clean_app, move |this, _, _, cx| {
-                                    this.close_clean_tabs(cx);
+                            PopupMenuItem::new(text(Key::CloseAllTabs, lang)).on_click(
+                                window.listener_for(&all_app, move |this, _, _, cx| {
+                                    this.close_all_tabs(cx);
                                 }),
                             ),
                         )

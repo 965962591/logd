@@ -36,6 +36,7 @@ pub enum Key {
     File,
     Open,
     Refresh,
+    Export,
     RecentFiles,
     View,
     ShowAll,
@@ -122,7 +123,7 @@ pub enum Key {
     CloseTab,
     CloseTabsBefore,
     CloseTabsAfter,
-    CloseCleanTabs,
+    CloseAllTabs,
 }
 
 pub fn text(key: Key, lang: Language) -> &'static str {
@@ -133,6 +134,8 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::Open, Language::EnUs) => "Open",
         (Key::Refresh, Language::ZhCn) => "刷新",
         (Key::Refresh, Language::EnUs) => "Refresh",
+        (Key::Export, Language::ZhCn) => "导出",
+        (Key::Export, Language::EnUs) => "Export",
         (Key::RecentFiles, Language::ZhCn) => "最近文件",
         (Key::RecentFiles, Language::EnUs) => "Recent Files",
         (Key::View, Language::ZhCn) => "视图",
@@ -309,7 +312,7 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::CloseTabsBefore, Language::EnUs) => "Close Tabs to the Left",
         (Key::CloseTabsAfter, Language::ZhCn) => "关闭后面的标签页",
         (Key::CloseTabsAfter, Language::EnUs) => "Close Tabs to the Right",
-        (Key::CloseCleanTabs, Language::ZhCn) => "关闭未修改或已保存的标签页",
-        (Key::CloseCleanTabs, Language::EnUs) => "Close Unmodified or Saved Tabs",
+        (Key::CloseAllTabs, Language::ZhCn) => "关闭所有标签页",
+        (Key::CloseAllTabs, Language::EnUs) => "Close All Tabs",
     }
 }
