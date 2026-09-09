@@ -2,7 +2,6 @@ use std::io;
 use std::path::PathBuf;
 
 use gpui_component::dock::{DockAreaState, DockPlacement};
-use gpui_component::ThemeMode;
 
 const FILTER_PLACEMENT_KEY: &str = "filter_placement";
 const SETTINGS_FILE: &str = "settings.conf";
@@ -81,13 +80,13 @@ pub fn save_search_history(queries: &[String]) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
-pub fn load_theme_mode() -> ThemeMode {
+pub fn load_theme_name() -> String {
     read_cache_file(THEME_FILE)
-        .and_then(|contents| parse_theme_mode(&contents))
-        .unwrap_or(ThemeMode::Dark)
+        .and_then(|contents| parse_theme_name(&contents))
+        .unwrap_or_else(|| crate::theme::DEFAULT_DARK_THEME.to_string())
 }
 
-pub fn save_theme_mode(mode: ThemeMode) -> io::Result<()> {
+pub fn save_theme_name(name: &str) -> io::Result<()> {
     let path = cache_file_path(THEME_FILE).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -97,7 +96,7 @@ pub fn save_theme_mode(mode: ThemeMode) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, mode.name())
+    std::fs::write(path, name)
 }
 
 fn dock_layout_path() -> Option<PathBuf> {
@@ -144,11 +143,15 @@ fn parse_filter_placement(contents: &str) -> Option<DockPlacement> {
     })
 }
 
-fn parse_theme_mode(contents: &str) -> Option<ThemeMode> {
-    match contents.trim().to_ascii_lowercase().as_str() {
-        "light" => Some(ThemeMode::Light),
-        "dark" => Some(ThemeMode::Dark),
-        _ => None,
+fn parse_theme_name(contents: &str) -> Option<String> {
+    let name = contents.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match name.to_ascii_lowercase().as_str() {
+        "light" => Some(crate::theme::DEFAULT_LIGHT_THEME.to_string()),
+        "dark" => Some(crate::theme::DEFAULT_DARK_THEME.to_string()),
+        _ => Some(name.to_string()),
     }
 }
 
@@ -265,9 +268,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_theme_mode() {
-        assert_eq!(parse_theme_mode("light\n"), Some(ThemeMode::Light));
-        assert_eq!(parse_theme_mode("DARK"), Some(ThemeMode::Dark));
-        assert_eq!(parse_theme_mode("system"), None);
+    fn parses_theme_name_and_migrates_legacy_modes() {
+        assert_eq!(
+            parse_theme_name("light\n").as_deref(),
+            Some("Default Light")
+        );
+        assert_eq!(parse_theme_name("DARK").as_deref(), Some("Default Dark"));
+        assert_eq!(parse_theme_name("Ayu Dark").as_deref(), Some("Ayu Dark"));
+        assert_eq!(parse_theme_name(" \n"), None);
     }
 }

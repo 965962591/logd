@@ -1,9 +1,35 @@
 //! Shared layout values and colors derived from the active gpui-kit theme.
 
-use gpui::{rgb, App, Hsla, Rgba};
-use gpui_component::ActiveTheme as _;
+use gpui::{rgb, App, Hsla, Rgba, SharedString, Window};
+use gpui_component::{ActiveTheme as _, ThemeMode, ThemeRegistry};
 
 const DARK_SURFACE_RGB: u32 = 0x171717;
+pub const DEFAULT_LIGHT_THEME: &str = "Default Light";
+pub const DEFAULT_DARK_THEME: &str = "Default Dark";
+
+const BUILTIN_THEME_SETS: &[&str] = &[
+    include_str!("../themes/adventure.json"),
+    include_str!("../themes/alduin.json"),
+    include_str!("../themes/asciinema.json"),
+    include_str!("../themes/aurora.json"),
+    include_str!("../themes/ayu.json"),
+    include_str!("../themes/catppuccin.json"),
+    include_str!("../themes/everforest.json"),
+    include_str!("../themes/fahrenheit.json"),
+    include_str!("../themes/flexoki.json"),
+    include_str!("../themes/gruvbox.json"),
+    include_str!("../themes/harper.json"),
+    include_str!("../themes/hybrid.json"),
+    include_str!("../themes/jellybeans.json"),
+    include_str!("../themes/kibble.json"),
+    include_str!("../themes/macos-classic.json"),
+    include_str!("../themes/mellifluous.json"),
+    include_str!("../themes/molokai.json"),
+    include_str!("../themes/solarized.json"),
+    include_str!("../themes/spaceduck.json"),
+    include_str!("../themes/tokyonight.json"),
+    include_str!("../themes/twilight.json"),
+];
 
 #[derive(Clone, Copy)]
 pub struct Palette {
@@ -32,10 +58,38 @@ pub struct Palette {
     pub search_foreground: Hsla,
 }
 
+pub fn register_builtin_themes(cx: &mut App) {
+    let registry = ThemeRegistry::global_mut(cx);
+    for contents in BUILTIN_THEME_SETS {
+        registry
+            .load_themes_from_str(contents)
+            .expect("gpui-kit built-in theme must be valid");
+    }
+}
+
+pub fn available_themes(cx: &App) -> Vec<(SharedString, ThemeMode)> {
+    ThemeRegistry::global(cx)
+        .sorted_themes()
+        .into_iter()
+        .map(|theme| (theme.name.clone(), theme.mode))
+        .collect()
+}
+
+pub fn apply_named_theme(name: &str, window: Option<&mut Window>, cx: &mut App) -> bool {
+    let Some(config) = ThemeRegistry::global(cx).themes().get(name).cloned() else {
+        return false;
+    };
+    let mode = config.mode;
+    gpui_component::Theme::global_mut(cx).apply_config(&config);
+    gpui_component::Theme::change(mode, window, cx);
+    apply_dark_surface(cx);
+    true
+}
+
 pub fn palette(cx: &App) -> Palette {
     let active = cx.theme();
     let dark_surface = dark_surface();
-    let surface = if active.mode.is_dark() {
+    let surface = if active.theme_name().as_ref() == DEFAULT_DARK_THEME {
         dark_surface
     } else {
         active.background
@@ -81,7 +135,7 @@ pub fn palette(cx: &App) -> Palette {
 /// through the application's palette, so changing only the root view leaves
 /// split frames and tiles with the stock dark-theme background.
 pub fn apply_dark_surface(cx: &mut App) {
-    if !cx.theme().mode.is_dark() {
+    if cx.theme().theme_name().as_ref() != DEFAULT_DARK_THEME {
         return;
     }
 
@@ -123,4 +177,34 @@ pub const WHEEL_LINES: f32 = 3.0;
 
 pub fn c(v: u32) -> Rgba {
     rgb(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use gpui_component::ThemeSet;
+
+    use super::BUILTIN_THEME_SETS;
+
+    #[test]
+    fn bundled_gpui_kit_themes_are_valid_and_unique() {
+        let themes = BUILTIN_THEME_SETS
+            .iter()
+            .flat_map(|contents| {
+                serde_json::from_str::<ThemeSet>(contents)
+                    .expect("bundled theme must parse")
+                    .themes
+            })
+            .collect::<Vec<_>>();
+        let names = themes
+            .iter()
+            .map(|theme| theme.name.as_ref())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(BUILTIN_THEME_SETS.len(), 21);
+        assert_eq!(themes.len(), 36);
+        assert_eq!(names.len(), themes.len());
+    }
+
 }

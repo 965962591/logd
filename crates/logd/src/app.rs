@@ -296,10 +296,8 @@ enum MenuCommand {
     SaveEditedCopy,
     ImportFilters,
     SetEncoding(Encoding),
-    SetTheme(gpui_component::ThemeMode),
+    SetTheme(SharedString),
     CopySelection,
-    ShowAll,
-    ShowOnlyFiltered,
     ToggleFilters,
     ToggleSearchResults,
     AddFilter,
@@ -1211,16 +1209,17 @@ impl LogdApp {
 
     fn set_theme(
         &mut self,
-        mode: gpui_component::ThemeMode,
+        name: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if cx.theme().mode == mode {
+        if cx.theme().theme_name() == &name {
             return;
         }
 
-        gpui_component::Theme::change(mode, Some(window), cx);
-        theme::apply_dark_surface(cx);
+        if !theme::apply_named_theme(name.as_ref(), Some(window), cx) {
+            return;
+        }
         let search_foreground = theme::search_foreground_rgb(cx);
         if !self.search_filters.is_empty() {
             for filter in &mut self.search_filters {
@@ -1237,7 +1236,7 @@ impl LogdApp {
             }
         }
 
-        let _ = crate::settings::save_theme_mode(mode);
+        let _ = crate::settings::save_theme_name(name.as_ref());
         cx.refresh_windows();
         cx.notify();
     }
@@ -1601,8 +1600,6 @@ impl LogdApp {
                     view.update(cx, |view, cx| view.copy_selection(cx));
                 }
             }
-            MenuCommand::ShowAll => self.set_show_only(false, window, cx),
-            MenuCommand::ShowOnlyFiltered => self.set_show_only(true, window, cx),
             MenuCommand::ToggleFilters => {
                 let visible = self.filter_panel.read(cx).visible();
                 self.show_filter_panel(!visible, window, cx)
@@ -1662,15 +1659,23 @@ impl LogdApp {
         let app = cx.entity();
         let lang = self.language;
         let recent = self.recent_files.clone();
-        let only = self.show_only_filtered;
-        let filters_open = self.filter_panel.read(cx).visible();
-        let search_results_open = self.search_results_panel.read(cx).visible();
         let selected = self.selected_filter.is_some();
         let has_view = self.active_view().is_some();
         let active_encoding = self
             .active_view()
             .map(|view| view.read(cx).doc().encoding());
-        let dark_theme = cx.theme().mode.is_dark();
+        let active_theme = cx.theme().theme_name().clone();
+        let themes = theme::available_themes(cx);
+        let light_themes = themes
+            .iter()
+            .filter(|(_, mode)| *mode == gpui_component::ThemeMode::Light)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let dark_themes = themes
+            .into_iter()
+            .filter(|(_, mode)| *mode == gpui_component::ThemeMode::Dark)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
         let id = match command_group {
             Key::File => "menu-file",
             Key::View => "menu-view",
@@ -1776,48 +1781,7 @@ impl LogdApp {
                 .into_any_element(),
             Key::View => button
                 .dropdown_menu(move |menu, window, cx| {
-                    let all_app = app.clone();
-                    let only_app = app.clone();
-                    let panel_app = app.clone();
-                    let search_panel_app = app.clone();
                     let language_app = app.clone();
-                    let light_theme_app = app.clone();
-                    let dark_theme_app = app.clone();
-                    let menu = menu
-                        .item(
-                            PopupMenuItem::new(text(Key::ShowAll, lang))
-                                .checked(!only)
-                                .on_click(window.listener_for(&all_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::ShowAll, window, cx)
-                                })),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::ShowOnlyFiltered, lang))
-                                .checked(only)
-                                .on_click(window.listener_for(&only_app, |this, _, window, cx| {
-                                    this.dispatch(MenuCommand::ShowOnlyFiltered, window, cx)
-                                })),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::ShowFilters, lang))
-                                .checked(filters_open)
-                                .on_click(window.listener_for(
-                                    &panel_app,
-                                    |this, _, window, cx| {
-                                        this.dispatch(MenuCommand::ToggleFilters, window, cx)
-                                    },
-                                )),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::ShowSearchResults, lang))
-                                .checked(search_results_open)
-                                .on_click(window.listener_for(
-                                    &search_panel_app,
-                                    |this, _, window, cx| {
-                                        this.dispatch(MenuCommand::ToggleSearchResults, window, cx)
-                                    },
-                                )),
-                        );
                     let copy_app = app.clone();
                     let menu = menu.item(
                         PopupMenuItem::new(text(Key::Copy, lang))
@@ -1845,43 +1809,57 @@ impl LogdApp {
                             )
                         },
                     );
+                    let theme_app = app.clone();
+                    let menu_light_themes = light_themes.clone();
+                    let menu_dark_themes = dark_themes.clone();
+                    let menu_active_theme = active_theme.clone();
                     menu.submenu(
                         text(Key::Theme, lang),
                         window,
                         cx,
                         move |menu, window, _| {
-                            menu.item(
-                                PopupMenuItem::new(text(Key::LightTheme, lang))
-                                    .checked(!dark_theme)
-                                    .on_click(window.listener_for(
-                                        &light_theme_app,
-                                        |this, _, window, cx| {
-                                            this.dispatch(
-                                                MenuCommand::SetTheme(
-                                                    gpui_component::ThemeMode::Light,
-                                                ),
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                            )
-                            .item(
-                                PopupMenuItem::new(text(Key::DarkTheme, lang))
-                                    .checked(dark_theme)
-                                    .on_click(window.listener_for(
-                                        &dark_theme_app,
-                                        |this, _, window, cx| {
-                                            this.dispatch(
-                                                MenuCommand::SetTheme(
-                                                    gpui_component::ThemeMode::Dark,
-                                                ),
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                            )
+                            let menu = menu.scrollable(true).item(
+                                PopupMenuItem::new(text(Key::LightTheme, lang)).disabled(true),
+                            );
+                            let menu = menu_light_themes.iter().fold(menu, |menu, theme_name| {
+                                let item_app = theme_app.clone();
+                                let target = theme_name.clone();
+                                menu.item(
+                                    PopupMenuItem::new(theme_name.clone())
+                                        .checked(theme_name == &menu_active_theme)
+                                        .on_click(window.listener_for(
+                                            &item_app,
+                                            move |this, _, window, cx| {
+                                                this.dispatch(
+                                                    MenuCommand::SetTheme(target.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                            });
+                            let menu = menu.separator().item(
+                                PopupMenuItem::new(text(Key::DarkTheme, lang)).disabled(true),
+                            );
+                            menu_dark_themes.iter().fold(menu, |menu, theme_name| {
+                                let item_app = theme_app.clone();
+                                let target = theme_name.clone();
+                                menu.item(
+                                    PopupMenuItem::new(theme_name.clone())
+                                        .checked(theme_name == &menu_active_theme)
+                                        .on_click(window.listener_for(
+                                            &item_app,
+                                            move |this, _, window, cx| {
+                                                this.dispatch(
+                                                    MenuCommand::SetTheme(target.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                            })
                         },
                     )
                 })
@@ -3577,8 +3555,11 @@ pub fn run(initial: Vec<PathBuf>) {
     app.run(move |cx| {
         cx.set_app_identity("com.github.965962591.logd", "logd");
         gpui_component::init(cx);
-        gpui_component::Theme::change(crate::settings::load_theme_mode(), None, cx);
-        crate::theme::apply_dark_surface(cx);
+        crate::theme::register_builtin_themes(cx);
+        let selected_theme = crate::settings::load_theme_name();
+        if !crate::theme::apply_named_theme(&selected_theme, None, cx) {
+            crate::theme::apply_named_theme(crate::theme::DEFAULT_DARK_THEME, None, cx);
+        }
         let initial = initial.clone();
         let options = crate::platform::window_options(cx);
         cx.spawn(async move |cx| {
