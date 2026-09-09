@@ -694,6 +694,8 @@ impl LogdApp {
                 filter
             })
             .collect::<Vec<_>>();
+        // Keep title-bar terms after the configured prefix. They are temporary
+        // filters for the current scan and never enter the persisted filter list.
         filters.extend(self.search_filters.iter().cloned());
         filters
     }

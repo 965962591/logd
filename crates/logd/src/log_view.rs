@@ -23,7 +23,7 @@ use gpui_component::scroll::{AutoScroll, Scrollbar, ScrollbarHandle, ScrollbarMo
 use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
 use logd_core::{
-    cache, index::HEAD_BYTES, scan_all_with_query_and_counts_for_filters, scan_query_all,
+    cache, index::HEAD_BYTES, scan_all_with_temporary_query_and_counts_for_filters, scan_query_all,
     CompileOptions, Document, Encoding, FileSource, FilterScanResult, FilterSpec, LineIndex,
     MatcherSet, Progress, Query, RenderRow, ScanOutcome, ScrollTo,
 };
@@ -115,6 +115,9 @@ pub struct LogView {
     filter_match_counts: Option<Arc<Vec<u64>>>,
     multi_file_filter_mask: Arc<Vec<bool>>,
     multi_file_filter_matches: Option<Arc<Vec<u64>>>,
+    /// Number of leading matcher entries supplied by the persisted filter
+    /// configuration; trailing entries are temporary title-bar filters.
+    configured_filter_count: usize,
     search_query: Arc<Query>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
@@ -246,6 +249,7 @@ impl LogView {
             filter_match_counts: None,
             multi_file_filter_mask: Arc::new(Vec::new()),
             multi_file_filter_matches: None,
+            configured_filter_count: 0,
             search_query,
             search_matches: None,
             search_scanning: None,
@@ -410,6 +414,7 @@ impl LogView {
     ) {
         self.dirty = false;
         self.filter_match_counts = None;
+        self.configured_filter_count = configured_filter_count.min(filters.len());
         self.multi_file_filter_mask = Arc::new(
             filters
                 .iter()
@@ -579,6 +584,7 @@ impl LogView {
         let source = self.doc.source().clone();
         let index = self.doc.index().clone();
         let matcher = self.doc.matcher().clone();
+        let configured_filter_count = self.configured_filter_count;
         let multi_file_filter_mask = self.multi_file_filter_mask.clone();
         let query = self.search_query.clone();
         let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
@@ -588,11 +594,12 @@ impl LogView {
             let out = cx
                 .background_executor()
                 .spawn(async move {
-                    scan_all_with_query_and_counts_for_filters(
+                    scan_all_with_temporary_query_and_counts_for_filters(
                         source.data(),
                         &index,
                         &matcher,
                         &query,
+                        configured_filter_count,
                         multi_file_filter_mask.as_slice(),
                         &progress,
                     )

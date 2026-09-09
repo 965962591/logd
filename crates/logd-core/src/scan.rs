@@ -111,6 +111,34 @@ pub fn scan_all_with_query_and_counts(
     scan_all_with_query_and_counts_for_filters(data, index, matcher, query, &[], progress)
 }
 
+/// Apply configured filters together with a temporary title-bar query.
+///
+/// `configured_filter_count` identifies the prefix of `matcher.filters()` that
+/// came from the persisted filter configuration. The query is treated as an
+/// additional, temporary include condition: it is not persisted and it does
+/// not participate in configured-filter counts. Configured excludes still
+/// hide matching lines. The result is cancelled by `progress` in the same way
+/// as the other full-file scanners.
+pub fn scan_all_with_temporary_query_and_counts_for_filters(
+    data: &[u8],
+    index: &LineIndex,
+    matcher: &MatcherSet,
+    query: &Query,
+    configured_filter_count: usize,
+    result_filters: &[bool],
+    progress: &Progress,
+) -> Option<FilterScanResult> {
+    scan_all_with_query_and_counts_for_filters_impl(
+        data,
+        index,
+        matcher,
+        query,
+        result_filters,
+        progress,
+        Some(configured_filter_count),
+    )
+}
+
 /// Apply configured filters and a temporary query while also collecting the
 /// lines hit by selected include filters, minus lines hit by selected excludes.
 pub fn scan_all_with_query_and_counts_for_filters(
@@ -120,6 +148,26 @@ pub fn scan_all_with_query_and_counts_for_filters(
     query: &Query,
     result_filters: &[bool],
     progress: &Progress,
+) -> Option<FilterScanResult> {
+    scan_all_with_query_and_counts_for_filters_impl(
+        data,
+        index,
+        matcher,
+        query,
+        result_filters,
+        progress,
+        None,
+    )
+}
+
+fn scan_all_with_query_and_counts_for_filters_impl(
+    data: &[u8],
+    index: &LineIndex,
+    matcher: &MatcherSet,
+    query: &Query,
+    result_filters: &[bool],
+    progress: &Progress,
+    temporary_query_filter_count: Option<usize>,
 ) -> Option<FilterScanResult> {
     progress.set_total(index.indexed_bytes.max(1));
 
@@ -135,7 +183,17 @@ pub fn scan_all_with_query_and_counts_for_filters(
     let parts: Vec<FilterScanChunk> = index
         .chunks
         .par_iter()
-        .map(|chunk| scan_filter_chunk(data, chunk, matcher, query, result_filters, progress))
+        .map(|chunk| {
+            scan_filter_chunk(
+                data,
+                chunk,
+                matcher,
+                query,
+                result_filters,
+                progress,
+                temporary_query_filter_count,
+            )
+        })
         .collect();
 
     if progress.is_cancelled() {
@@ -177,6 +235,7 @@ fn scan_filter_chunk(
     query: &Query,
     result_filters: &[bool],
     progress: &Progress,
+    temporary_query_filter_count: Option<usize>,
 ) -> FilterScanChunk {
     let end = (chunk.end_byte as usize).min(data.len());
     let mut pos = chunk.start_byte as usize;
@@ -224,7 +283,19 @@ fn scan_filter_chunk(
         if selected_include && !selected_exclude {
             selected_filter_lines.push(chunk.start_line + line_offset);
         }
-        if filters_visible && query.matches(line, &mut query_scratch) {
+
+        let line_visible = match temporary_query_filter_count {
+            Some(configured_filter_count) if !query.is_empty() => temporary_query_visible(
+                matcher,
+                &filter_hits,
+                configured_filter_count,
+                query,
+                line,
+                &mut query_scratch,
+            ),
+            _ => filters_visible && query.matches(line, &mut query_scratch),
+        };
+        if line_visible {
             lines.push(chunk.start_line + line_offset);
         }
         pos = next;
@@ -239,6 +310,45 @@ fn scan_filter_chunk(
         lines,
         filter_counts,
         selected_filter_lines,
+    }
+}
+
+/// Return the visibility of a line when the title-bar query is a temporary
+/// include alongside the configured filter prefix. Configured excludes always
+/// win. If configured includes exist, either one of those or the query may
+/// select a line; with no configured include, the query itself is the only
+/// include condition while it is active.
+fn temporary_query_visible(
+    matcher: &MatcherSet,
+    filter_hits: &[bool],
+    configured_filter_count: usize,
+    query: &Query,
+    line: &[u8],
+    query_scratch: &mut QueryScratch,
+) -> bool {
+    let configured_filters = matcher.filters().iter().take(configured_filter_count);
+    let mut has_configured_include = false;
+    let mut configured_include_hit = false;
+
+    for (index, filter) in configured_filters.enumerate() {
+        if !filter.is_active() {
+            continue;
+        }
+        if filter.excluding {
+            if filter_hits.get(index).copied().unwrap_or(false) {
+                return false;
+            }
+        } else {
+            has_configured_include = true;
+            configured_include_hit |= filter_hits.get(index).copied().unwrap_or(false);
+        }
+    }
+
+    let query_hit = query.matches(line, query_scratch);
+    if has_configured_include {
+        configured_include_hit || query_hit
+    } else {
+        query_hit
     }
 }
 
@@ -544,5 +654,75 @@ mod tests {
         };
         assert_eq!(lines, vec![0]);
         assert_eq!(result.selected_filter_lines, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn temporary_query_is_an_include_without_being_persisted() {
+        let (data, idx) = build("configured only\nquery only\nboth configured query\nother\n");
+        let matcher = matcher(vec![
+            FilterSpec {
+                text: "configured".into(),
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "query".into(),
+                mode: crate::matcher::HighlightMode::Field,
+                ..Default::default()
+            },
+        ]);
+        let query = Query::parse("query", CompileOptions::default()).unwrap();
+
+        let result = scan_all_with_temporary_query_and_counts_for_filters(
+            &data,
+            &idx,
+            &matcher,
+            &query,
+            1,
+            &[],
+            &Progress::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Matched(lines) = result.outcome else {
+            panic!()
+        };
+        assert_eq!(lines, vec![0, 1, 2]);
+        assert_eq!(result.filter_counts, vec![2, 2]);
+    }
+
+    #[test]
+    fn temporary_query_still_respects_configured_excludes() {
+        let (data, idx) = build("configured\nquery\nquery blocked\n");
+        let matcher = matcher(vec![
+            FilterSpec {
+                text: "configured".into(),
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "blocked".into(),
+                excluding: true,
+                ..Default::default()
+            },
+            FilterSpec {
+                text: "query".into(),
+                mode: crate::matcher::HighlightMode::Field,
+                ..Default::default()
+            },
+        ]);
+        let query = Query::parse("query", CompileOptions::default()).unwrap();
+
+        let result = scan_all_with_temporary_query_and_counts_for_filters(
+            &data,
+            &idx,
+            &matcher,
+            &query,
+            2,
+            &[],
+            &Progress::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Matched(lines) = result.outcome else {
+            panic!()
+        };
+        assert_eq!(lines, vec![0, 1]);
     }
 }
