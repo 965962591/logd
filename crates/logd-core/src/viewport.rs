@@ -139,6 +139,11 @@ impl Viewport {
             .min(self.total_lines.saturating_sub(1))
     }
 
+    /// Whether the viewport is pinned to the end of the document.
+    pub fn is_at_bottom(&self) -> bool {
+        self.max_scroll_lines() - self.scroll_lines() <= 0.001
+    }
+
     // ---- 纵向滚动 ----
 
     /// `dy > 0` 表示内容上移（视图往文件末尾走）。

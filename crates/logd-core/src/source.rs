@@ -6,8 +6,11 @@
 //! **匹配跑在原始字节上**，只有可见的 ~60 行才解码成 `str`。所以关键字在建
 //! matcher 时就按本文件的编码转成字节串（见 [`crate::matcher::encode_pattern`]）。
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -206,7 +209,7 @@ pub struct FileSource {
 impl FileSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).with_context(|| format!("打不开 {}", path.display()))?;
+        let file = open_log_file(&path).with_context(|| format!("打不开 {}", path.display()))?;
         let len = file
             .metadata()
             .with_context(|| format!("读不到 {} 的元信息", path.display()))?
@@ -276,6 +279,23 @@ impl FileSource {
         &self.path
     }
 
+    /// Cheaply verify that this source still looks like an append-only
+    /// continuation of an older mapping. Sampling both ends catches normal
+    /// log rotation without rescanning a multi-gigabyte prefix.
+    pub fn preserves_prefix(&self, previous: &Self) -> bool {
+        const SAMPLE_BYTES: usize = 64 * 1024;
+
+        if self.len < previous.len {
+            return false;
+        }
+        let old = previous.data();
+        let new = self.data();
+        let head_len = old.len().min(SAMPLE_BYTES);
+        let tail_start = old.len().saturating_sub(SAMPLE_BYTES);
+        new.get(..head_len) == Some(&old[..head_len])
+            && new.get(tail_start..old.len()) == Some(&old[tail_start..])
+    }
+
     pub fn file_name(&self) -> String {
         self.path
             .file_name()
@@ -314,6 +334,23 @@ impl FileSource {
     }
 }
 
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(windows)]
+    {
+        // Keep the reader invisible to a live logger: it may append, rotate,
+        // replace, or delete the path while our snapshot mapping is alive.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+
+    options.open(path)
+}
+
 /// 返回 (编码, BOM 字节数)。
 fn detect_encoding(data: &[u8]) -> Result<(Encoding, usize)> {
     if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -341,6 +378,9 @@ fn detect_encoding(data: &[u8]) -> Result<(Encoding, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    use std::io::Write;
 
     #[test]
     fn detects_utf8_bom() {
@@ -391,5 +431,47 @@ mod tests {
         assert!(!had_errors);
         let source = FileSource::from_bytes_for_test(bytes.into_owned(), Encoding::Big5);
         assert_eq!(source.decode(0, source.len()), "繁體日誌");
+    }
+
+    #[test]
+    fn append_only_source_preserves_sampled_prefix() {
+        let previous = FileSource::from_bytes_for_test(b"one\ntwo\n".to_vec(), Encoding::Utf8);
+        let appended =
+            FileSource::from_bytes_for_test(b"one\ntwo\nthree\n".to_vec(), Encoding::Utf8);
+        let replaced =
+            FileSource::from_bytes_for_test(b"different content\n".to_vec(), Encoding::Utf8);
+
+        assert!(appended.preserves_prefix(&previous));
+        assert!(!replaced.preserves_prefix(&previous));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mapped_source_does_not_lock_live_log() {
+        let directory = std::env::temp_dir().join(format!(
+            "logd-no-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("live.log");
+        let rotated = directory.join("live.log.1");
+        std::fs::write(&path, b"first\n").unwrap();
+
+        let source = FileSource::open(&path).unwrap();
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::remove_file(&rotated).unwrap();
+
+        // The mapped snapshot remains readable after normal log rotation.
+        assert_eq!(source.data(), b"first\n");
+        drop(source);
+        std::fs::remove_dir(&directory).unwrap();
     }
 }

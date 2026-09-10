@@ -89,6 +89,7 @@ const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 32.0;
 const LINE_HEIGHT_PADDING: f32 = 5.0;
 const SEARCH_RESULT_FLASH_DURATION: Duration = Duration::from_millis(1_200);
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 打开文件的**易错部分**：mmap + 编码探测 + 首屏索引。
 ///
@@ -98,6 +99,25 @@ pub struct Loaded {
     index: Arc<LineIndex>,
     /// 索引是不是从磁盘缓存直接读出来的（省掉一整趟扫描）
     from_cache: bool,
+}
+
+#[derive(Clone)]
+struct RefreshScanSnapshot {
+    matcher: Arc<MatcherSet>,
+    query: Arc<Query>,
+    configured_filter_count: usize,
+    multi_file_filter_mask: Arc<Vec<bool>>,
+    matches: Option<Arc<Vec<u64>>>,
+    filter_counts: Option<Arc<Vec<u64>>>,
+    selected_filter_lines: Option<Arc<Vec<u64>>>,
+    search_matches: Option<Arc<Vec<u64>>>,
+}
+
+struct IncrementalRefreshResults {
+    matches: Option<Arc<Vec<u64>>>,
+    filter_counts: Arc<Vec<u64>>,
+    selected_filter_lines: Option<Arc<Vec<u64>>>,
+    search_matches: Option<Arc<Vec<u64>>>,
 }
 
 pub struct LogView {
@@ -284,6 +304,7 @@ impl LogView {
         if !complete {
             view.start_full_index(cx);
         }
+        view.start_auto_refresh(cx);
         view
     }
 
@@ -393,6 +414,168 @@ impl LogView {
             }
         })
         .detach();
+    }
+
+    /// Watch an append-only log without retaining another file handle. Each
+    /// refresh opens a new shared mapping and swaps it in only after its index
+    /// is ready, so rendering never observes mismatched data and offsets.
+    fn start_auto_refresh(&self, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| loop {
+            executor.timer(AUTO_REFRESH_INTERVAL).await;
+
+            let snapshot = match this.update(cx, |this, _| {
+                (this.indexing.is_none()
+                    && this.scanning.is_none()
+                    && this.search_scanning.is_none())
+                .then(|| {
+                    (
+                        this.doc.source().clone(),
+                        this.doc.index().clone(),
+                        RefreshScanSnapshot {
+                            matcher: this.doc.matcher().clone(),
+                            query: this.search_query.clone(),
+                            configured_filter_count: this.configured_filter_count,
+                            multi_file_filter_mask: this.multi_file_filter_mask.clone(),
+                            matches: this.doc.matched_lines(),
+                            filter_counts: this.filter_match_counts.clone(),
+                            selected_filter_lines: this.multi_file_filter_matches.clone(),
+                            search_matches: this.search_matches.clone(),
+                        },
+                    )
+                })
+            }) {
+                Ok(snapshot) => snapshot,
+                Err(_) => break,
+            };
+            let Some((old_source, old_index, scan_snapshot)) = snapshot else {
+                continue;
+            };
+
+            let path = old_source.path().to_path_buf();
+            let metadata_path = path.clone();
+            let disk_len = executor
+                .spawn(async move { std::fs::metadata(metadata_path).map(|meta| meta.len()) })
+                .await;
+            let Ok(disk_len) = disk_len else {
+                // Rotation can briefly leave the original path absent.
+                continue;
+            };
+            if disk_len == old_source.len() {
+                continue;
+            }
+
+            let progress = Arc::new(Progress::default());
+            let accepted = this
+                .update(cx, |this, cx| {
+                    if this.indexing.is_some() || !Arc::ptr_eq(this.doc.source(), &old_source) {
+                        return false;
+                    }
+                    this.indexing = Some(progress.clone());
+                    this.poll_while_busy(cx);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !accepted {
+                continue;
+            }
+
+            let old_source_for_build = old_source.clone();
+            let old_index_for_build = old_index.clone();
+            let scan_snapshot_for_build = scan_snapshot.clone();
+            let build_progress = progress.clone();
+            let refreshed = executor
+                .spawn(async move {
+                    let source = Arc::new(FileSource::open(path)?);
+                    let append_only = source.len() > old_source_for_build.len()
+                        && source.preserves_prefix(&old_source_for_build);
+                    let refresh_line = if old_source_for_build.is_empty()
+                        || old_source_for_build.data().last() == Some(&b'\n')
+                    {
+                        old_index_for_build.total_lines
+                    } else {
+                        old_index_for_build
+                            .chunks
+                            .last()
+                            .map(|chunk| chunk.start_line)
+                            .unwrap_or(0)
+                    };
+                    let index = if append_only {
+                        LineIndex::extend(&old_index_for_build, source.data(), &build_progress)
+                    } else {
+                        LineIndex::build_full(source.data(), &build_progress)
+                    };
+                    Ok::<_, anyhow::Error>(index.map(|index| {
+                        let index = Arc::new(index);
+                        let results = append_only.then(|| {
+                            incremental_refresh_results(
+                                &old_source_for_build,
+                                &old_index_for_build,
+                                &source,
+                                &index,
+                                refresh_line,
+                                &scan_snapshot_for_build,
+                            )
+                        });
+                        (source, index, results.flatten())
+                    }))
+                })
+                .await;
+
+            if this
+                .update(cx, |this, cx| {
+                    if !Arc::ptr_eq(this.doc.source(), &old_source) {
+                        return;
+                    }
+                    this.indexing = None;
+                    if let Ok(Some((source, index, results))) = refreshed {
+                        let scan_unchanged =
+                            Arc::ptr_eq(this.doc.matcher(), &scan_snapshot.matcher)
+                                && Arc::ptr_eq(&this.search_query, &scan_snapshot.query)
+                                && this.configured_filter_count
+                                    == scan_snapshot.configured_filter_count
+                                && Arc::ptr_eq(
+                                    &this.multi_file_filter_mask,
+                                    &scan_snapshot.multi_file_filter_mask,
+                                );
+                        this.doc.replace_source_and_index(source, index);
+                        this.from_cache = false;
+                        if scan_unchanged {
+                            if let Some(results) = results {
+                                this.apply_incremental_refresh_results(results);
+                            } else {
+                                this.start_scan(cx);
+                                this.start_search_scan(cx);
+                            }
+                        } else {
+                            this.start_scan(cx);
+                            this.start_search_scan(cx);
+                        }
+                    }
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn apply_incremental_refresh_results(&mut self, results: IncrementalRefreshResults) {
+        if let Some(progress) = self.scanning.take() {
+            progress.cancel();
+        }
+        if let Some(progress) = self.search_scanning.take() {
+            progress.cancel();
+        }
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.search_scan_gen = self.search_scan_gen.wrapping_add(1);
+        self.doc.set_matches(results.matches);
+        self.filter_match_counts = Some(results.filter_counts);
+        self.multi_file_filter_matches = results.selected_filter_lines;
+        self.search_matches = results.search_matches;
     }
 
     // ---- 筛选 ----
@@ -2119,6 +2302,116 @@ impl Render for LogView {
     }
 }
 
+fn incremental_refresh_results(
+    old_source: &FileSource,
+    old_index: &LineIndex,
+    new_source: &FileSource,
+    new_index: &LineIndex,
+    refresh_line: u64,
+    snapshot: &RefreshScanSnapshot,
+) -> Option<IncrementalRefreshResults> {
+    let has_combined_filter = !snapshot.matcher.is_noop() || !snapshot.query.is_empty();
+    let has_selected_filters = snapshot
+        .multi_file_filter_mask
+        .iter()
+        .zip(snapshot.matcher.filters())
+        .any(|(selected, filter)| *selected && !filter.excluding);
+    if snapshot.filter_counts.is_none()
+        || (has_combined_filter && snapshot.matches.is_none())
+        || (has_selected_filters && snapshot.selected_filter_lines.is_none())
+        || (!snapshot.query.is_empty() && snapshot.search_matches.is_none())
+    {
+        return None;
+    }
+
+    let old_tail = old_index.suffix_from_line(refresh_line);
+    let new_tail = new_index.suffix_from_line(refresh_line);
+    let old_tail_results = scan_all_with_temporary_query_and_counts_for_filters(
+        old_source.data(),
+        &old_tail,
+        &snapshot.matcher,
+        &snapshot.query,
+        snapshot.configured_filter_count,
+        snapshot.multi_file_filter_mask.as_slice(),
+        &Progress::default(),
+    )?;
+    let new_tail_results = scan_all_with_temporary_query_and_counts_for_filters(
+        new_source.data(),
+        &new_tail,
+        &snapshot.matcher,
+        &snapshot.query,
+        snapshot.configured_filter_count,
+        snapshot.multi_file_filter_mask.as_slice(),
+        &Progress::default(),
+    )?;
+
+    let mut filter_counts = snapshot.filter_counts.as_ref()?.as_ref().clone();
+    for ((total, old_count), new_count) in filter_counts
+        .iter_mut()
+        .zip(old_tail_results.filter_counts)
+        .zip(new_tail_results.filter_counts)
+    {
+        *total = total.saturating_sub(old_count).saturating_add(new_count);
+    }
+
+    let matches = if has_combined_filter {
+        let ScanOutcome::Matched(tail) = new_tail_results.outcome else {
+            return None;
+        };
+        Some(Arc::new(merge_refreshed_lines(
+            snapshot.matches.as_ref()?.as_slice(),
+            refresh_line,
+            tail,
+        )))
+    } else {
+        None
+    };
+
+    let selected_filter_lines = if has_selected_filters {
+        Some(Arc::new(merge_refreshed_lines(
+            snapshot.selected_filter_lines.as_ref()?.as_slice(),
+            refresh_line,
+            new_tail_results.selected_filter_lines,
+        )))
+    } else {
+        None
+    };
+
+    let search_matches = if snapshot.query.is_empty() {
+        None
+    } else {
+        let ScanOutcome::Matched(tail) = scan_query_all(
+            new_source.data(),
+            &new_tail,
+            &snapshot.query,
+            &Progress::default(),
+        )?
+        else {
+            return None;
+        };
+        Some(Arc::new(merge_refreshed_lines(
+            snapshot.search_matches.as_ref()?.as_slice(),
+            refresh_line,
+            tail,
+        )))
+    };
+
+    Some(IncrementalRefreshResults {
+        matches,
+        filter_counts: Arc::new(filter_counts),
+        selected_filter_lines,
+        search_matches,
+    })
+}
+
+fn merge_refreshed_lines(previous: &[u64], refresh_line: u64, tail: Vec<u64>) -> Vec<u64> {
+    let keep = previous.partition_point(|line| *line < refresh_line);
+    let mut merged = Vec::with_capacity(keep + tail.len());
+    merged.extend_from_slice(&previous[..keep]);
+    merged.extend(tail);
+    merged
+}
+
 fn next_char_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     if byte == text.len() {
@@ -2145,7 +2438,18 @@ fn prev_char_boundary(text: &str, byte: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextPoint, TextSelection};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use logd_core::{
+        scan_all_with_temporary_query_and_counts_for_filters, FileSource, FilterSpec, LineIndex,
+        MatcherSet, Progress, Query, ScanOutcome,
+    };
+
+    use super::{
+        incremental_refresh_results, merge_refreshed_lines, RefreshScanSnapshot, TextPoint,
+        TextSelection,
+    };
 
     fn selection(anchor: (u64, usize), active: (u64, usize)) -> TextSelection {
         TextSelection {
@@ -2185,5 +2489,96 @@ mod tests {
         let selection = selection((8, 7), (8, 2));
 
         assert_eq!(selection.range_for_row(8, 10), Some(2..7));
+    }
+
+    #[test]
+    fn refreshed_lines_replace_only_the_rescanned_tail() {
+        assert_eq!(
+            merge_refreshed_lines(&[1, 4, 8, 12], 8, vec![9, 11, 15]),
+            vec![1, 4, 9, 11, 15]
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_updates_matches_and_filter_counts() {
+        let directory = std::env::temp_dir().join(format!(
+            "logd-refresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("live.log");
+        std::fs::write(&path, b"hit\nmiss\npartial").unwrap();
+
+        let old_source = Arc::new(FileSource::open(&path).unwrap());
+        let old_index =
+            Arc::new(LineIndex::build_full(old_source.data(), &Progress::default()).unwrap());
+        let matcher = Arc::new(
+            MatcherSet::new(
+                vec![FilterSpec {
+                    text: "hit".into(),
+                    ..Default::default()
+                }],
+                old_source.encoding(),
+            )
+            .unwrap(),
+        );
+        let query = Arc::new(Query::always_true());
+        let initial = scan_all_with_temporary_query_and_counts_for_filters(
+            old_source.data(),
+            &old_index,
+            &matcher,
+            &query,
+            1,
+            &[true],
+            &Progress::default(),
+        )
+        .unwrap();
+        let ScanOutcome::Matched(initial_matches) = initial.outcome else {
+            panic!("active filter must return matched lines");
+        };
+        let snapshot = RefreshScanSnapshot {
+            matcher,
+            query,
+            configured_filter_count: 1,
+            multi_file_filter_mask: Arc::new(vec![true]),
+            matches: Some(Arc::new(initial_matches)),
+            filter_counts: Some(Arc::new(initial.filter_counts)),
+            selected_filter_lines: Some(Arc::new(initial.selected_filter_lines)),
+            search_matches: None,
+        };
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" hit\nnew hit\n")
+            .unwrap();
+        let new_source = Arc::new(FileSource::open(&path).unwrap());
+        let new_index = Arc::new(
+            LineIndex::extend(&old_index, new_source.data(), &Progress::default()).unwrap(),
+        );
+        let refresh_line = old_index.chunks.last().unwrap().start_line;
+        let refreshed = incremental_refresh_results(
+            &old_source,
+            &old_index,
+            &new_source,
+            &new_index,
+            refresh_line,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(refreshed.matches.unwrap().as_slice(), &[0, 2, 3]);
+        assert_eq!(refreshed.filter_counts.as_slice(), &[3]);
+        assert_eq!(
+            refreshed.selected_filter_lines.unwrap().as_slice(),
+            &[0, 2, 3]
+        );
+
+        drop(new_source);
+        drop(old_source);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

@@ -108,32 +108,7 @@ impl LineIndex {
             });
         }
 
-        // 先串行算出每块对齐到行首的起点。每次 memchr 只扫几百字节，可忽略。
-        let nchunks = (file_len / CHUNK_BYTES).max(1) as usize;
-        let mut starts: Vec<usize> = Vec::with_capacity(nchunks + 1);
-        starts.push(0);
-        for k in 1..nchunks {
-            let raw = (k as u64 * file_len / nchunks as u64) as usize;
-            let Some(s) = align_to_line_start(data, raw) else {
-                // 从 raw 到 EOF 没有换行了，后面的块全是空的。
-                break;
-            };
-            if s > *starts.last().unwrap() && s < data.len() {
-                starts.push(s);
-            }
-        }
-        starts.push(data.len());
-
-        let ranges: Vec<(usize, usize, bool)> = starts
-            .windows(2)
-            .enumerate()
-            .map(|(i, w)| (w[0], w[1], i == starts.len() - 2))
-            .collect();
-
-        let mut chunks: Vec<ChunkIndex> = ranges
-            .par_iter()
-            .map(|&(s, e, last)| index_chunk(data, s, e, last, Some(progress)))
-            .collect();
+        let mut chunks = index_range(data, 0, progress);
 
         if progress.is_cancelled() {
             return None;
@@ -154,6 +129,88 @@ impl LineIndex {
             file_len,
             complete: true,
         })
+    }
+
+    /// Extend a complete index after bytes have been appended to the file.
+    ///
+    /// If the previous final line was incomplete, its chunk is rebuilt. All
+    /// complete chunks and anchors are reused, so a refresh scans at most one
+    /// old chunk plus the newly appended bytes.
+    pub fn extend(previous: &LineIndex, data: &[u8], progress: &Progress) -> Option<LineIndex> {
+        let file_len = data.len() as u64;
+        if !previous.complete || file_len < previous.file_len {
+            return Self::build_full(data, progress);
+        }
+        if file_len == previous.file_len {
+            progress.set_total(0);
+            return Some(previous.clone());
+        }
+
+        let ended_on_line_boundary = previous.file_len == 0
+            || data
+                .get(previous.file_len.saturating_sub(1) as usize)
+                .copied()
+                == Some(b'\n');
+        let keep_count = if ended_on_line_boundary {
+            previous.chunks.len()
+        } else {
+            previous.chunks.len().saturating_sub(1)
+        };
+        let rebuild_start = if ended_on_line_boundary {
+            previous.file_len as usize
+        } else {
+            previous
+                .chunks
+                .get(keep_count)
+                .map(|chunk| chunk.start_byte as usize)
+                .unwrap_or(0)
+        };
+        progress.set_total((data.len() - rebuild_start) as u64);
+
+        let mut chunks = previous.chunks[..keep_count].to_vec();
+        let mut rebuilt = index_range(data, rebuild_start, progress);
+        if progress.is_cancelled() {
+            return None;
+        }
+        chunks.append(&mut rebuilt);
+        chunks.retain(|chunk| chunk.line_count > 0);
+
+        let mut total_lines = 0;
+        for chunk in &mut chunks {
+            chunk.start_line = total_lines;
+            total_lines += chunk.line_count;
+        }
+
+        Some(LineIndex {
+            chunks,
+            total_lines,
+            indexed_bytes: file_len,
+            file_len,
+            complete: true,
+        })
+    }
+
+    /// Return an index view containing chunks at or after a known chunk
+    /// boundary. Stored line numbers remain global, which lets scan results be
+    /// appended directly to results from an older snapshot.
+    pub fn suffix_from_line(&self, start_line: u64) -> LineIndex {
+        let chunks: Vec<_> = self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.start_line >= start_line)
+            .cloned()
+            .collect();
+        let indexed_bytes = chunks
+            .iter()
+            .map(|chunk| chunk.end_byte - chunk.start_byte)
+            .sum();
+        LineIndex {
+            chunks,
+            total_lines: self.total_lines,
+            indexed_bytes,
+            file_len: self.file_len,
+            complete: true,
+        }
     }
 
     /// 第 `line` 行的起始字节偏移。`line >= total_lines` 时返回 `None`。
@@ -209,6 +266,46 @@ impl LineIndex {
                 .map(|c| c.anchors.len() * 8)
                 .sum::<usize>()
     }
+}
+
+fn index_range(data: &[u8], start: usize, progress: &Progress) -> Vec<ChunkIndex> {
+    let byte_count = data.len().saturating_sub(start) as u64;
+    if byte_count == 0 {
+        return Vec::new();
+    }
+
+    // First find chunk boundaries on line starts. This scans only a few bytes
+    // around each boundary and lets the expensive work run in parallel.
+    let nchunks = (byte_count / CHUNK_BYTES).max(1) as usize;
+    let mut starts: Vec<usize> = Vec::with_capacity(nchunks + 1);
+    starts.push(start);
+    for k in 1..nchunks {
+        let raw = start + (k as u64 * byte_count / nchunks as u64) as usize;
+        let Some(aligned) = align_to_line_start(data, raw) else {
+            break;
+        };
+        if aligned > *starts.last().unwrap() && aligned < data.len() {
+            starts.push(aligned);
+        }
+    }
+    starts.push(data.len());
+
+    let last_range = starts.len() - 2;
+    starts
+        .windows(2)
+        .enumerate()
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&(index, window)| {
+            index_chunk(
+                data,
+                window[0],
+                window[1],
+                index == last_range,
+                Some(progress),
+            )
+        })
+        .collect()
 }
 
 /// 返回 `>= raw` 的第一个整行起点；`raw` 之后没有换行时返回 `None`。
@@ -363,6 +460,54 @@ mod tests {
         head.line_spans(&s, 0, head.total_lines as usize, &mut a);
         full.line_spans(&s, 0, head.total_lines as usize, &mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn extending_reuses_prefix_and_indexes_appended_lines() {
+        let before = b"one\ntwo\n";
+        let previous = LineIndex::build_full(before, &Progress::default()).unwrap();
+        let after = b"one\ntwo\nthree\nfour";
+
+        let extended = LineIndex::extend(&previous, after, &Progress::default()).unwrap();
+        let rebuilt = LineIndex::build_full(after, &Progress::default()).unwrap();
+
+        assert_eq!(extended.total_lines, 4);
+        assert_eq!(extended.file_len, after.len() as u64);
+        let (mut actual, mut expected) = (Vec::new(), Vec::new());
+        extended.line_spans(after, 0, 10, &mut actual);
+        rebuilt.line_spans(after, 0, 10, &mut expected);
+        assert_eq!(actual, expected);
+        assert_eq!(extended.chunks[0].end_byte, previous.file_len);
+        assert_eq!(extended.chunks[1].start_line, previous.total_lines);
+    }
+
+    #[test]
+    fn extending_rebuilds_an_unterminated_last_line() {
+        let before = b"one\npar";
+        let previous = LineIndex::build_full(before, &Progress::default()).unwrap();
+        let after = b"one\npartial\nthree\n";
+
+        let extended = LineIndex::extend(&previous, after, &Progress::default()).unwrap();
+        let mut spans = Vec::new();
+        extended.line_spans(after, 0, 10, &mut spans);
+
+        assert_eq!(extended.total_lines, 3);
+        assert_eq!(spans, vec![(0, 3), (4, 11), (12, 17)]);
+    }
+
+    #[test]
+    fn suffix_index_keeps_global_line_numbers() {
+        let before = b"one\ntwo\n";
+        let previous = LineIndex::build_full(before, &Progress::default()).unwrap();
+        let after = b"one\ntwo\nthree\nfour\n";
+        let extended = LineIndex::extend(&previous, after, &Progress::default()).unwrap();
+        let suffix = extended.suffix_from_line(previous.total_lines);
+        let mut spans = Vec::new();
+        suffix.line_spans(after, previous.total_lines, 10, &mut spans);
+
+        assert_eq!(suffix.chunks.len(), 1);
+        assert_eq!(suffix.chunks[0].start_line, 2);
+        assert_eq!(spans, vec![(8, 13), (14, 18)]);
     }
 
     #[test]

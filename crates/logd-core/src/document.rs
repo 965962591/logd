@@ -145,6 +145,20 @@ impl Document {
         self.sync_viewport();
     }
 
+    /// Replace a file snapshot and its matching index together. Readers at
+    /// the end keep following new lines; readers inspecting older content
+    /// retain their current position.
+    pub fn replace_source_and_index(&mut self, source: Arc<FileSource>, index: Arc<LineIndex>) {
+        let follow_tail = self.viewport.is_at_bottom();
+        self.source = source;
+        self.index = index;
+        self.matches = None;
+        self.sync_viewport();
+        if follow_tail {
+            self.viewport.scroll_to_bottom();
+        }
+    }
+
     /// 过滤器变了：命中集立即作废，等新的扫描结果。
     pub fn set_matcher(&mut self, matcher: Arc<MatcherSet>) {
         self.matcher = matcher;
@@ -549,6 +563,26 @@ mod tests {
         d.set_index(full);
         assert!(d.index_complete());
         assert_eq!(d.display_rows(), 1000);
+    }
+
+    #[test]
+    fn replacing_grown_source_follows_tail_only_when_already_at_bottom() {
+        let mut following = doc_from("one\ntwo\nthree\n", 10.0, 20.0);
+        following.viewport_mut().scroll_to_bottom();
+        let grown = Arc::new(FileSource::from_bytes_for_test(
+            b"one\ntwo\nthree\nfour\nfive\n".to_vec(),
+            Encoding::Utf8,
+        ));
+        let grown_index =
+            Arc::new(LineIndex::build_full(grown.data(), &Progress::default()).unwrap());
+        following.replace_source_and_index(grown.clone(), grown_index.clone());
+        assert!(following.viewport().is_at_bottom());
+
+        let mut reading = doc_from("one\ntwo\nthree\n", 10.0, 10.0);
+        reading.viewport_mut().scroll_to_top();
+        reading.replace_source_and_index(grown, grown_index);
+        assert_eq!(reading.viewport().anchor_line(), 0);
+        assert!(!reading.viewport().is_at_bottom());
     }
 
     #[test]
