@@ -18,7 +18,21 @@ mod theme;
 mod ui;
 mod updater;
 
+// Keep the machine-readable CLI in logd-core so the GUI binary and the
+// standalone development binary expose exactly the same behavior.
+#[path = "../../logd-core/src/bin/logd-core.rs"]
+mod cli;
+
 fn main() {
+    let mut args = std::env::args().skip(1);
+    if cli::is_cli_command(args.next().as_deref()) {
+        if let Err(error) = cli::run_from(std::env::args().skip(1)) {
+            eprintln!("错误: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     updater::start_auto_update();
 
     // 命令行可以直接给若干路径：日志文件开标签页，.logd/.tat 当配置加载。

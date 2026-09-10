@@ -1,5 +1,6 @@
 [package]
 name = "logd-core"
+autobins = false
 description = "超大日志文件的索引/匹配/筛选引擎，不依赖任何 UI"
 version.workspace = true
 edition.workspace = true
