@@ -10,12 +10,13 @@ use std::sync::Mutex;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use rayon::prelude::*;
 
 use crate::logline::{self, LogLine};
 use crate::source::Encoding;
 
-const DEFAULT_MAX_LINES: usize = 100_000;
-const DEFAULT_MAX_VALUES_PER_FIELD: usize = 256;
+const DEFAULT_MAX_LINES: usize = 1_000_000;
+const DEFAULT_MAX_VALUES_PER_FIELD: usize = 4_096;
 const MAX_EXACT_VALUES_PER_FIELD: usize = DEFAULT_MAX_LINES;
 const MAX_FUZZY_PATTERN_BYTES: usize = 64;
 
@@ -97,30 +98,34 @@ impl RankedValueIndex {
     }
 
     fn insert(&mut self, value: String, seen_at: u64) {
+        self.insert_weighted(value, 1, seen_at);
+    }
+
+    fn insert_weighted(&mut self, value: String, count: u64, seen_at: u64) {
         if let Some(stats) = self.values.get_mut(&value) {
-            stats.count = stats.count.saturating_add(1);
-            stats.last_seen = seen_at;
+            stats.count = stats.count.saturating_add(count);
+            stats.last_seen = stats.last_seen.max(seen_at);
             self.least
                 .push(Reverse((stats.count, stats.last_seen, value)));
             self.compact_heap_if_needed();
             return;
         }
 
-        let count = if self.values.len() < self.capacity {
-            1
+        let estimated_count = if self.values.len() < self.capacity {
+            count
         } else {
             let (removed, stats) = self.pop_least_current().expect("full index has a value");
             self.values.remove(&removed);
-            stats.count.saturating_add(1)
+            stats.count.saturating_add(count)
         };
         self.values.insert(
             value.clone(),
             ValueStats {
-                count,
+                count: estimated_count,
                 last_seen: seen_at,
             },
         );
-        self.least.push(Reverse((count, seen_at, value)));
+        self.least.push(Reverse((estimated_count, seen_at, value)));
         self.compact_heap_if_needed();
     }
 
@@ -198,19 +203,66 @@ impl FieldCatalog {
         catalog
     }
 
-    /// 使用默认采样上限构建字段目录。
+    /// 使用默认采样上限并行构建字段目录。Rayon 会从整份输入的并行分区
+    /// 取样，每个 worker 独立写局部目录，最后再归并，避免共享写锁。
     pub fn from_sample(data: &[u8], encoding: Encoding) -> Self {
-        Self::from_data(data, encoding, DEFAULT_MAX_LINES)
+        Self::from_parallel_sample(data, encoding, DEFAULT_MAX_LINES)
     }
 
-    /// 将一行中的结构化字段和值加入目录。
+    fn from_parallel_sample(data: &[u8], encoding: Encoding, max_lines: usize) -> Self {
+        if max_lines == 0 {
+            return Self::default();
+        }
+        if data.is_empty() {
+            return Self::default();
+        }
+
+        // Sample every part of the file instead of taking only its head. Keep
+        // the partition count bounded because each worker owns a local Top-K
+        // index until the deterministic merge below.
+        let partitions = rayon::current_num_threads()
+            .saturating_mul(2)
+            .clamp(1, 32)
+            .min(max_lines);
+        let mut starts = Vec::with_capacity(partitions + 1);
+        starts.push(0);
+        for part in 1..partitions {
+            let raw = part * data.len() / partitions;
+            let Some(relative) = memchr::memchr(b'\n', &data[raw..]) else {
+                break;
+            };
+            let start = raw + relative + 1;
+            if start > *starts.last().expect("first start exists") && start < data.len() {
+                starts.push(start);
+            }
+        }
+        starts.push(data.len());
+        let quota = max_lines.div_ceil(starts.len() - 1);
+        let catalogs = starts
+            .par_windows(2)
+            .map(|bounds| Self::from_data(&data[bounds[0]..bounds[1]], encoding, quota))
+            .collect::<Vec<_>>();
+
+        // Indexed parallel collection preserves range order. Merge serially so
+        // last_seen consistently reflects later file regions, independent of
+        // Rayon scheduling.
+        catalogs.into_iter().fold(Self::default(), Self::merge)
+    }
+
+    /// 将一行中的字段和值加入目录。非结构化行退化成整行 message，
+    /// 因而普通文本日志也可以提供内容词元补全。
     pub fn add_line(&mut self, line: &[u8], encoding: Encoding) {
         let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-        let Some(parsed) = logline::parse(line) else {
+        let line = line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(line);
+        if line.is_empty() {
             return;
-        };
+        }
         self.seen_lines = self.seen_lines.saturating_add(1);
-        self.add_parsed(line, &parsed, encoding);
+        if let Some(parsed) = logline::parse(line) {
+            self.add_parsed(line, &parsed, encoding);
+        } else {
+            self.add_message_tokens(line, encoding);
+        }
     }
 
     fn add_parsed(&mut self, line: &[u8], parsed: &LogLine, encoding: Encoding) {
@@ -232,9 +284,13 @@ impl FieldCatalog {
                 self.insert(LogField::Tag, value);
             }
         }
-        // Message values are tokenized rather than storing entire long lines.
-        // This makes `msg:` completion useful without making the catalog huge.
-        let message = encoding.decode_bytes(parsed.message_bytes(line));
+        self.add_message_tokens(parsed.message_bytes(line), encoding);
+    }
+
+    // Message values are tokenized rather than storing entire long lines. This
+    // makes `msg:` completion useful without making the catalog huge.
+    fn add_message_tokens(&mut self, message: &[u8], encoding: Encoding) {
+        let message = encoding.decode_bytes(message);
         for token in message.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
             if token.chars().count() >= 2 && !token.chars().all(|ch| ch.is_ascii_digit()) {
                 self.insert(LogField::Message, token.to_owned());
@@ -278,6 +334,34 @@ impl FieldCatalog {
                 count: 1,
                 last_seen: 0,
             })
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        let seen_offset = self.seen_lines;
+        self.seen_lines = self.seen_lines.saturating_add(other.seen_lines);
+        for (field, values) in other.exact_values {
+            let target = self.exact_values.entry(field).or_default();
+            for value in values {
+                if target.len() >= MAX_EXACT_VALUES_PER_FIELD && !target.contains(&value) {
+                    break;
+                }
+                target.insert(value);
+            }
+        }
+        for (field, index) in other.ranked_values {
+            let target = self
+                .ranked_values
+                .entry(field)
+                .or_insert_with(|| RankedValueIndex::new(self.max_values_per_field));
+            for (value, stats) in index.values {
+                target.insert_weighted(
+                    value,
+                    stats.count,
+                    seen_offset.saturating_add(stats.last_seen),
+                );
+            }
+        }
+        self
     }
 
     /// 根据当前输入返回最多 `limit` 个联想项。
@@ -652,6 +736,46 @@ mod tests {
         assert!(catalog.values(LogField::Tag).any(|v| v == "AeAlgo"));
         assert!(catalog.values(LogField::Pid).any(|v| v == "1234"));
         assert!(catalog.values(LogField::Message).any(|v| v == "Magic"));
+    }
+
+    #[test]
+    fn plain_lines_fall_back_to_message_tokens() {
+        let catalog = FieldCatalog::from_sample(
+            b"plain startup completed\nworker-cache connected\n",
+            Encoding::Utf8,
+        );
+        assert!(catalog
+            .values(LogField::Message)
+            .any(|value| value == "startup"));
+        assert!(catalog
+            .suggest("msg:worker", 10)
+            .iter()
+            .any(|suggestion| suggestion.expression == "msg:worker-cache"));
+    }
+
+    #[test]
+    fn parallel_catalog_merge_combines_worker_results() {
+        let left = FieldCatalog::from_data(b"left-only payload\n", Encoding::Utf8, usize::MAX);
+        let right = FieldCatalog::from_data(b"right-only payload\n", Encoding::Utf8, usize::MAX);
+        let merged = left.merge(right);
+        assert!(merged
+            .values(LogField::Message)
+            .any(|value| value == "left-only"));
+        assert!(merged
+            .values(LogField::Message)
+            .any(|value| value == "right-only"));
+    }
+
+    #[test]
+    fn parallel_sampling_includes_later_file_regions() {
+        let data = b"head-token\nhead-skip\nlate-skip\ntail-token\n";
+        let catalog = FieldCatalog::from_parallel_sample(data, Encoding::Utf8, 2);
+        assert!(catalog
+            .values(LogField::Message)
+            .any(|value| value == "head-token"));
+        assert!(catalog
+            .values(LogField::Message)
+            .any(|value| value == "tail-token"));
     }
 
     #[test]

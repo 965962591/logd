@@ -756,11 +756,31 @@ impl LogdApp {
         if is_empty {
             items.extend(self.search_history.iter().take(LIMIT).cloned());
         } else {
-            if let Some(tab) = self.tabs.get(self.active) {
-                for suggestion in tab.field_catalog.suggest(value, LIMIT) {
-                    if seen.insert(suggestion.expression.clone()) {
-                        items.push(suggestion.expression);
-                    }
+            // Every opened tab builds its own catalog in the background. Merge
+            // their ranked results here so values from a non-active log remain
+            // available; ranking within each file is preserved and ties stay
+            // deterministic by tab order.
+            let mut catalog_items = self
+                .tabs
+                .iter()
+                .enumerate()
+                .flat_map(|(tab_index, tab)| {
+                    tab.field_catalog
+                        .suggest(value, LIMIT)
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(rank, suggestion)| {
+                            (rank, suggestion.score, tab_index, suggestion.expression)
+                        })
+                })
+                .collect::<Vec<_>>();
+            catalog_items.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+            for (_, _, _, expression) in catalog_items {
+                if items.len() >= LIMIT {
+                    break;
+                }
+                if seen.insert(expression.clone()) {
+                    items.push(expression);
                 }
             }
             let mut history = self
@@ -935,11 +955,21 @@ impl LogdApp {
         let path = tab.path.clone();
         match LogView::load(&path) {
             Ok(loaded) => {
+                let catalog_source = loaded.source.clone();
+                let catalog_encoding = catalog_source.encoding();
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
                 self.observe_log_view(&view, cx);
                 self.apply_filters_to_view(self.active, &view, cx);
                 self.apply_search_to_view(&view, cx);
                 self.tabs[self.active].view = view;
+                self.tabs[self.active].field_catalog = Arc::new(FieldCatalog::default());
+                self.build_field_catalog(
+                    path.clone(),
+                    catalog_source,
+                    catalog_encoding,
+                    window,
+                    cx,
+                );
                 self.status = Some(format!(
                     "{}: {}",
                     text(Key::Refresh, self.language),
