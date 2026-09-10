@@ -218,8 +218,9 @@ impl FileSource {
         let backing = if len == 0 {
             Backing::Empty
         } else {
-            // SAFETY: 映射期间文件被外部截断会触发 SIGBUS/EXCEPTION。
-            // 当前只支持静态日志文件，实时 tail 不在范围内（见 doc/PLAN.md 风险 4）。
+            // SAFETY: append-only writers are supported; the UI periodically
+            // replaces this fixed-length snapshot. In-place truncation while
+            // a mapped page is being read can still trigger SIGBUS/EXCEPTION.
             let mmap = unsafe { Mmap::map(&file) }
                 .with_context(|| format!("映射 {} 失败", path.display()))?;
             Backing::Mapped(mmap)
