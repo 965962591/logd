@@ -2310,16 +2310,26 @@ impl LogdApp {
             .border_color(palette.border)
             .rounded(px(6.))
             .shadow_md()
+            .on_scroll_wheel(|_, _, cx| {
+                // This popup is rendered through `deferred`, so it is not
+                // guaranteed to bubble through the title-bar container.
+                cx.stop_propagation();
+            })
             .children(suggestion_rows);
         let center = h_flex()
             .relative()
             .w_full()
             .h_full()
             .min_w_0()
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                window.prevent_default();
-                cx.stop_propagation();
-            })
+            // This field is painted over the title bar's native drag regions.
+            // Occlusion removes those hitboxes behind the field without
+            // swallowing mouse events needed by text selection or the history
+            // trigger.
+            .occlude()
+            // The title-bar search overlay sits above the log view. Stop wheel
+            // bubbling at this boundary after the popup's own scroll handler has
+            // consumed it, so the log viewport never scrolls underneath.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .bg(palette.input_background)
             .border_1()
             .border_color(palette.border)
