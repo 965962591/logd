@@ -16,9 +16,13 @@ const HEIGHT: f32 = 34.0;
 const CONTROL_WIDTH: f32 = 46.0;
 const WINDOW_CONTROLS_WIDTH: f32 = CONTROL_WIDTH * 3.0;
 const SIDE_DRAG_MIN_WIDTH: f32 = 64.0;
+const RIGHT_BUTTONS_MIN_WIDTH: f32 = 120.0;
+const RIGHT_SLOT_MIN_WIDTH: f32 =
+    WINDOW_CONTROLS_WIDTH + SIDE_DRAG_MIN_WIDTH + RIGHT_BUTTONS_MIN_WIDTH;
 const SEARCH_MIN_WIDTH: f32 = 300.0;
-const SEARCH_MAX_WIDTH: f32 = 720.0;
-const CENTER_DRAG_MIN_WIDTH: f32 = 20.0;
+// Size the search box against the full title bar, rather than against the
+// flex-sized side slots, so its visual center stays aligned with the window.
+const SEARCH_WIDTH_RATIO: f32 = 0.4;
 const APP_ICON_BYTES: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/2.png"));
 
@@ -115,6 +119,26 @@ pub fn render(
     let maximized = window.is_maximized();
     let palette = theme::palette(cx);
 
+    // Lay the search field over the full title bar. The left and right slots
+    // remain in normal flow below it, preserving their drag/button hitboxes;
+    // only the input itself is centered by this overlay.
+    let center_slot = h_flex()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .h_full()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(relative(SEARCH_WIDTH_RATIO))
+                .min_w(px(SEARCH_MIN_WIDTH))
+                .flex_none()
+                .child(center),
+        );
+
     h_flex()
         .id("app-title-bar")
         .relative()
@@ -147,29 +171,11 @@ pub fn render(
                 .h_full()
                 .flex_1()
                 .min_w_0()
-                .min_w(px(SEARCH_MIN_WIDTH + CENTER_DRAG_MIN_WIDTH * 2.))
-                .justify_center()
-                .child(fixed_drag_region(
-                    "title-drag-center-left",
-                    CENTER_DRAG_MIN_WIDTH,
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(SEARCH_MIN_WIDTH))
-                        .max_w(px(SEARCH_MAX_WIDTH))
-                        .child(center),
-                )
-                .child(fixed_drag_region(
-                    "title-drag-center-right",
-                    CENTER_DRAG_MIN_WIDTH,
-                )),
-        )
-        .child(
-            h_flex()
-                .h_full()
-                .flex_1()
-                .min_w_0()
+                // The nested right slot reserves the native window controls
+                // with padding. Keep enough width for that padding, its drag
+                // hitbox, and the three title-bar action buttons; otherwise
+                // overflow_hidden clips the buttons and their SVG icons.
+                .min_w(px(RIGHT_SLOT_MIN_WIDTH))
                 .overflow_hidden()
                 .justify_end()
                 .child(
@@ -187,6 +193,9 @@ pub fn render(
                         .child(right),
                 ),
         )
+        // Paint the centered search overlay after the side slots so the input
+        // stays interactive where their drag hitboxes would otherwise overlap.
+        .child(center_slot)
         // Keep native window controls out of the flex flow. They remain
         // anchored to the window edge when the title bar is space-constrained.
         .child(
@@ -246,15 +255,6 @@ fn drag_region(id: &'static str, min_width: f32) -> impl IntoElement {
         // Keep a real, non-zero hitbox even when the title bar is narrow or
         // the neighboring search/menu content is measured as min-content.
         .min_w(px(min_width))
-        .window_control_area(WindowControlArea::Drag)
-}
-
-fn fixed_drag_region(id: &'static str, width: f32) -> impl IntoElement {
-    div()
-        .id(id)
-        .h_full()
-        .w(px(width))
-        .flex_none()
         .window_control_area(WindowControlArea::Drag)
 }
 
