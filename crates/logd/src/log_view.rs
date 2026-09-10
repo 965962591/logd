@@ -94,7 +94,7 @@ const SEARCH_RESULT_FLASH_DURATION: Duration = Duration::from_millis(1_200);
 ///
 /// 和构造视图分开，是因为 `cx.new()` 的闭包必须返回 `Self` 而不是 `Result<Self>`。
 pub struct Loaded {
-    source: Arc<FileSource>,
+    pub(crate) source: Arc<FileSource>,
     index: Arc<LineIndex>,
     /// 索引是不是从磁盘缓存直接读出来的（省掉一整趟扫描）
     from_cache: bool,
@@ -549,6 +549,7 @@ impl LogView {
             CompileOptions {
                 base_date,
                 encoding: Some(self.doc.encoding()),
+                fuzzy_text: true,
                 ..Default::default()
             },
         );

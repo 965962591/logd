@@ -21,7 +21,7 @@ use gpui_component::dialog::DialogFooter;
 use gpui_component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement,
 };
-use gpui_component::input::{Enter, Input, InputEvent, InputState};
+use gpui_component::input::{Enter, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::progress::Progress;
@@ -30,7 +30,10 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
     Root, Selectable as _, Sizable, WindowExt as _,
 };
-use logd_core::{Encoding, FilterScope, FilterSpec, HighlightMode, LogdFile, TatFile};
+use logd_core::{
+    fuzzy_score, Encoding, FieldCatalog, FilterScope, FilterSpec, HighlightMode, LogdFile, Query,
+    TatFile,
+};
 
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
@@ -44,6 +47,7 @@ struct Tab {
     view: Entity<LogView>,
     title: String,
     path: PathBuf,
+    field_catalog: Arc<FieldCatalog>,
 }
 
 #[derive(Clone)]
@@ -322,6 +326,9 @@ pub struct LogdApp {
     search_history: Vec<String>,
     keyword: Entity<InputState>,
     search_history_select: Entity<ComboboxState<Vec<String>>>,
+    search_suggestions: Vec<String>,
+    search_suggestions_open: bool,
+    search_suggestion_index: Option<usize>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
     filter_fore: Entity<ColorPickerState>,
@@ -378,9 +385,23 @@ impl LogdApp {
                             state.clear_selection(cx);
                         });
                     }
+                    this.refresh_search_suggestions(&value, window, cx);
                 }
                 if matches!(ev, InputEvent::PressEnter { .. }) {
-                    this.set_global_search(state.read(cx).value().to_string(), window, cx);
+                    this.search_suggestions_open = false;
+                    let value = this
+                        .search_suggestion_index
+                        .and_then(|index| this.search_suggestions.get(index).cloned())
+                        .unwrap_or_else(|| state.read(cx).value().to_string());
+                    this.accept_search_value(value, window, cx);
+                }
+                if matches!(ev, InputEvent::Focus) {
+                    let value = state.read(cx).value().to_string();
+                    this.refresh_search_suggestions(&value, window, cx);
+                }
+                if matches!(ev, InputEvent::Blur) {
+                    this.search_suggestions_open = false;
+                    cx.notify();
                 }
             },
         )
@@ -391,10 +412,7 @@ impl LogdApp {
             |this, _, ev: &ComboboxEvent<Vec<String>>, window, cx| {
                 if let ComboboxEvent::Change(values) = ev {
                     if let Some(value) = values.first() {
-                        let value = value.clone();
-                        this.keyword
-                            .update(cx, |state, cx| state.set_value(value.clone(), window, cx));
-                        this.set_global_search(value, window, cx);
+                        this.accept_search_value(value.clone(), window, cx);
                     }
                 }
             },
@@ -498,6 +516,9 @@ impl LogdApp {
             search_history,
             keyword,
             search_history_select,
+            search_suggestions: Vec::new(),
+            search_suggestions_open: false,
+            search_suggestion_index: None,
             filter_text,
             filter_description,
             filter_fore,
@@ -636,11 +657,10 @@ impl LogdApp {
     fn clear_search_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_history.clear();
         let _ = crate::settings::save_search_history(&self.search_history);
-        self.search_history_select.update(cx, |state, cx| {
-            state.set_items(Vec::new(), window, cx);
-            state.clear_selection(cx);
-        });
-        cx.notify();
+        let value = self.keyword.read(cx).value().to_string();
+        self.refresh_search_suggestions(&value, window, cx);
+        self.search_history_select
+            .update(cx, |state, cx| state.clear_selection(cx));
     }
 
     fn clear_recent_files(&mut self, cx: &mut Context<Self>) {
@@ -657,6 +677,8 @@ impl LogdApp {
         }
         match LogView::load(path) {
             Ok(loaded) => {
+                let catalog_source = loaded.source.clone();
+                let catalog_encoding = catalog_source.encoding();
                 let view = cx.new(|cx| LogView::new(loaded, window, cx));
                 self.observe_log_view(&view, cx);
                 let tab_index = self.tabs.len();
@@ -667,6 +689,7 @@ impl LogdApp {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string()),
                     path: path.to_path_buf(),
+                    field_catalog: Arc::new(FieldCatalog::default()),
                 });
                 self.active = tab_index;
                 self.tab_scroll.scroll_to_item(tab_index);
@@ -674,11 +697,118 @@ impl LogdApp {
                 self.apply_search_to_view(&view, cx);
                 self.remember_file(path);
                 self.status = None;
+                self.build_field_catalog(
+                    path.to_path_buf(),
+                    catalog_source,
+                    catalog_encoding,
+                    window,
+                    cx,
+                );
             }
             Err(error) => {
                 self.status = Some(format!("{}: {error:#}", text(Key::Open, self.language)))
             }
         }
+        cx.notify();
+    }
+
+    fn build_field_catalog(
+        &self,
+        path: PathBuf,
+        source: Arc<logd_core::FileSource>,
+        encoding: Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx
+            .background_executor()
+            .spawn(async move { Arc::new(FieldCatalog::from_sample(source.data(), encoding)) });
+        cx.spawn_in(window, async move |this, window| {
+            let catalog = task.await;
+            _ = window.update(|window, cx| {
+                _ = this.update(cx, |this, cx| {
+                    let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) else {
+                        return;
+                    };
+                    tab.field_catalog = catalog;
+                    let value = this.keyword.read(cx).value().to_string();
+                    this.refresh_search_suggestions(&value, window, cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_search_suggestions(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const LIMIT: usize = 16;
+        let value = value.trim();
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        if value.is_empty() {
+            items.extend(self.search_history.iter().take(LIMIT).cloned());
+        } else {
+            if let Some(tab) = self.tabs.get(self.active) {
+                for suggestion in tab.field_catalog.suggest(value, LIMIT) {
+                    if seen.insert(suggestion.expression.clone()) {
+                        items.push(suggestion.expression);
+                    }
+                }
+            }
+            let mut history = self
+                .search_history
+                .iter()
+                .filter_map(|item| fuzzy_score(value, item).map(|score| (score, item)))
+                .collect::<Vec<_>>();
+            history.sort_by_key(|(score, _)| *score);
+            for (_, item) in history {
+                if items.len() >= LIMIT {
+                    break;
+                }
+                if seen.insert(item.clone()) {
+                    items.push(item.clone());
+                }
+            }
+        }
+        self.search_suggestions = items.clone();
+        self.search_suggestions_open = !value.is_empty() && !items.is_empty();
+        self.search_suggestion_index = None;
+        self.search_history_select.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn accept_search_value(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_suggestion_index = None;
+        self.keyword
+            .update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+        if value.ends_with(':') || value.ends_with('=') {
+            self.refresh_search_suggestions(&value, window, cx);
+            window.focus(&self.keyword.read(cx).focus_handle(cx), cx);
+        } else {
+            self.search_suggestions_open = false;
+            self.set_global_search(value, window, cx);
+        }
+    }
+
+    fn move_search_suggestion(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.search_suggestions.is_empty() {
+            return;
+        }
+        self.search_suggestions_open = true;
+        let last = self.search_suggestions.len() - 1;
+        self.search_suggestion_index = Some(match (self.search_suggestion_index, down) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(index), true) => (index + 1).min(last),
+            (Some(index), false) => index.saturating_sub(1),
+        });
         cx.notify();
     }
 
@@ -1178,7 +1308,12 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn set_encoding(&mut self, encoding: Encoding, cx: &mut Context<Self>) {
+    fn set_encoding(
+        &mut self,
+        encoding: Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = self.active_view().cloned() else {
             return;
         };
@@ -1188,9 +1323,13 @@ impl LogdApp {
         let filters = self.filters_for_tab(self.active);
         let configured_filter_count = self.filters.len();
         let search_query = self.search_query.clone();
+        let source = view.read(cx).doc().source().clone();
+        let path = self.tabs[self.active].path.clone();
         view.update(cx, |view, cx| {
             view.set_encoding(encoding, filters, configured_filter_count, search_query, cx)
         });
+        self.tabs[self.active].field_catalog = Arc::new(FieldCatalog::default());
+        self.build_field_catalog(path, source, encoding, window, cx);
         cx.notify();
     }
 
@@ -1585,7 +1724,7 @@ impl LogdApp {
                 }
             }
             MenuCommand::ImportFilters => self.prompt_import_filters(window, cx),
-            MenuCommand::SetEncoding(encoding) => self.set_encoding(encoding, cx),
+            MenuCommand::SetEncoding(encoding) => self.set_encoding(encoding, window, cx),
             MenuCommand::SetTheme(mode) => self.set_theme(mode, window, cx),
             MenuCommand::CopySelection => {
                 if let Some(view) = self.active_view().cloned() {
@@ -1961,6 +2100,9 @@ impl LogdApp {
         let search_history = self.search_history.clone();
         let has_search_history = !search_history.is_empty();
         let search_history_select = self.search_history_select.clone();
+        let search_suggestions = self.search_suggestions.clone();
+        let search_suggestions_open = self.search_suggestions_open;
+        let search_suggestion_index = self.search_suggestion_index;
         let keyword = self.keyword.clone();
         let lang = self.language;
         let filter_toggle_app = app.clone();
@@ -2045,13 +2187,14 @@ impl LogdApp {
             ))
             .into_any_element();
         let clear_app = app.clone();
+        let search_input_app = app.clone();
         let search_history_combo = Combobox::new(&search_history_select)
             .small()
             .w_full()
             .h_full()
             .appearance(false)
             .menu_max_h(px(320.))
-            .render_trigger(move |_, _, _| {
+            .render_trigger(move |_, window, _| {
                 h_flex()
                     .w_full()
                     .h_full()
@@ -2064,6 +2207,29 @@ impl LogdApp {
                             .flex_1()
                             .h_full()
                             .on_click(|_, _, cx| cx.stop_propagation())
+                            .on_action(window.listener_for(
+                                &search_input_app,
+                                |this, _: &MoveDown, _, cx| {
+                                    cx.stop_propagation();
+                                    this.move_search_suggestion(true, cx);
+                                },
+                            ))
+                            .on_action(window.listener_for(
+                                &search_input_app,
+                                |this, _: &MoveUp, _, cx| {
+                                    cx.stop_propagation();
+                                    this.move_search_suggestion(false, cx);
+                                },
+                            ))
+                            .on_action(window.listener_for(
+                                &search_input_app,
+                                |this, _: &Escape, _, cx| {
+                                    cx.stop_propagation();
+                                    this.search_suggestions_open = false;
+                                    this.search_suggestion_index = None;
+                                    cx.notify();
+                                },
+                            ))
                             // Keep Enter in the text input; otherwise the enclosing
                             // combobox treats it as a request to open history.
                             .on_action(|_: &Enter, _, cx| cx.stop_propagation())
@@ -2093,7 +2259,60 @@ impl LogdApp {
                         })),
                 )
             });
+        let suggestion_rows = search_suggestions
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let suggestion_app = app.clone();
+                let accepted = value.clone();
+                h_flex()
+                    .id(("search-suggestion", index))
+                    .w_full()
+                    .min_h(px(28.))
+                    .px_2()
+                    .items_center()
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .when(search_suggestion_index == Some(index), |row| {
+                        row.bg(palette.selection)
+                    })
+                    .hover(|style| style.bg(palette.control_hover))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_click(
+                        window.listener_for(&suggestion_app, move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.accept_search_value(accepted.clone(), window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(value),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let suggestions_popup = v_flex()
+            .id("search-suggestions")
+            .absolute()
+            .top(px(33.))
+            .left_0()
+            .right_0()
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .bg(palette.background)
+            .border_1()
+            .border_color(palette.border)
+            .rounded(px(6.))
+            .shadow_md()
+            .children(suggestion_rows);
         let center = h_flex()
+            .relative()
             .w_full()
             .h_full()
             .min_w_0()
@@ -2113,6 +2332,9 @@ impl LogdApp {
                     .h_full()
                     .child(search_history_combo),
             )
+            .when(search_suggestions_open, |center| {
+                center.child(deferred(suggestions_popup))
+            })
             .into_any_element();
         let close_app = cx.weak_entity();
         title_bar::render(
@@ -3344,8 +3566,12 @@ fn parse_search_expression(value: &str) -> SearchExpression {
                 .iter()
                 .map(|keyword| {
                     parse_time_shorthand(keyword).unwrap_or_else(|| {
-                        keywords.push(keyword.clone());
-                        quote_query_literal(keyword)
+                        if is_structured_search_term(keyword) {
+                            keyword.clone()
+                        } else {
+                            keywords.push(keyword.clone());
+                            quote_query_literal(keyword)
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -3359,6 +3585,40 @@ fn parse_search_expression(value: &str) -> SearchExpression {
         .collect::<Vec<_>>()
         .join(" or ");
     SearchExpression { keywords, query }
+}
+
+fn is_structured_search_term(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    let has_field_prefix = [
+        "level=",
+        "level!=",
+        "lvl=",
+        "priority=",
+        "pid=",
+        "pid!=",
+        "pid>",
+        "pid<",
+        "tid=",
+        "tid!=",
+        "tid>",
+        "tid<",
+        "tag:",
+        "tag=",
+        "tag!=",
+        "tag~",
+        "tag!~",
+        "msg:",
+        "msg=",
+        "msg!=",
+        "msg~",
+        "msg!~",
+        "message:",
+        "text:",
+        "is:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    has_field_prefix && Query::parse(value, Default::default()).is_ok()
 }
 
 fn parse_time_shorthand(value: &str) -> Option<String> {
@@ -3618,6 +3878,17 @@ mod tests {
         assert_eq!(
             parse_search_expression(r#"say "hi" & C:\logs"#).query,
             r#"("say \"hi\"" and "C:\\logs")"#
+        );
+    }
+
+    #[test]
+    fn search_expression_preserves_field_completion_syntax() {
+        assert_eq!(
+            parse_search_expression("tag:AeAlgo & level=W"),
+            SearchExpression {
+                keywords: Vec::new(),
+                query: "(tag:AeAlgo and level=W)".into(),
+            }
         );
     }
 

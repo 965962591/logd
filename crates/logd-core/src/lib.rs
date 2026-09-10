@@ -2,6 +2,7 @@
 //!
 //! 这一层完全不依赖 UI，可以单独 `cargo test -p logd-core`。
 
+pub mod autocomplete;
 pub mod cache;
 pub mod document;
 pub mod index;
@@ -18,6 +19,9 @@ pub mod source;
 pub mod tat;
 pub mod viewport;
 
+pub use autocomplete::{
+    fuzzy_match, fuzzy_score, FieldCatalog, FuzzyPattern, LogField, Suggestion,
+};
 pub use document::{Document, RenderRow};
 pub use index::{ChunkIndex, LineIndex, ANCHOR_STRIDE};
 pub use logd::LogdFile;

@@ -26,6 +26,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
+use crate::autocomplete::FuzzyPattern;
 use crate::logline::{self, Level, LogLine, Ts};
 use crate::source::Encoding;
 
@@ -166,6 +167,9 @@ pub struct CompileOptions {
     pub base_date: Option<Ts>,
     /// 关键字要按目标文件的编码转成字节串。
     pub encoding: Option<Encoding>,
+    /// Compile bare text terms as fuzzy word matches. Field expressions and regexes keep their
+    /// existing exact semantics. Intended for interactive title-bar search only.
+    pub fuzzy_text: bool,
 }
 
 pub struct Query {
@@ -173,6 +177,9 @@ pub struct Query {
     /// 整行字面量集合，一遍扫出所有命中
     ac: Option<AhoCorasick>,
     ac_slots: Vec<usize>,
+    /// 标题栏普通文本的模糊匹配器。
+    fuzzy: Vec<FuzzyPattern>,
+    fuzzy_slots: Vec<usize>,
     /// 整行正则集合
     re: Option<RegexSet>,
     re_slots: Vec<usize>,
@@ -192,6 +199,7 @@ impl fmt::Debug for Query {
         f.debug_struct("Query")
             .field("root", &self.root)
             .field("literals", &self.ac_slots.len())
+            .field("fuzzy", &self.fuzzy_slots.len())
             .field("regexes", &self.re_slots.len())
             .field("fields", &self.fields.len())
             .field("needs_fields", &self.needs_fields)
@@ -204,6 +212,8 @@ impl fmt::Debug for Query {
 pub struct QueryScratch {
     lo: Bits,
     hi: Bits,
+    fuzzy_row: Vec<usize>,
+    fuzzy_next: Vec<usize>,
 }
 
 impl Query {
@@ -213,6 +223,8 @@ impl Query {
             root: Node::Always(true),
             ac: None,
             ac_slots: Vec::new(),
+            fuzzy: Vec::new(),
+            fuzzy_slots: Vec::new(),
             re: None,
             re_slots: Vec::new(),
             fields: Vec::new(),
@@ -257,7 +269,14 @@ impl Query {
             }
         }
 
-        // 2) 字段项：只解析一次
+        // 2) 模糊文本：精确子串优先，必要时才对词元做有界近似比较。
+        for (i, pattern) in self.fuzzy.iter().enumerate() {
+            if pattern.is_match(line, &mut scratch.fuzzy_row, &mut scratch.fuzzy_next) {
+                scratch.lo.set(self.fuzzy_slots[i]);
+            }
+        }
+
+        // 3) 字段项：只解析一次
         if self.needs_fields {
             let parsed = logline::parse(line).unwrap_or_else(|| LogLine::plain(line.len()));
             for (i, t) in self.fields.iter().enumerate() {
@@ -267,7 +286,7 @@ impl Query {
             }
         }
 
-        // 3) 正则延迟：把正则槽位分别当全假/全真各算一次，
+        // 4) 正则延迟：把正则槽位分别当全假/全真各算一次，
         //    结论一致就说明正则不影响结果，直接省掉。
         if self.re.is_some() {
             scratch.hi = scratch.lo;
@@ -621,6 +640,8 @@ struct Compiler {
     opts: CompileOptions,
     lits: Vec<Vec<u8>>,
     ac_slots: Vec<usize>,
+    fuzzy: Vec<FuzzyPattern>,
+    fuzzy_slots: Vec<usize>,
     res: Vec<String>,
     re_slots: Vec<usize>,
     fields: Vec<FieldTerm>,
@@ -634,6 +655,8 @@ impl Compiler {
             opts,
             lits: Vec::new(),
             ac_slots: Vec::new(),
+            fuzzy: Vec::new(),
+            fuzzy_slots: Vec::new(),
             res: Vec::new(),
             re_slots: Vec::new(),
             fields: Vec::new(),
@@ -692,6 +715,8 @@ impl Compiler {
             root,
             ac,
             ac_slots: self.ac_slots,
+            fuzzy: self.fuzzy,
+            fuzzy_slots: self.fuzzy_slots,
             re,
             re_slots: self.re_slots,
             needs_fields: !self.fields.is_empty(),
@@ -712,8 +737,14 @@ impl Compiler {
                     return Ok(Node::Always(true));
                 }
                 let slot = self.slot()?;
-                self.lits.push(self.encode(s));
-                self.ac_slots.push(slot);
+                if self.opts.fuzzy_text {
+                    self.fuzzy
+                        .push(FuzzyPattern::new(self.encode(s), self.opts.case_sensitive));
+                    self.fuzzy_slots.push(slot);
+                } else {
+                    self.lits.push(self.encode(s));
+                    self.ac_slots.push(slot);
+                }
                 Node::Slot(slot)
             }
             Ast::Regex(r) => {
@@ -935,6 +966,30 @@ mod tests {
         assert!(hit(&q, LINE_D));
         assert!(hit(&q, PLAIN));
         assert!(!hit(&q, LINE_W));
+    }
+
+    #[test]
+    fn fuzzy_text_is_opt_in_and_keeps_field_terms_exact() {
+        let fuzzy = Query::parse(
+            "Aelgo",
+            CompileOptions {
+                fuzzy_text: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(hit(&fuzzy, LINE_D));
+        assert!(!hit(&q("Aelgo"), LINE_D));
+
+        let field = Query::parse(
+            "tag:Aelgo",
+            CompileOptions {
+                fuzzy_text: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!hit(&field, LINE_D));
     }
 
     #[test]
