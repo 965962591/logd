@@ -747,10 +747,13 @@ impl LogdApp {
         cx: &mut Context<Self>,
     ) {
         const LIMIT: usize = 16;
-        let value = value.trim();
+        // Keep the original expression intact so completion preserves spacing
+        // around boolean operators. Individual matchers trim only the active
+        // fragment where appropriate.
+        let is_empty = value.trim().is_empty();
         let mut seen = HashSet::new();
         let mut items = Vec::new();
-        if value.is_empty() {
+        if is_empty {
             items.extend(self.search_history.iter().take(LIMIT).cloned());
         } else {
             if let Some(tab) = self.tabs.get(self.active) {
@@ -776,7 +779,7 @@ impl LogdApp {
             }
         }
         self.search_suggestions = items.clone();
-        self.search_suggestions_open = !value.is_empty() && !items.is_empty();
+        self.search_suggestions_open = !is_empty && !items.is_empty();
         self.search_suggestion_index = None;
         self.search_history_select.update(cx, |state, cx| {
             state.set_items(items, window, cx);

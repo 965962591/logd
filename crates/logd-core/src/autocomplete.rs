@@ -4,7 +4,8 @@
 //! 然后在输入变化时调用 [`FieldCatalog::suggest`] 获取联想项。
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::Mutex;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
@@ -15,6 +16,7 @@ use crate::source::Encoding;
 
 const DEFAULT_MAX_LINES: usize = 100_000;
 const DEFAULT_MAX_VALUES_PER_FIELD: usize = 256;
+const MAX_EXACT_VALUES_PER_FIELD: usize = DEFAULT_MAX_LINES;
 const MAX_FUZZY_PATTERN_BYTES: usize = 64;
 
 /// 可用于查询表达式的日志字段。
@@ -70,19 +72,101 @@ pub struct Suggestion {
     pub score: usize,
 }
 
-/// 从日志样本中收集字段值。每个字段有独立上限，避免超大日志导致内存增长。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueStats {
+    count: u64,
+    last_seen: u64,
+}
+
+/// Streaming heavy-hitter index. It keeps memory bounded while allowing values
+/// that become frequent later in the log to replace one-off values seen early.
+#[derive(Clone, Debug)]
+struct RankedValueIndex {
+    values: HashMap<String, ValueStats>,
+    least: BinaryHeap<Reverse<(u64, u64, String)>>,
+    capacity: usize,
+}
+
+impl RankedValueIndex {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: HashMap::with_capacity(capacity),
+            least: BinaryHeap::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, value: String, seen_at: u64) {
+        if let Some(stats) = self.values.get_mut(&value) {
+            stats.count = stats.count.saturating_add(1);
+            stats.last_seen = seen_at;
+            self.least
+                .push(Reverse((stats.count, stats.last_seen, value)));
+            self.compact_heap_if_needed();
+            return;
+        }
+
+        let count = if self.values.len() < self.capacity {
+            1
+        } else {
+            let (removed, stats) = self.pop_least_current().expect("full index has a value");
+            self.values.remove(&removed);
+            stats.count.saturating_add(1)
+        };
+        self.values.insert(
+            value.clone(),
+            ValueStats {
+                count,
+                last_seen: seen_at,
+            },
+        );
+        self.least.push(Reverse((count, seen_at, value)));
+        self.compact_heap_if_needed();
+    }
+
+    fn pop_least_current(&mut self) -> Option<(String, ValueStats)> {
+        while let Some(Reverse((count, last_seen, value))) = self.least.pop() {
+            let Some(stats) = self.values.get(&value) else {
+                continue;
+            };
+            if stats.count == count && stats.last_seen == last_seen {
+                return Some((value, stats.clone()));
+            }
+        }
+        None
+    }
+
+    fn compact_heap_if_needed(&mut self) {
+        let threshold = self.capacity.saturating_mul(4).max(64);
+        if self.least.len() <= threshold {
+            return;
+        }
+        self.least = self
+            .values
+            .iter()
+            .map(|(value, stats)| Reverse((stats.count, stats.last_seen, value.clone())))
+            .collect();
+    }
+}
+
+/// 从日志样本中收集字段值。低基数字段保留采样范围内的唯一值；tag 和
+/// message 使用有界重频索引，避免大日志导致内存增长或候选只偏向文件开头。
 #[derive(Debug)]
 pub struct FieldCatalog {
-    values: BTreeMap<LogField, BTreeSet<String>>,
+    exact_values: BTreeMap<LogField, BTreeSet<String>>,
+    ranked_values: BTreeMap<LogField, RankedValueIndex>,
     max_values_per_field: usize,
+    seen_lines: u64,
     matcher: Mutex<Matcher>,
 }
 
 impl Clone for FieldCatalog {
     fn clone(&self) -> Self {
         Self {
-            values: self.values.clone(),
+            exact_values: self.exact_values.clone(),
+            ranked_values: self.ranked_values.clone(),
             max_values_per_field: self.max_values_per_field,
+            seen_lines: self.seen_lines,
             matcher: Mutex::new(new_matcher()),
         }
     }
@@ -97,8 +181,10 @@ impl Default for FieldCatalog {
 impl FieldCatalog {
     pub fn new(max_values_per_field: usize) -> Self {
         Self {
-            values: BTreeMap::new(),
+            exact_values: BTreeMap::new(),
+            ranked_values: BTreeMap::new(),
             max_values_per_field: max_values_per_field.max(1),
+            seen_lines: 0,
             matcher: Mutex::new(new_matcher()),
         }
     }
@@ -123,6 +209,7 @@ impl FieldCatalog {
         let Some(parsed) = logline::parse(line) else {
             return;
         };
+        self.seen_lines = self.seen_lines.saturating_add(1);
         self.add_parsed(line, &parsed, encoding);
     }
 
@@ -156,17 +243,41 @@ impl FieldCatalog {
     }
 
     fn insert(&mut self, field: LogField, value: String) {
-        let values = self.values.entry(field).or_default();
-        if values.contains(&value) || values.len() < self.max_values_per_field {
-            values.insert(value);
+        if matches!(field, LogField::Tag | LogField::Message) {
+            self.ranked_values
+                .entry(field)
+                .or_insert_with(|| RankedValueIndex::new(self.max_values_per_field))
+                .insert(value, self.seen_lines);
+        } else {
+            let values = self.exact_values.entry(field).or_default();
+            if values.len() < MAX_EXACT_VALUES_PER_FIELD || values.contains(&value) {
+                values.insert(value);
+            }
         }
     }
 
     pub fn values(&self, field: LogField) -> impl Iterator<Item = &str> {
-        self.values
+        self.exact_values
             .get(&field)
             .into_iter()
             .flat_map(|values| values.iter().map(String::as_str))
+            .chain(
+                self.ranked_values
+                    .get(&field)
+                    .into_iter()
+                    .flat_map(|index| index.values.keys().map(String::as_str)),
+            )
+    }
+
+    fn value_stats(&self, field: LogField, value: &str) -> ValueStats {
+        self.ranked_values
+            .get(&field)
+            .and_then(|index| index.values.get(value))
+            .cloned()
+            .unwrap_or(ValueStats {
+                count: 1,
+                last_seen: 0,
+            })
     }
 
     /// 根据当前输入返回最多 `limit` 个联想项。
@@ -191,12 +302,19 @@ impl FieldCatalog {
             for candidate in LogField::ALL {
                 let expression = format!("{}{}", candidate.name(), candidate.completion_operator());
                 if let Some(score) = nucleo_score(&atom, &expression, &mut matcher, &mut char_buf) {
-                    out.push(Suggestion {
-                        field: Some(candidate),
-                        value: candidate.name().to_owned(),
-                        expression: format!("{expression_prefix}{expression}"),
-                        score,
-                    });
+                    out.push((
+                        match_priority(prefix, &expression),
+                        ValueStats {
+                            count: u64::MAX,
+                            last_seen: u64::MAX,
+                        },
+                        Suggestion {
+                            field: Some(candidate),
+                            value: candidate.name().to_owned(),
+                            expression: format!("{expression_prefix}{expression}"),
+                            score,
+                        },
+                    ));
                 }
             }
         }
@@ -209,36 +327,108 @@ impl FieldCatalog {
                 let Some(score) = nucleo_score(&atom, value, &mut matcher, &mut char_buf) else {
                     continue;
                 };
-                out.push(Suggestion {
-                    field: Some(candidate),
-                    value: value.to_owned(),
-                    expression: format!(
-                        "{expression_prefix}{}",
-                        format_field_expression(candidate, value)
-                    ),
-                    score,
-                });
+                out.push((
+                    match_priority(prefix, value),
+                    self.value_stats(candidate, value),
+                    Suggestion {
+                        field: Some(candidate),
+                        value: value.to_owned(),
+                        expression: format!(
+                            "{expression_prefix}{}",
+                            format_field_expression(candidate, value)
+                        ),
+                        score,
+                    },
+                ));
             }
         }
-        out.sort_by(|a, b| {
-            a.score
-                .cmp(&b.score)
+        out.sort_by(|(a_priority, a_stats, a), (b_priority, b_stats, b)| {
+            a_priority
+                .cmp(b_priority)
+                .then_with(|| b_stats.count.cmp(&a_stats.count))
+                .then_with(|| b_stats.last_seen.cmp(&a_stats.last_seen))
+                .then_with(|| a.score.cmp(&b.score))
                 .then_with(|| a.expression.cmp(&b.expression))
         });
         out.truncate(limit);
-        out
+        out.into_iter()
+            .map(|(_, _, suggestion)| suggestion)
+            .collect()
     }
 }
 
 fn split_completion_fragment(input: &str) -> (&str, &str) {
-    let start = input
-        .char_indices()
-        .rev()
-        .find_map(|(index, ch)| matches!(ch, '&' | '|').then_some(index + ch.len_utf8()))
-        .unwrap_or(0);
+    let start = completion_fragment_start(input);
     let fragment = &input[start..];
     let whitespace = fragment.len() - fragment.trim_start().len();
     (&input[..start + whitespace], &fragment[whitespace..])
+}
+
+/// Find the last symbolic boolean operator that is part of query syntax, not
+/// text inside a quoted value or regex. The query lexer uses the same quote,
+/// slash-regex, escape, and doubled-operator rules.
+fn completion_fragment_start(input: &str) -> usize {
+    #[derive(Clone, Copy)]
+    enum Literal {
+        Quote(char),
+        Regex,
+    }
+
+    let mut literal = None;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match literal {
+            Some(Literal::Quote(quote)) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    literal = None;
+                }
+            }
+            Some(Literal::Regex) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '/' {
+                    literal = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => literal = Some(Literal::Quote(ch)),
+                '/' => literal = Some(Literal::Regex),
+                '&' | '|' => {
+                    let mut end = index + ch.len_utf8();
+                    if chars.peek().is_some_and(|(_, next)| *next == ch) {
+                        let (next_index, next) = chars.next().expect("peeked operator");
+                        end = next_index + next.len_utf8();
+                    }
+                    start = end;
+                }
+                _ => {}
+            },
+        }
+    }
+    start
+}
+
+fn match_priority(query: &str, candidate: &str) -> u8 {
+    if query.is_empty() {
+        return 0;
+    }
+    let query = query.to_lowercase();
+    let candidate = candidate.to_lowercase();
+    if candidate.starts_with(&query) {
+        0
+    } else if candidate.contains(&query) {
+        1
+    } else {
+        2
+    }
 }
 
 fn format_field_expression(field: LogField, value: &str) -> String {
@@ -509,5 +699,64 @@ mod tests {
         assert!(out
             .iter()
             .any(|suggestion| suggestion.expression == "Magic & tag:AeAlgo"));
+    }
+
+    #[test]
+    fn suggestions_preserve_whitespace_after_boolean_operator() {
+        let catalog = FieldCatalog::from_sample(DATA.as_bytes(), Encoding::Utf8);
+        let out = catalog.suggest("Magic &  tag:ae", 10);
+        assert!(out
+            .iter()
+            .any(|suggestion| suggestion.expression == "Magic &  tag:AeAlgo"));
+    }
+
+    #[test]
+    fn boolean_characters_inside_literals_do_not_split_completion() {
+        assert_eq!(
+            split_completion_fragment(r#"tag:"Audio & Video" | msg:par"#),
+            (r#"tag:"Audio & Video" | "#, "msg:par")
+        );
+        assert_eq!(
+            split_completion_fragment(r#"msg:/start|stop/ & tag:ae"#),
+            (r#"msg:/start|stop/ & "#, "tag:ae")
+        );
+        assert_eq!(
+            split_completion_fragment(r#"msg:/start\|stop/"#),
+            ("", r#"msg:/start\|stop/"#)
+        );
+    }
+
+    #[test]
+    fn bounded_ranked_index_keeps_later_frequent_values() {
+        let mut index = RankedValueIndex::new(2);
+        index.insert("early-a".into(), 1);
+        index.insert("early-b".into(), 2);
+        for seen_at in 3..10 {
+            index.insert("late-hot".into(), seen_at);
+        }
+        assert!(index.values.contains_key("late-hot"));
+        assert!(index.values["late-hot"].count > 1);
+        assert_eq!(index.values.len(), 2);
+    }
+
+    #[test]
+    fn ranked_suggestions_prefer_frequency_then_recency() {
+        let mut catalog = FieldCatalog::new(4);
+        for value in ["Alpha", "Alpine", "Alpha", "Alpine", "Alpha"] {
+            catalog.seen_lines += 1;
+            catalog.insert(LogField::Tag, value.into());
+        }
+        let out = catalog.suggest("tag:Al", 4);
+        assert_eq!(out[0].value, "Alpha");
+        assert_eq!(out[1].value, "Alpine");
+    }
+
+    #[test]
+    fn exact_fields_are_not_limited_by_ranked_value_capacity() {
+        let mut catalog = FieldCatalog::new(1);
+        for value in ["1", "2", "3"] {
+            catalog.insert(LogField::Pid, value.into());
+        }
+        assert_eq!(catalog.values(LogField::Pid).count(), 3);
     }
 }
