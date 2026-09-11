@@ -32,3 +32,8 @@ target/
 *onnx
 *.dll
 *.dylib
+# Runtime libraries required by the embedded ADB binary.
+!resources/win/AdbWinApi.dll
+!resources/win/AdbWinUsbApi.dll
+!resources/win/libwinpthread-1.dll
+!resources/mac/lib64/libc++.dylib

@@ -36,13 +36,4 @@ identifier = "com.github.965962591.logd"
 publisher = "logd"
 category = "DeveloperTool"
 icons = ["../../public/logd.ico", "../../public/logd.icns", "../../public/2.png"]
-# cargo-packager expands `**/*` to directories as well as files. App bundles
-# and WiX can only copy regular files, so list file-only patterns here while
-# preserving the resources/{win,mac} layout used by `live_log::adb_path`.
-resources = [
-  "../../resources/win/*.exe",
-  "../../resources/win/*.dll",
-  "../../resources/mac/adb",
-  "../../resources/mac/lib64/*.dylib",
-]
 before-packaging-command = "cargo build --locked --release -p logd"

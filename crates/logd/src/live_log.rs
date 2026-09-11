@@ -18,6 +18,40 @@ use tokio::sync::{mpsc, watch};
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+#[cfg(windows)]
+const EMBEDDED_ADB_FILES: &[(&str, &[u8])] = &[
+    ("adb.exe", include_bytes!("../../../resources/win/adb.exe")),
+    (
+        "AdbWinApi.dll",
+        include_bytes!("../../../resources/win/AdbWinApi.dll"),
+    ),
+    (
+        "AdbWinUsbApi.dll",
+        include_bytes!("../../../resources/win/AdbWinUsbApi.dll"),
+    ),
+    (
+        "libwinpthread-1.dll",
+        include_bytes!("../../../resources/win/libwinpthread-1.dll"),
+    ),
+];
+
+#[cfg(target_os = "macos")]
+const EMBEDDED_ADB_FILES: &[(&str, &[u8])] = &[
+    ("adb", include_bytes!("../../../resources/mac/adb")),
+    (
+        "lib64/libc++.dylib",
+        include_bytes!("../../../resources/mac/lib64/libc++.dylib"),
+    ),
+];
+
+#[cfg(not(any(windows, target_os = "macos")))]
+const EMBEDDED_ADB_FILES: &[(&str, &[u8])] = &[];
+
+#[cfg(windows)]
+const EMBEDDED_ADB_EXECUTABLE: &str = "adb.exe";
+#[cfg(target_os = "macos")]
+const EMBEDDED_ADB_EXECUTABLE: &str = "adb";
+
 #[derive(Debug, Clone)]
 pub enum LiveLogEvent {
     DeviceReady { serial: String, path: PathBuf },
@@ -420,31 +454,81 @@ fn adb_path() -> Result<PathBuf, String> {
         }
         return Err(format!("LOGD_ADB_PATH does not exist: {}", path.display()));
     }
+    extract_embedded_adb()
+}
 
-    let platform = if cfg!(windows) { "win" } else { "mac" };
-    let executable = if cfg!(windows) { "adb.exe" } else { "adb" };
-    let mut candidates = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../resources")
-        .join(platform)
-        .join(executable)];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("resources").join(platform).join(executable));
-            if let Some(contents) = parent.parent() {
-                candidates.push(
-                    contents
-                        .join("Resources")
-                        .join("resources")
-                        .join(platform)
-                        .join(executable),
-                );
-            }
+fn extract_embedded_adb() -> Result<PathBuf, String> {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        return Err("Embedded adb is only available on Windows and macOS".into());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let directory = logd_core::cache::application_cache_dir()
+            .map_err(|error| {
+                format!("Cannot determine the application cache directory: {error:#}")
+            })?
+            .join("adb")
+            .join(format!("{:016x}", embedded_adb_hash()));
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Cannot create {}: {error}", directory.display()))?;
+
+        for (relative_path, bytes) in EMBEDDED_ADB_FILES {
+            let path = directory.join(relative_path);
+            write_embedded_file(&path, bytes)?;
+        }
+
+        let adb = directory.join(EMBEDDED_ADB_EXECUTABLE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = std::fs::metadata(&adb)
+                .map_err(|error| format!("Cannot inspect {}: {error}", adb.display()))?
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&adb, permissions)
+                .map_err(|error| format!("Cannot mark {} executable: {error}", adb.display()))?;
+        }
+        Ok(adb)
+    }
+}
+
+fn embedded_adb_hash() -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for (path, bytes) in EMBEDDED_ADB_FILES {
+        for byte in path.as_bytes().iter().chain(bytes.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
         }
     }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| "Bundled adb was not found in resources".to_string())
+    hash
+}
+
+fn write_embedded_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Embedded adb path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
+    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), "logd"));
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("Cannot write {}: {error}", temporary.display()))?;
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_error) if std::fs::read(path).is_ok_and(|existing| existing == bytes) => {
+            let _ = std::fs::remove_file(&temporary);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(format!("Cannot install {}: {error}", path.display()))
+        }
+    }
 }
 
 fn configure_adb_environment(command: &mut Command, adb: &Path) {
@@ -534,7 +618,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_timestamp, parse_devices, safe_file_name};
+    use super::{capture_timestamp, embedded_adb_hash, parse_devices, safe_file_name};
 
     #[test]
     fn parses_only_authorized_devices() {
@@ -552,5 +636,10 @@ mod tests {
     #[test]
     fn capture_timestamp_is_non_empty() {
         assert!(!capture_timestamp().is_empty());
+    }
+
+    #[test]
+    fn embedded_adb_has_a_stable_content_hash() {
+        assert_ne!(embedded_adb_hash(), 0);
     }
 }
