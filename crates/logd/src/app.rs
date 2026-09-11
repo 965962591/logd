@@ -161,11 +161,10 @@ impl UpdateDialog {
 }
 
 impl Render for UpdateDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
         let check = cx.entity().clone();
         let download = cx.entity().clone();
-        let close = cx.entity().clone();
         let (status_text, progress, can_download) = match &self.status {
             UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
             UpdateStatus::Checking => (
@@ -843,7 +842,7 @@ impl LogdApp {
         });
         cx.spawn_in(window, async move |this, window| {
             let result = task.await;
-            _ = window.update(|window, cx| {
+            _ = window.update(|_window, cx| {
                 _ = this.update(cx, |this, cx| {
                     match result {
                         Ok(count) => {
@@ -3339,7 +3338,8 @@ impl LogdApp {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .text_color(palette.muted), // .child(text(Key::SearchResultsPrompt, lang)),
+                        .text_color(palette.muted)
+                        .child(text(Key::SearchResultsPrompt, lang)),
                 )
                 .into_any_element();
         }

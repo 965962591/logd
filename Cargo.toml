@@ -52,5 +52,3 @@ strip = "symbols"
 debug = false
 panic = "abort"
 incremental = false
-[build]
-jobs = 8  # 设置为你的 CPU 核心数或稍低的值
