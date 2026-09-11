@@ -37,6 +37,7 @@ use logd_core::{
 };
 
 use crate::i18n::{text, Key, Language};
+use crate::live_log::{LiveLogEvent, LiveLogService};
 use crate::log_view::LogView;
 use crate::regex_table::extract_table;
 use crate::theme;
@@ -354,6 +355,9 @@ pub struct LogdApp {
     language: Language,
     status: Option<String>,
     focus: FocusHandle,
+    live_log: Option<LiveLogService>,
+    live_event_sender: Sender<LiveLogEvent>,
+    live_events: Receiver<LiveLogEvent>,
 }
 
 impl LogdApp {
@@ -377,6 +381,7 @@ impl LogdApp {
         let regex_table_pattern = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::RegexTablePlaceholder, language))
         });
+        let (live_sender, live_events) = std::sync::mpsc::channel();
 
         let search_history_for_keyword = search_history_select.clone();
         cx.subscribe_in(
@@ -568,11 +573,92 @@ impl LogdApp {
             language,
             status: None,
             focus: cx.focus_handle(),
+            live_log: None,
+            live_event_sender: live_sender,
+            live_events,
         };
+        this.start_live_event_poll(window, cx);
         for path in initial {
             this.open_path(&path, window, cx);
         }
         this
+    }
+
+    fn start_live_event_poll(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, window| loop {
+            window
+                .background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let keep_running = this
+                .update_in(window, |this, window, cx| {
+                    let events = this.live_events.try_iter().collect::<Vec<_>>();
+                    let had_events = !events.is_empty();
+                    for event in events {
+                        match event {
+                            LiveLogEvent::DeviceReady { serial, path } => {
+                                this.open_log(&path, window, cx);
+                                if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path)
+                                {
+                                    tab.title = format!("ADB {serial}");
+                                }
+                            }
+                            LiveLogEvent::DeviceStopped => {}
+                            LiveLogEvent::CaptureFinished => {
+                                // ADB can exit by itself (device unplugged or
+                                // authorization revoked). Clear the running
+                                // state so the single toggle button returns to
+                                // its start icon.
+                                this.live_log.take();
+                            }
+                            LiveLogEvent::Error(error) => this.status = Some(error),
+                        }
+                    }
+                    if had_events {
+                        cx.notify();
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_running {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn start_live_capture(&mut self, cx: &mut Context<Self>) {
+        if self.live_log.is_some() {
+            return;
+        }
+        match LiveLogService::start(self.live_event_sender.clone()) {
+            Ok(service) => {
+                self.live_log = Some(service);
+                self.status = Some("Starting ADB logcat capture...".into());
+            }
+            Err(error) => self.status = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn stop_live_capture(&mut self, cx: &mut Context<Self>) {
+        if let Some(service) = self.live_log.take() {
+            service.stop();
+        }
+        self.status = Some("ADB logcat capture stopped".into());
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_live_capture(&mut self, cx: &mut Context<Self>) {
+        if self.live_capture_running() {
+            self.stop_live_capture(cx);
+        } else {
+            self.start_live_capture(cx);
+        }
+    }
+
+    pub(crate) fn live_capture_running(&self) -> bool {
+        self.live_log.is_some()
     }
 
     fn reset_default_dock_layout(
@@ -2265,6 +2351,8 @@ impl LogdApp {
         let search_results_toggle_app = app.clone();
         let regex_table_toggle_app = app.clone();
         let show_only_app = app.clone();
+        let capture_running = self.live_capture_running();
+        let capture_app = app.clone();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -2291,6 +2379,21 @@ impl LogdApp {
             .flex_none()
             .items_center()
             .gap_1()
+            .child(title_bar::capture_toggle(
+                capture_running,
+                text(
+                    if capture_running {
+                        Key::StopLiveCapture
+                    } else {
+                        Key::StartLiveCapture
+                    },
+                    lang,
+                ),
+                palette,
+                move |_, _, cx| {
+                    capture_app.update(cx, |app, cx| app.toggle_live_capture(cx));
+                },
+            ))
             .child(title_bar::show_only_toggle(
                 self.show_only_filtered,
                 self.tabs.is_empty(),

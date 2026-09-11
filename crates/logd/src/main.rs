@@ -11,6 +11,7 @@
 
 mod app;
 mod i18n;
+mod live_log;
 mod log_view;
 mod platform;
 mod regex_table;

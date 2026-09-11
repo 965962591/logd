@@ -1082,7 +1082,7 @@ impl Panel for RegexTablePanel {
                 .gap_1()
                 .child(
                     Button::new("regex-table-add-page")
-                        .label("+")
+                        .icon(IconName::Plus)
                         .xsmall()
                         .ghost()
                         .tab_stop(false)
@@ -1096,7 +1096,7 @@ impl Panel for RegexTablePanel {
                 )
                 .child(
                     Button::new("regex-table-remove-page")
-                        .label("−")
+                        .icon(IconName::Minus)
                         .xsmall()
                         .ghost()
                         .tab_stop(false)
