@@ -307,7 +307,6 @@ enum MenuCommand {
     CopySelection,
     ToggleFilters,
     ToggleSearchResults,
-    ToggleRegexTable,
     AddFilter,
     EditFilter,
     DeleteFilter,
@@ -1999,10 +1998,6 @@ impl LogdApp {
                 let visible = self.search_results_panel.read(cx).visible();
                 self.show_search_results(!visible, window, cx)
             }
-            MenuCommand::ToggleRegexTable => {
-                let visible = self.regex_table_panel.read(cx).visible();
-                self.show_regex_table(!visible, window, cx)
-            }
             MenuCommand::AddFilter => self.begin_add_filter(window, cx),
             MenuCommand::EditFilter => self.begin_edit_filter(window, cx),
             MenuCommand::DeleteFilter => self.delete_selected_filter(cx),
@@ -2056,7 +2051,6 @@ impl LogdApp {
         let recent = self.recent_files.clone();
         let selected = self.selected_filter.is_some();
         let has_view = self.active_view().is_some();
-        let regex_table_open = self.regex_table_panel.read(cx).visible();
         let can_export = self
             .active_view()
             .is_some_and(|view| view.read(cx).can_export());
@@ -2202,29 +2196,12 @@ impl LogdApp {
                 .dropdown_menu(move |menu, window, cx| {
                     let language_app = app.clone();
                     let copy_app = app.clone();
-                    let regex_table_app = app.clone();
                     let menu = menu.item(
                         PopupMenuItem::new(text(Key::Copy, lang))
                             .disabled(!has_view)
                             .on_click(window.listener_for(&copy_app, |this, _, window, cx| {
                                 this.dispatch(MenuCommand::CopySelection, window, cx)
                             })),
-                    );
-                    let menu = menu.item(
-                        PopupMenuItem::new(text(
-                            if regex_table_open {
-                                Key::HideRegexTable
-                            } else {
-                                Key::ShowRegexTable
-                            },
-                            lang,
-                        ))
-                        .on_click(window.listener_for(
-                            &regex_table_app,
-                            |this, _, window, cx| {
-                                this.dispatch(MenuCommand::ToggleRegexTable, window, cx)
-                            },
-                        )),
                     );
                     let menu = menu.submenu(
                         text(Key::Language, lang),
@@ -2446,7 +2423,6 @@ impl LogdApp {
             ))
             .child(title_bar::show_only_toggle(
                 self.show_only_filtered,
-                self.tabs.is_empty(),
                 lang,
                 palette,
                 move |window, cx| {

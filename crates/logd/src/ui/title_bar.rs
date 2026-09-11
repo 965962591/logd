@@ -135,7 +135,6 @@ fn inline_icon(data: &'static [u8], palette: theme::Palette) -> Svg {
 /// shortcut.
 pub fn show_only_toggle(
     only: bool,
-    disabled: bool,
     lang: Language,
     palette: theme::Palette,
     on_toggle: impl Fn(&mut Window, &mut App) + 'static,
@@ -156,7 +155,6 @@ pub fn show_only_toggle(
         .small()
         .ghost()
         .toggled(only)
-        .disabled(disabled)
         .tab_stop(false)
         .tooltip(text(target, lang))
         .on_click(move |_, window, cx| {

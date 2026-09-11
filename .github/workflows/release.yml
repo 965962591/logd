@@ -165,6 +165,50 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
+      - name: Publish Windows packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(Get-ChildItem -Path release-assets -File | ForEach-Object { $_.FullName })
+          if ($assets.Count -eq 0) {
+            throw "No Windows release assets were generated"
+          }
+
+          & gh release view $env:RELEASE_TAG --repo $env:GH_REPO *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $env:RELEASE_TAG $assets --repo $env:GH_REPO --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to upload Windows assets to release '$env:RELEASE_TAG'"
+            }
+            exit 0
+          }
+
+          # Both platform jobs can reach this point at the same time. If
+          # release creation loses that race, upload to the release created by
+          # the other platform instead of failing the whole workflow.
+          & gh release create $env:RELEASE_TAG $assets `
+            --repo $env:GH_REPO `
+            --target $env:RELEASE_COMMIT `
+            --title "logd $env:RELEASE_VERSION" `
+            --generate-notes
+          if ($LASTEXITCODE -eq 0) {
+            exit 0
+          }
+
+          & gh release view $env:RELEASE_TAG --repo $env:GH_REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create or find release '$env:RELEASE_TAG'"
+          }
+          & gh release upload $env:RELEASE_TAG $assets --repo $env:GH_REPO --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to upload Windows assets to release '$env:RELEASE_TAG'"
+          }
+
   package-macos:
     name: Package macOS
     needs: version
@@ -268,50 +312,42 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub release
-    needs:
-      - version
-      - package-windows
-      - package-macos
-    runs-on: ubuntu-latest
-    env:
-      GH_REPO: ${{ github.repository }}
-      RELEASE_VERSION: ${{ needs.version.outputs.value }}
-      RELEASE_TAG: ${{ needs.version.outputs.tag }}
-      RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
-
-    steps:
-      - name: Download release packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Publish GitHub release
+      - name: Publish macOS package
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
         run: |
           set -euo pipefail
           assets=(release-assets/*)
-          if [[ ${#assets[@]} -ne 5 ]]; then
-            echo "Expected five release files, found ${#assets[@]}" >&2
+          if [[ ${#assets[@]} -eq 0 || ! -f "${assets[0]}" ]]; then
+            echo "No macOS release assets were generated" >&2
             exit 1
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
-            gh release edit "$RELEASE_TAG" \
-              --draft=false \
-              --prerelease=false \
-              --title "logd $RELEASE_VERSION"
-          else
-            gh release create "$RELEASE_TAG" \
-              "${assets[@]}" \
-              --target "$RELEASE_COMMIT" \
-              --generate-notes \
-              --draft=false \
-              --prerelease=false \
-              --title "logd $RELEASE_VERSION"
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" --clobber
+            exit 0
           fi
+
+          # Both platform jobs can reach this point at the same time. If
+          # release creation loses that race, upload to the release created by
+          # the other platform instead of failing the whole workflow.
+          if gh release create "$RELEASE_TAG" \
+            "${assets[@]}" \
+            --repo "$GH_REPO" \
+            --target "$RELEASE_COMMIT" \
+            --generate-notes \
+            --draft=false \
+            --prerelease=false \
+            --title "logd $RELEASE_VERSION"; then
+            exit 0
+          fi
+
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1 || {
+            echo "Failed to create or find release '$RELEASE_TAG'" >&2
+            exit 1
+          }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" --clobber
