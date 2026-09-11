@@ -208,5 +208,4 @@ mod tests {
         assert_eq!(themes.len(), 36);
         assert_eq!(names.len(), themes.len());
     }
-
 }

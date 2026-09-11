@@ -1,6 +1,11 @@
 //! Dock panel adapters. Business state remains owned by `LogdApp`.
 
-use std::{collections::HashSet, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -11,10 +16,12 @@ use gpui_component::dock::{
     DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelHandle,
     PanelInfo, PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
+use gpui_component::input::InputState;
 use gpui_component::{h_flex, IconName, Sizable as _};
 
 use crate::app::LogdApp;
 use crate::i18n::{text, Key, Language};
+use crate::regex_table::{extract_text_source, RecordTable};
 use crate::theme;
 
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
@@ -610,6 +617,14 @@ pub struct RegexTablePanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
     visible: bool,
+    /// User-editable display names keyed by the extractor's stable column key.
+    pub(crate) header_aliases: HashMap<String, String>,
+    /// Input controls retained across renders so edits/focus survive updates.
+    pub(crate) header_inputs: HashMap<String, Entity<InputState>>,
+    pub(crate) table: RecordTable,
+    pub(crate) table_pattern: String,
+    pub(crate) running: bool,
+    generation: u64,
 }
 
 impl RegexTablePanel {
@@ -617,36 +632,124 @@ impl RegexTablePanel {
         if let Some(app_entity) = app.upgrade() {
             cx.observe(&app_entity, |_, _, cx| cx.notify()).detach();
         }
-        Self { app, focus: cx.focus_handle(), visible: true }
+        Self {
+            app,
+            focus: cx.focus_handle(),
+            visible: true,
+            header_aliases: HashMap::new(),
+            header_inputs: HashMap::new(),
+            table: RecordTable::default(),
+            table_pattern: String::new(),
+            running: false,
+            generation: 0,
+        }
     }
-    pub fn visible(&self) -> bool { self.visible }
+
+    pub(crate) fn extract_text(
+        &mut self,
+        source: Arc<logd_core::FileSource>,
+        index: Arc<logd_core::LineIndex>,
+        encoding: logd_core::Encoding,
+        pattern: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.table_pattern = pattern.clone();
+        self.table = RecordTable::default();
+        self.running = true;
+        cx.notify();
+
+        let weak = cx.entity().downgrade();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, cx| {
+            let table = executor
+                .spawn(async move { extract_text_source(source, index, encoding, &pattern, 5000) })
+                .await;
+            weak.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
+                panel.table = table;
+                panel.running = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn clear_extraction(&mut self, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.table_pattern.clear();
+        self.table = RecordTable::default();
+        self.running = false;
+        cx.notify();
+    }
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        if self.visible != visible { self.visible = visible; cx.notify(); }
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
     }
 }
 
 impl BasePanel for RegexTablePanel {
-    fn panel_name(&self) -> &'static str { REGEX_TABLE_PANEL }
-    fn visible(&self, _: &App) -> bool { self.visible }
-    fn closable(&self, _: &App) -> bool { false }
-    fn dump(&self, _: &App) -> PanelState { visibility_state(REGEX_TABLE_PANEL, self.visible) }
+    fn panel_name(&self) -> &'static str {
+        REGEX_TABLE_PANEL
+    }
+    fn visible(&self, _: &App) -> bool {
+        self.visible
+    }
+    fn closable(&self, _: &App) -> bool {
+        false
+    }
+    fn dump(&self, _: &App) -> PanelState {
+        visibility_state(REGEX_TABLE_PANEL, self.visible)
+    }
 }
 impl Panel for RegexTablePanel {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.app.upgrade().map(|app| text(Key::RegexTable, app.read(cx).language()).to_string()).unwrap_or_else(|| "Regex Table".into())
+        self.app
+            .upgrade()
+            .map(|app| text(Key::RegexTable, app.read(cx).language()).to_string())
+            .unwrap_or_else(|| "Regex Table".into())
     }
-    fn inner_padding(&self, _: &App) -> bool { false }
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
     fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
-        let language = self.app.upgrade().map(|app| app.read(cx).language()).unwrap_or(Language::EnUs);
-        Some(vec![close_tool_panel_button("close-regex-table-panel", REGEX_TABLE_PANEL, self.app.clone(), language)])
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button(
+            "close-regex-table-panel",
+            REGEX_TABLE_PANEL,
+            self.app.clone(),
+            language,
+        )])
     }
-    fn zoom_control(&self, _: &App) -> Option<PanelControl> { Some(PanelControl::Toolbar) }
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
+    }
 }
 impl EventEmitter<PanelEvent> for RegexTablePanel {}
-impl Focusable for RegexTablePanel { fn focus_handle(&self, _: &App) -> FocusHandle { self.focus.clone() } }
+impl Focusable for RegexTablePanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 impl Render for RegexTablePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.app.upgrade().map(|app| LogdApp::render_regex_table(&app, window, cx)).unwrap_or_else(|| div().into_any_element())
+        self.app
+            .upgrade()
+            .map(|app| LogdApp::render_regex_table(&app, self, window, cx))
+            .unwrap_or_else(|| div().into_any_element())
     }
 }
 

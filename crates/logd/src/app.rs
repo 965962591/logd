@@ -37,12 +37,12 @@ use logd_core::{
 
 use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
+use crate::regex_table::extract_table;
 use crate::theme;
 use crate::ui::dock::{
     logd_dock_area, register_logd_panels, FilterPanel, LogPanel, RegexTablePanel,
     SearchResultsPanel,
 };
-use crate::regex_table::extract_table;
 use crate::ui::title_bar;
 
 struct Tab {
@@ -249,21 +249,20 @@ impl Render for UpdateDialog {
                                 cx.notify();
                             });
                         }),
-                )
-                // .child(
-                //     Button::new("close-about")
-                //         .label(text(Key::Close, language))
-                //         .disabled(matches!(
-                //             self.status,
-                //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
-                //         ))
-                //         .on_click(window.listener_for(
-                //             &close,
-                //             |_: &mut UpdateDialog, _, window, cx| {
-                //                 window.close_dialog(cx);
-                //             },
-                //         )),
-                // ),
+                ), // .child(
+                   //     Button::new("close-about")
+                   //         .label(text(Key::Close, language))
+                   //         .disabled(matches!(
+                   //             self.status,
+                   //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+                   //         ))
+                   //         .on_click(window.listener_for(
+                   //             &close,
+                   //             |_: &mut UpdateDialog, _, window, cx| {
+                   //                 window.close_dialog(cx);
+                   //             },
+                   //         )),
+                   // ),
         )
     }
 }
@@ -348,6 +347,7 @@ pub struct LogdApp {
     search_results_panel: Entity<SearchResultsPanel>,
     regex_table_panel: Entity<RegexTablePanel>,
     regex_table_pattern: Entity<InputState>,
+    regex_table_refresh_task: Option<Task<()>>,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
     language: Language,
@@ -373,7 +373,9 @@ impl LogdApp {
         });
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
-        let regex_table_pattern = cx.new(|cx| InputState::new(window, cx).placeholder(text(Key::RegexTablePlaceholder, language)));
+        let regex_table_pattern = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::RegexTablePlaceholder, language))
+        });
 
         let search_history_for_keyword = search_history_select.clone();
         cx.subscribe_in(
@@ -441,8 +443,10 @@ impl LogdApp {
         cx.subscribe_in(
             &regex_table_pattern,
             window,
-            |_, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) { cx.notify(); }
+            |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.schedule_regex_table_refresh(window, cx);
+                }
             },
         )
         .detach();
@@ -452,7 +456,13 @@ impl LogdApp {
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
         let regex_table_panel = cx.new(|cx| RegexTablePanel::new(app.clone(), cx));
-        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, &regex_table_panel, cx);
+        register_logd_panels(
+            &log_panel,
+            &filter_panel,
+            &search_results_panel,
+            &regex_table_panel,
+            cx,
+        );
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
         let (dock_area, skin) =
@@ -551,6 +561,7 @@ impl LogdApp {
             search_results_panel,
             regex_table_panel,
             regex_table_pattern,
+            regex_table_refresh_task: None,
             last_layout_state,
             save_layout_task: None,
             language,
@@ -591,18 +602,20 @@ impl LogdApp {
             // dragged away. One split tree keeps these tool panels movable.
             let center = match filter_placement {
                 DockPlacement::Left => DockLayout::h_split().child(filters, Some(px(360.))).child(
-                    DockLayout::v_split()
-                        .child(workspace, None)
-                        .child(
-                            DockLayout::v_split().child(search_results, Some(px(200.))).child(regex_table, Some(px(200.))),
-                            Some(px(400.)),
-                        ),
+                    DockLayout::v_split().child(workspace, None).child(
+                        DockLayout::v_split()
+                            .child(search_results, Some(px(200.)))
+                            .child(regex_table, Some(px(200.))),
+                        Some(px(400.)),
+                    ),
                     None,
                 ),
                 DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
                     DockLayout::h_split()
                         .child(
-                            DockLayout::v_split().child(search_results, None).child(regex_table, Some(px(200.))),
+                            DockLayout::v_split()
+                                .child(search_results, None)
+                                .child(regex_table, Some(px(200.))),
                             None,
                         )
                         .child(filters, Some(px(360.))),
@@ -610,12 +623,12 @@ impl LogdApp {
                 ),
                 DockPlacement::Right | DockPlacement::Center => DockLayout::h_split()
                     .child(
+                        DockLayout::v_split().child(workspace, None).child(
                             DockLayout::v_split()
-                                .child(workspace, None)
-                                .child(
-                                    DockLayout::v_split().child(search_results, Some(px(200.))).child(regex_table, Some(px(200.))),
-                                    Some(px(400.)),
-                                ),
+                                .child(search_results, Some(px(200.)))
+                                .child(regex_table, Some(px(200.))),
+                            Some(px(400.)),
+                        ),
                         None,
                     )
                     .child(filters, Some(px(360.))),
@@ -644,6 +657,36 @@ impl LogdApp {
                 if crate::settings::save_dock_layout(&state).is_ok() {
                     this.last_layout_state = Some(state);
                 }
+            });
+        }));
+    }
+
+    fn schedule_regex_table_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.regex_table_refresh_task = Some(cx.spawn_in(window, async move |this, window| {
+            window
+                .background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            _ = this.update_in(window, |this, _, cx| {
+                let pattern = this.regex_table_pattern.read(cx).value().to_string();
+                if pattern.trim().is_empty() {
+                    this.regex_table_panel
+                        .update(cx, |panel, cx| panel.clear_extraction(cx));
+                    return;
+                }
+                let Some(view) = this.active_view() else {
+                    this.regex_table_panel
+                        .update(cx, |panel, cx| panel.clear_extraction(cx));
+                    return;
+                };
+                let (source, index, encoding) = {
+                    let view = view.read(cx);
+                    let doc = view.doc();
+                    (doc.source().clone(), doc.index().clone(), doc.encoding())
+                };
+                this.regex_table_panel.update(cx, |panel, cx| {
+                    panel.extract_text(source, index, encoding, pattern, cx)
+                });
             });
         }));
     }
@@ -1370,12 +1413,7 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn set_encoding(
-        &mut self,
-        encoding: Encoding,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_encoding(&mut self, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active_view().cloned() else {
             return;
         };
@@ -1395,12 +1433,7 @@ impl LogdApp {
         cx.notify();
     }
 
-    fn set_theme(
-        &mut self,
-        name: SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_theme(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if cx.theme().theme_name() == &name {
             return;
         }
@@ -1720,8 +1753,14 @@ impl LogdApp {
         cx.notify();
     }
 
-    pub(crate) fn show_regex_table(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.regex_table_panel.update(cx, |panel, cx| panel.set_visible(show, cx));
+    pub(crate) fn show_regex_table(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.regex_table_panel
+            .update(cx, |panel, cx| panel.set_visible(show, cx));
         self.normalize_hidden_dock_panels(window, cx);
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
@@ -2012,11 +2051,20 @@ impl LogdApp {
                             })),
                     );
                     let menu = menu.item(
-                        PopupMenuItem::new(text(if regex_table_open { Key::HideRegexTable } else { Key::ShowRegexTable }, lang)).on_click(
-                            window.listener_for(&regex_table_app, |this, _, window, cx| {
+                        PopupMenuItem::new(text(
+                            if regex_table_open {
+                                Key::HideRegexTable
+                            } else {
+                                Key::ShowRegexTable
+                            },
+                            lang,
+                        ))
+                        .on_click(window.listener_for(
+                            &regex_table_app,
+                            |this, _, window, cx| {
                                 this.dispatch(MenuCommand::ToggleRegexTable, window, cx)
-                            }),
-                        ),
+                            },
+                        )),
                     );
                     let menu = menu.submenu(
                         text(Key::Language, lang),
@@ -2596,7 +2644,8 @@ impl LogdApp {
 
     pub fn render_regex_table(
         app: &Entity<Self>,
-        _window: &mut Window,
+        panel: &mut RegexTablePanel,
+        window: &mut Window,
         cx: &mut Context<RegexTablePanel>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
@@ -2607,20 +2656,54 @@ impl LogdApp {
                 .active_view()
                 .map(|view| {
                     let doc = view.read(cx).doc();
-                    // Regex tables are intended for the active log, not only
-                    // the first viewport. Scan a generous bounded prefix so
-                    // records in normal-sized logs are found without making
-                    // the UI duplicate multi-gigabyte files.
-                    // Read the complete active snapshot. The extractor still
-                    // limits output rows, but must be able to find records
-                    // that occur after the beginning of a large log.
-                    const SAMPLE_BYTES: u64 = u64::MAX;
-                    doc.source().decode(0, doc.source().len().min(SAMPLE_BYTES)).into_owned()
+                    if pattern.trim().is_empty() {
+                        const JSON_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
+                        doc.source()
+                            .decode(0, doc.source().len().min(JSON_SAMPLE_BYTES))
+                            .into_owned()
+                    } else {
+                        String::new()
+                    }
                 })
                 .unwrap_or_default();
-            let table = extract_table(&input, &pattern, 5000);
+            let table = if pattern.trim().is_empty() {
+                extract_table(&input, &pattern, 5000)
+            } else if panel.table_pattern == pattern {
+                panel.table.clone()
+            } else {
+                Default::default()
+            };
             (pattern, state.regex_table_pattern.clone(), table)
         };
+        for column in table.columns.iter().cloned() {
+            if panel.header_inputs.contains_key(&column) {
+                continue;
+            }
+            let alias = panel
+                .header_aliases
+                .get(&column)
+                .cloned()
+                .unwrap_or_else(|| column.clone());
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(alias));
+            let key = column.clone();
+            let weak_panel = cx.entity().downgrade();
+            cx.subscribe_in(
+                &input,
+                window,
+                move |_, state, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let value = state.read(cx).value().to_string();
+                        if let Some(panel) = weak_panel.upgrade() {
+                            panel.update(cx, |panel, _cx| {
+                                panel.header_aliases.insert(key.clone(), value);
+                            });
+                        }
+                    }
+                },
+            )
+            .detach();
+            panel.header_inputs.insert(column, input);
+        }
         let mut content = v_flex()
             .size_full()
             .bg(palette.background)
@@ -2630,23 +2713,50 @@ impl LogdApp {
             .gap_2()
             .child(Input::new(&input).small());
         if let Some(error) = table.error {
-            return content.child(div().text_color(palette.search_foreground).child(error)).into_any_element();
+            return content
+                .child(div().text_color(palette.search_foreground).child(error))
+                .into_any_element();
         }
-        if table.columns.is_empty() {
-            let message = if pattern.trim().is_empty() {
+        if table.columns.is_empty() || table.matched == 0 {
+            let message = if panel.running && panel.table_pattern == pattern {
+                "Parsing..."
+            } else if pattern.trim().is_empty() {
                 "Enter a regex, or open JSON/NDJSON to infer columns"
             } else {
                 "No matches"
             };
-            return content.child(div().text_color(palette.muted).child(message)).into_any_element();
+            let message = format!("{message} (scanned {} lines)", table.scanned);
+            return content
+                .child(div().text_color(palette.muted).child(message))
+                .into_any_element();
         }
         let header = h_flex()
-            .h(px(24.))
+            .h(px(28.))
             .items_center()
             .bg(palette.gutter)
             .children(table.columns.iter().map(|column| {
-                div().w(px(180.)).flex_none().px_2().text_color(palette.muted).child(column.clone())
+                let input = panel.header_inputs.get(column).cloned();
+                input
+                    .map(|input| {
+                        div()
+                            .w(px(180.))
+                            .flex_none()
+                            .px_1()
+                            .child(Input::new(&input).small().appearance(false))
+                            .into_any_element()
+                    })
+                    .unwrap_or_else(|| {
+                        div()
+                            .w(px(180.))
+                            .flex_none()
+                            .px_2()
+                            .text_color(palette.muted)
+                            .child(column.clone())
+                            .into_any_element()
+                    })
             }));
+        let matched = table.matched;
+        let scanned = table.scanned;
         let rows = table.rows;
         let body = uniform_list("regex-table-rows", rows.len(), move |range, _, _| {
             range
@@ -2658,13 +2768,29 @@ impl LogdApp {
                         .border_b_1()
                         .border_color(palette.border)
                         .children(row.into_iter().map(|value| {
-                            div().w(px(180.)).flex_none().px_2().overflow_hidden().text_ellipsis().child(value)
+                            div()
+                                .w(px(180.))
+                                .flex_none()
+                                .px_2()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(value)
                         }))
                         .into_any_element()
                 })
                 .collect::<Vec<_>>()
-        });
-        content.child(header).child(body).into_any_element()
+        })
+        .flex_1()
+        .min_h_0();
+        content
+            .child(
+                div()
+                    .text_color(palette.muted)
+                    .child(format!("Matched {matched}, scanned {scanned} lines")),
+            )
+            .child(header)
+            .child(body)
+            .into_any_element()
     }
 
     /// gpui-component keeps hidden split children in their original index so

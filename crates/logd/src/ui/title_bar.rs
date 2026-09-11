@@ -92,7 +92,11 @@ pub fn show_only_toggle(
         SHOW_ALL_SVG
     };
     // Reveal the mode the click will activate.
-    let target = if only { Key::ShowAll } else { Key::ShowOnlyFiltered };
+    let target = if only {
+        Key::ShowAll
+    } else {
+        Key::ShowOnlyFiltered
+    };
     Button::new("title-show-mode")
         .children(vec![inline_icon(data, palette).into_any_element()])
         .small()

@@ -96,13 +96,10 @@ fn fetch_manual_release() -> anyhow::Result<Option<ManualRelease>> {
                 release.tag_name,
                 asset_name
             )
-    })?;
+        })?;
     Ok(Some(ManualRelease {
         version: release.tag_name,
-        download_url: format!(
-            "{GITHUB_DOWNLOAD_PROXY}{}",
-            asset.browser_download_url
-        ),
+        download_url: format!("{GITHUB_DOWNLOAD_PROXY}{}", asset.browser_download_url),
         size: asset.size,
     }))
 }

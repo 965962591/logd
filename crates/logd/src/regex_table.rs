@@ -3,12 +3,17 @@
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use logd_core::{Encoding, FileSource, LineIndex};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub error: Option<String>,
+    pub scanned: usize,
+    pub matched: usize,
 }
 
 /// Text logs use the supplied regex. JSON and NDJSON are parsed structurally;
@@ -34,19 +39,28 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
         if let Ok(value) = serde_json::from_str::<Value>(input.trim()) {
             match value {
                 Value::Array(values) => {
-                    records.extend(values.into_iter().take(max_rows).filter_map(json_record))
+                    table.scanned = values.len().min(max_rows);
+                    records.extend(values.into_iter().take(max_rows).filter_map(json_record));
+                    table.matched = records.len();
                 }
                 value => {
+                    table.scanned = 1;
                     if let Some(record) = json_record(value) {
                         records.push(record);
+                        table.matched = 1;
                     }
                 }
             }
         } else {
-            for line in input.lines().take(max_rows) {
+            for line in input.lines() {
+                table.scanned += 1;
                 if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
                     if let Some(record) = json_record(value) {
                         records.push(record);
+                        table.matched += 1;
+                        if records.len() >= max_rows {
+                            break;
+                        }
                     }
                 }
             }
@@ -59,7 +73,20 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
                 return table;
             }
         };
-        for line in input.lines().take(max_rows) {
+        table.columns = regex
+            .capture_names()
+            .skip(1)
+            .enumerate()
+            .map(|(index, name)| {
+                name.map(str::to_owned)
+                    .unwrap_or_else(|| format!("group_{}", index + 1))
+            })
+            .collect();
+        if table.columns.is_empty() {
+            table.columns.push("match".into());
+        }
+        for line in input.lines() {
+            table.scanned += 1;
             let Some(captures) = regex.captures(line) else {
                 continue;
             };
@@ -95,14 +122,20 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
             }
             if !record.is_empty() {
                 records.push(record);
+                table.matched += 1;
+                if records.len() >= max_rows {
+                    break;
+                }
             }
         }
     }
-    let mut columns = BTreeSet::new();
-    for record in &records {
-        columns.extend(record.keys().cloned());
+    if table.columns.is_empty() {
+        let mut columns = BTreeSet::new();
+        for record in &records {
+            columns.extend(record.keys().cloned());
+        }
+        table.columns = columns.into_iter().collect();
     }
-    table.columns = columns.into_iter().collect();
     table.rows = records
         .into_iter()
         .map(|record| {
@@ -114,6 +147,103 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
         })
         .collect();
     table
+}
+
+/// Extract a text log without materializing the whole file in memory.
+pub fn extract_text_lines<I>(lines: I, pattern: &str, max_rows: usize) -> RecordTable
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut table = RecordTable::default();
+    let regex = match Regex::new(pattern.trim()) {
+        Ok(regex) => regex,
+        Err(error) => {
+            table.error = Some(error.to_string());
+            return table;
+        }
+    };
+    table.columns = regex
+        .capture_names()
+        .skip(1)
+        .enumerate()
+        .map(|(index, name)| {
+            name.map(str::to_owned)
+                .unwrap_or_else(|| format!("group_{}", index + 1))
+        })
+        .collect();
+    if table.columns.is_empty() {
+        table.columns.push("match".into());
+    }
+    let mut records = Vec::<BTreeMap<String, String>>::new();
+    for line in lines {
+        table.scanned += 1;
+        let Some(captures) = regex.captures(&line) else {
+            continue;
+        };
+        let mut record = BTreeMap::new();
+        if regex.captures_len() > 1 {
+            for index in 1..regex.captures_len() {
+                let key = regex
+                    .capture_names()
+                    .nth(index)
+                    .flatten()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("group_{index}"));
+                record.insert(
+                    key,
+                    captures
+                        .get(index)
+                        .map(|m| m.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
+        } else if let Some(matched) = captures.get(0) {
+            record.insert("match".into(), matched.as_str().into());
+        }
+        if !record.is_empty() {
+            records.push(record);
+            table.matched += 1;
+            if records.len() >= max_rows {
+                break;
+            }
+        }
+    }
+    table.rows = records
+        .into_iter()
+        .map(|record| {
+            table
+                .columns
+                .iter()
+                .map(|column| record.get(column).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect();
+    table
+}
+
+/// Scan an indexed/memory-mapped log in the background without copying the
+/// complete file into a single String.
+pub fn extract_text_source(
+    source: Arc<FileSource>,
+    index: Arc<LineIndex>,
+    encoding: Encoding,
+    pattern: &str,
+    max_rows: usize,
+) -> RecordTable {
+    let data = source.data();
+    let mut spans = Vec::with_capacity(1);
+    let lines = (0..index.total_lines).filter_map(|line| {
+        index.line_spans(data, line, 1, &mut spans);
+        let &(start, end) = spans.first()?;
+        let mut start = start as usize;
+        let end = end as usize;
+        if start == 0 {
+            start = source.bom_len().min(end);
+        }
+        Some(encoding.decode_bytes(&data[start..end]).into_owned())
+    });
+    extract_text_lines(lines, pattern, max_rows)
 }
 
 fn json_record(value: Value) -> Option<BTreeMap<String, String>> {
@@ -173,12 +303,40 @@ mod tests {
 
     #[test]
     fn supplied_pattern_matches_sample_log() {
-        let input = "cur(s(1692)0.020000s,g[3.42 14016],dmy1128)";
+        let input = "M079F6D  09-04 10:46:59.967   842 26978 D Libae:[Sub_fun]: 493,aec_lcg_alg_status_printf:ae.m,frm_id,0,unstb,near_stb,unlock,100Hz,sensor_fps[0,30],fps[14,30]:30.00,cur(s(1692)0.020000s,g[3.42 14016],dmy1128),nxt:idx241.88";
         let table = extract_table(
             input,
             r"cur\(s\((\d+)\)([\d.]+)s,g\[([\d.]+)\s+(\d+)\],dmy(\d+)\)",
             100,
         );
         assert_eq!(table.rows[0], ["1692", "0.020000", "3.42", "14016", "1128"]);
+        assert_eq!(table.scanned, 1);
+        assert_eq!(table.matched, 1);
+    }
+
+    #[test]
+    fn row_limit_does_not_limit_lines_scanned_before_a_match() {
+        let input = format!("{}value=42", "irrelevant\n".repeat(6_000));
+        let table = extract_table(&input, r"value=(\d+)", 5_000);
+        assert_eq!(table.rows, [["42"]]);
+        assert_eq!(table.scanned, 6_001);
+    }
+
+    #[test]
+    fn streaming_text_extraction_preserves_named_and_unnamed_columns() {
+        let lines = vec![
+            "cur(s(1692)0.020000s,g[3.42 14016],dmy1128)".to_owned(),
+            "noise".to_owned(),
+        ];
+        let table = super::extract_text_lines(
+            lines,
+            r"cur\(s\((?<sensor_id>\d+)\)([\d.]+)s,g\[(?<gain>[\d.]+)\s+(\d+)\],dmy(?<dmy>\d+)\)",
+            100,
+        );
+        assert_eq!(
+            table.columns,
+            ["sensor_id", "group_2", "gain", "group_4", "dmy"]
+        );
+        assert_eq!(table.matched, 1);
     }
 }

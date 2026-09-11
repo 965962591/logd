@@ -261,7 +261,9 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::HideRegexTable, Language::ZhCn) => "隐藏正则表格",
         (Key::HideRegexTable, Language::EnUs) => "Hide Regex Table",
         (Key::RegexTablePlaceholder, Language::ZhCn) => "正则表达式（命名捕获组作为列）",
-        (Key::RegexTablePlaceholder, Language::EnUs) => "Regex (named capture groups become columns)",
+        (Key::RegexTablePlaceholder, Language::EnUs) => {
+            "Regex (named capture groups become columns)"
+        }
         (Key::SearchResultsPrompt, Language::ZhCn) => "在标题栏输入关键字并按回车搜索",
         (Key::SearchResultsPrompt, Language::EnUs) => {
             "Enter keywords in the title bar and press Enter"
