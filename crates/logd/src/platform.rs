@@ -3,8 +3,8 @@
 use gpui::{px, size, App, Size, TitlebarOptions, WindowDecorations, WindowOptions};
 
 /// The initial client area used by every build and platform.
-pub const INITIAL_WINDOW_WIDTH: f32 = 900.0;
-pub const INITIAL_WINDOW_HEIGHT: f32 = 600.0;
+pub const INITIAL_WINDOW_WIDTH: f32 = 1000.0;
+pub const INITIAL_WINDOW_HEIGHT: f32 = 650.0;
 
 pub fn initial_window_size() -> Size<gpui::Pixels> {
     size(px(INITIAL_WINDOW_WIDTH), px(INITIAL_WINDOW_HEIGHT))

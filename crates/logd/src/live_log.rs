@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -118,10 +118,18 @@ async fn run_capture(
     let writer_events = events.clone();
     let writer = tokio::spawn(write_batches(lines_rx, writer_events));
     let mut workers = Vec::with_capacity(devices.len());
+    // One UTC timestamp identifies this capture session. Including
+    // milliseconds keeps rapid stop/start operations from reusing the same
+    // filename while keeping names sortable when browsing the history folder.
+    let session_timestamp = capture_timestamp();
 
     for serial in devices {
-        let path = output_dir.join(format!("{}.log", safe_file_name(&serial)));
-        if let Err(error) = std::fs::File::create(&path) {
+        let path = unique_log_path(&output_dir, &serial, &session_timestamp);
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             let _ = events.send(LiveLogEvent::Error(format!(
                 "Cannot create log file for {serial}: {error}"
             )));
@@ -472,9 +480,61 @@ fn safe_file_name(serial: &str) -> String {
         .collect()
 }
 
+fn unique_log_path(output_dir: &Path, serial: &str, timestamp: &str) -> PathBuf {
+    let stem = format!("{}_{}", safe_file_name(serial), timestamp);
+    let initial = output_dir.join(format!("{stem}.log"));
+    if !initial.exists() {
+        return initial;
+    }
+    // A suffix is only needed if the system clock has the same millisecond on
+    // two starts. It preserves the device_timestamp naming scheme while
+    // making the no-overwrite guarantee explicit.
+    for suffix in 1..=1000 {
+        let candidate = output_dir.join(format!("{stem}_{suffix}.log"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // This is practically unreachable; the create_new call below still
+    // reports a useful error if the directory is unexpectedly saturated.
+    initial
+}
+
+fn capture_timestamp() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = duration.as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    let millis = duration.subsec_millis();
+    format!("{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}_{millis:03}")
+}
+
+// Gregorian calendar conversion based on the civil_from_days algorithm. The
+// result is UTC, which is stable across machines and avoids locale characters
+// in filenames.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_devices, safe_file_name};
+    use super::{capture_timestamp, parse_devices, safe_file_name};
 
     #[test]
     fn parses_only_authorized_devices() {
@@ -487,5 +547,10 @@ mod tests {
     #[test]
     fn makes_device_serials_safe_file_names() {
         assert_eq!(safe_file_name("usb:1/2"), "usb_1_2");
+    }
+
+    #[test]
+    fn capture_timestamp_is_non_empty() {
+        assert!(!capture_timestamp().is_empty());
     }
 }
