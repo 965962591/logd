@@ -297,6 +297,7 @@ enum MenuCommand {
     Open,
     OpenRecent(PathBuf),
     ClearRecentFiles,
+    ClearLiveLogHistory,
     Refresh,
     Export,
     SaveEditedCopy,
@@ -825,6 +826,45 @@ impl LogdApp {
     fn clear_recent_files(&mut self, cx: &mut Context<Self>) {
         self.recent_files.clear();
         let _ = crate::settings::save_recent_files(&self.recent_files);
+        cx.notify();
+    }
+
+    fn clear_live_log_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Take ownership before dispatching the blocking join to a background
+        // worker. This immediately puts the title-bar toggle back in its
+        // stopped state and prevents new data from being written while files
+        // are removed.
+        let service = self.live_log.take();
+        self.status = Some("Clearing realtime log history...".into());
+        let task = cx.background_executor().spawn(async move {
+            if let Some(service) = service {
+                service.stop_and_wait();
+            }
+            crate::live_log::clear_history()
+        });
+        cx.spawn_in(window, async move |this, window| {
+            let result = task.await;
+            _ = window.update(|window, cx| {
+                _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(count) => {
+                            let active_path =
+                                this.tabs.get(this.active).map(|tab| tab.path.clone());
+                            this.tabs
+                                .retain(|tab| !crate::live_log::is_history_log(&tab.path));
+                            this.restore_active_path(active_path, cx);
+                            this.status = Some(format!(
+                                "Cleared {count} realtime log file{}",
+                                if count == 1 { "" } else { "s" }
+                            ));
+                        }
+                        Err(error) => this.status = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1931,6 +1971,7 @@ impl LogdApp {
             MenuCommand::Open => self.prompt_open(window, cx),
             MenuCommand::OpenRecent(path) => self.open_path(&path, window, cx),
             MenuCommand::ClearRecentFiles => self.clear_recent_files(cx),
+            MenuCommand::ClearLiveLogHistory => self.clear_live_log_history(window, cx),
             MenuCommand::Refresh => self.refresh_active(window, cx),
             MenuCommand::Export => {
                 if let Some(view) = self.active_view().cloned() {
@@ -2053,6 +2094,7 @@ impl LogdApp {
                     let refresh_app = app.clone();
                     let export_app = app.clone();
                     let save_copy_app = app.clone();
+                    let clear_live_log_app = app.clone();
                     let menu = menu
                         .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
                             window.listener_for(&open_app, |this, _, window, cx| {
@@ -2078,6 +2120,14 @@ impl LogdApp {
                             PopupMenuItem::new(text(Key::SaveEditedCopy, lang)).on_click(
                                 window.listener_for(&save_copy_app, |this, _, window, cx| {
                                     this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
+                                }),
+                            ),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(text(Key::ClearLiveLogHistory, lang)).on_click(
+                                window.listener_for(&clear_live_log_app, |this, _, window, cx| {
+                                    this.dispatch(MenuCommand::ClearLiveLogHistory, window, cx)
                                 }),
                             ),
                         );

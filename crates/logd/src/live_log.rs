@@ -68,6 +68,16 @@ impl LiveLogService {
         // in-memory batch once all senders have been dropped.
         let _ = self.stop.send(true);
     }
+
+    /// Signal capture shutdown and wait for the worker to flush its final
+    /// in-memory batch. This is intended for background maintenance actions
+    /// such as deleting the history directory.
+    pub fn stop_and_wait(mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Drop for LiveLogService {
@@ -348,14 +358,50 @@ fn parse_devices(output: &str) -> Vec<String> {
 }
 
 fn live_log_dir() -> Result<PathBuf, String> {
-    let base = dirs::data_local_dir()
-        .or_else(dirs::data_dir)
-        .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| "Cannot determine a local data directory".to_string())?;
-    let path = base.join("logd").join("live-logs");
+    let path = logd_core::cache::application_cache_dir()
+        .map_err(|error| format!("Cannot determine the application cache directory: {error:#}"))?
+        .join("logs");
     std::fs::create_dir_all(&path)
         .map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
     Ok(path)
+}
+
+pub fn history_dir() -> Result<PathBuf, String> {
+    logd_core::cache::application_cache_dir()
+        .map(|path| path.join("logs"))
+        .map_err(|error| format!("Cannot determine the application cache directory: {error:#}"))
+}
+
+pub fn clear_history() -> Result<usize, String> {
+    let directory = history_dir()?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!("Cannot read {}: {error}", directory.display()));
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("Cannot read an entry in {}: {error}", directory.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Cannot inspect {}: {error}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .map_err(|error| format!("Cannot delete {}: {error}", entry.path().display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+pub fn is_history_log(path: &Path) -> bool {
+    history_dir()
+        .ok()
+        .is_some_and(|directory| path.parent() == Some(directory.as_path()))
 }
 
 fn adb_path() -> Result<PathBuf, String> {
