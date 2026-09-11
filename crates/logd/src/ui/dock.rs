@@ -16,7 +16,8 @@ use gpui_component::dock::{
     DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelHandle,
     PanelInfo, PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
-use gpui_component::input::InputState;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{h_flex, IconName, Sizable as _};
 
 use crate::app::LogdApp;
@@ -617,18 +618,97 @@ pub struct RegexTablePanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
     visible: bool,
-    /// User-editable display names keyed by the extractor's stable column key.
-    pub(crate) header_aliases: HashMap<String, String>,
-    /// Input controls retained across renders so edits/focus survive updates.
-    pub(crate) header_inputs: HashMap<String, Entity<InputState>>,
-    pub(crate) table: RecordTable,
-    pub(crate) table_pattern: String,
-    pub(crate) running: bool,
+    pages: Vec<RegexTablePage>,
+    active_page: usize,
+    next_page_id: u64,
+}
+
+struct RegexTablePage {
+    id: u64,
+    pattern: String,
+    header_inputs: HashMap<String, Entity<InputState>>,
+    table: RecordTable,
+    table_pattern: String,
+    running: bool,
     generation: u64,
+    table_revision: u64,
+    rendered_table_key: String,
+    table_state: Entity<TableState<RegexTableDelegate>>,
+}
+
+pub(crate) struct RegexTableDelegate {
+    columns: Vec<Column>,
+    rows: Arc<Vec<Vec<String>>>,
+    headers: Vec<Entity<InputState>>,
+}
+
+impl Default for RegexTableDelegate {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Arc::new(Vec::new()),
+            headers: Vec::new(),
+        }
+    }
+}
+
+impl TableDelegate for RegexTableDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        self.headers
+            .get(col_ix)
+            .map(|input| {
+                Input::new(input)
+                    .small()
+                    .appearance(false)
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| div().into_any_element())
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div().size_full().overflow_hidden().text_ellipsis().child(
+            self.rows
+                .get(row_ix)
+                .and_then(|row| row.get(col_ix))
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
+        self.rows
+            .get(row_ix)
+            .and_then(|row| row.get(col_ix))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 impl RegexTablePanel {
-    pub fn new(app: WeakEntity<LogdApp>, cx: &mut Context<Self>) -> Self {
+    pub fn new(app: WeakEntity<LogdApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         if let Some(app_entity) = app.upgrade() {
             cx.observe(&app_entity, |_, _, cx| cx.notify()).detach();
         }
@@ -636,13 +716,74 @@ impl RegexTablePanel {
             app,
             focus: cx.focus_handle(),
             visible: true,
-            header_aliases: HashMap::new(),
-            header_inputs: HashMap::new(),
-            table: RecordTable::default(),
-            table_pattern: String::new(),
-            running: false,
-            generation: 0,
+            pages: vec![new_regex_page(1, window, cx)],
+            active_page: 0,
+            next_page_id: 2,
         }
+    }
+
+    fn active(&self) -> &RegexTablePage {
+        &self.pages[self.active_page]
+    }
+
+    fn active_mut(&mut self) -> &mut RegexTablePage {
+        &mut self.pages[self.active_page]
+    }
+
+    pub(crate) fn page_tabs(&self) -> Vec<(u64, bool)> {
+        self.pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (page.id, index == self.active_page))
+            .collect()
+    }
+
+    pub(crate) fn select_page(
+        &mut self,
+        index: usize,
+        current_pattern: String,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if index >= self.pages.len() {
+            return None;
+        }
+        self.active_mut().pattern = current_pattern;
+        self.active_page = index;
+        cx.notify();
+        Some(self.active().pattern.clone())
+    }
+
+    pub(crate) fn add_page(
+        &mut self,
+        current_pattern: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.active_mut().pattern = current_pattern;
+        let id = self.next_page_id;
+        self.next_page_id = self.next_page_id.wrapping_add(1);
+        self.pages.push(new_regex_page(id, window, cx));
+        self.active_page = self.pages.len() - 1;
+        cx.notify();
+        String::new()
+    }
+
+    pub(crate) fn remove_active_page(
+        &mut self,
+        current_pattern: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.active_mut().pattern = current_pattern;
+        self.pages.remove(self.active_page);
+        if self.pages.is_empty() {
+            let id = self.next_page_id;
+            self.next_page_id = self.next_page_id.wrapping_add(1);
+            self.pages.push(new_regex_page(id, window, cx));
+        }
+        self.active_page = self.active_page.min(self.pages.len() - 1);
+        cx.notify();
+        self.active().pattern.clone()
     }
 
     pub(crate) fn extract_text(
@@ -653,25 +794,35 @@ impl RegexTablePanel {
         pattern: String,
         cx: &mut Context<Self>,
     ) {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        self.table_pattern = pattern.clone();
-        self.table = RecordTable::default();
-        self.running = true;
+        let page = self.active_mut();
+        page.pattern = pattern.clone();
+        page.generation = page.generation.wrapping_add(1);
+        let generation = page.generation;
+        let page_id = page.id;
+        page.table_pattern = pattern.clone();
+        page.table = RecordTable::default();
+        page.running = true;
         cx.notify();
 
         let weak = cx.entity().downgrade();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_, cx| {
-            let table = executor
-                .spawn(async move { extract_text_source(source, index, encoding, &pattern, 5000) })
-                .await;
+            let table =
+                executor
+                    .spawn(async move {
+                        extract_text_source(source, index, encoding, &pattern, usize::MAX)
+                    })
+                    .await;
             weak.update(cx, |panel, cx| {
-                if panel.generation != generation {
+                let Some(page) = panel.pages.iter_mut().find(|page| page.id == page_id) else {
+                    return;
+                };
+                if page.generation != generation {
                     return;
                 }
-                panel.table = table;
-                panel.running = false;
+                page.table = table;
+                page.running = false;
+                page.table_revision = page.table_revision.wrapping_add(1);
                 cx.notify();
             })
             .ok();
@@ -680,11 +831,113 @@ impl RegexTablePanel {
     }
 
     pub(crate) fn clear_extraction(&mut self, cx: &mut Context<Self>) {
-        self.generation = self.generation.wrapping_add(1);
-        self.table_pattern.clear();
-        self.table = RecordTable::default();
-        self.running = false;
+        let page = self.active_mut();
+        page.pattern.clear();
+        page.generation = page.generation.wrapping_add(1);
+        page.table_pattern.clear();
+        page.table = RecordTable::default();
+        page.running = false;
         cx.notify();
+    }
+
+    pub(crate) fn table_key(&self, pattern: &str) -> String {
+        format!("regex:{pattern}:{}", self.active().table_revision)
+    }
+
+    pub(crate) fn current_table(&self, pattern: &str) -> RecordTable {
+        let page = self.active();
+        if page.table_pattern == pattern {
+            page.table.clone()
+        } else {
+            RecordTable::default()
+        }
+    }
+
+    pub(crate) fn is_running(&self, pattern: &str) -> bool {
+        let page = self.active();
+        page.running && page.table_pattern == pattern
+    }
+
+    pub(crate) fn sync_virtual_table(
+        &mut self,
+        key: String,
+        table: &RecordTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active().rendered_table_key == key {
+            return;
+        }
+        let page = self.active_mut();
+        for column in &table.columns {
+            if page.header_inputs.contains_key(column) {
+                continue;
+            }
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(column.clone()));
+            // The InputState owns the edited header. Do not subscribe back to
+            // the parent panel: doing so re-enters DataTable header rendering.
+            page.header_inputs.insert(column.clone(), input);
+        }
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| Column::new(column.clone(), column.clone()).width(180.))
+            .collect();
+        let headers = table
+            .columns
+            .iter()
+            .filter_map(|column| page.header_inputs.get(column).cloned())
+            .collect();
+        let rows = table.rows.clone();
+        page.table_state.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.columns = columns;
+            delegate.headers = headers;
+            delegate.rows = rows;
+            state.refresh(cx);
+            cx.notify();
+        });
+        page.rendered_table_key = key;
+    }
+
+    pub(crate) fn data_table(&self) -> DataTable<RegexTableDelegate> {
+        DataTable::new(&self.active().table_state)
+            .bordered(false)
+            .scrollbar_visible(true, true)
+    }
+
+    pub(crate) fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = self.active();
+        if page.table.rows.is_empty() {
+            return;
+        }
+        let headers = page
+            .table
+            .columns
+            .iter()
+            .map(|column| {
+                page.header_inputs
+                    .get(column)
+                    .map(|input| input.read(cx).value().to_string())
+                    .unwrap_or_else(|| column.clone())
+            })
+            .collect::<Vec<_>>();
+        let rows = page.table.rows.clone();
+        let page_id = page.id;
+        let target = cx.prompt_for_new_path(
+            std::path::Path::new("."),
+            Some(&format!("regex-table-{page_id}.csv")),
+        );
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |_, _| {
+            let Some(target) = target.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            let _ = executor
+                .spawn(async move { write_regex_csv(target, headers, rows) })
+                .await;
+        })
+        .detach();
     }
     pub fn visible(&self) -> bool {
         self.visible
@@ -694,6 +947,55 @@ impl RegexTablePanel {
             self.visible = visible;
             cx.notify();
         }
+    }
+}
+
+fn new_regex_page(
+    id: u64,
+    window: &mut Window,
+    cx: &mut Context<RegexTablePanel>,
+) -> RegexTablePage {
+    let table_state = cx.new(|cx| {
+        TableState::new(RegexTableDelegate::default(), window, cx)
+            .col_selectable(false)
+            .row_selectable(false)
+            .col_movable(false)
+            .sortable(false)
+    });
+    RegexTablePage {
+        id,
+        pattern: String::new(),
+        header_inputs: HashMap::new(),
+        table: RecordTable::default(),
+        table_pattern: String::new(),
+        running: false,
+        generation: 0,
+        table_revision: 0,
+        rendered_table_key: String::new(),
+        table_state,
+    }
+}
+
+fn write_regex_csv(
+    path: PathBuf,
+    headers: Vec<String>,
+    rows: Arc<Vec<Vec<String>>>,
+) -> anyhow::Result<()> {
+    use std::io::{BufWriter, Write as _};
+    let mut writer = BufWriter::new(std::fs::File::create(path)?);
+    writeln!(writer, "{}", headers.iter().map(|value| csv_field(value)).collect::<Vec<_>>().join(","))?;
+    for row in rows.iter() {
+        writeln!(writer, "{}", row.iter().map(|value| csv_field(value)).collect::<Vec<_>>().join(","))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
     }
 }
 

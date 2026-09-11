@@ -10,7 +10,7 @@ use logd_core::{Encoding, FileSource, LineIndex};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordTable {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Arc<Vec<Vec<String>>>,
     pub error: Option<String>,
     pub scanned: usize,
     pub matched: usize,
@@ -136,16 +136,18 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
         }
         table.columns = columns.into_iter().collect();
     }
-    table.rows = records
-        .into_iter()
-        .map(|record| {
-            table
-                .columns
-                .iter()
-                .map(|column| record.get(column).cloned().unwrap_or_default())
-                .collect()
-        })
-        .collect();
+    table.rows = Arc::new(
+        records
+            .into_iter()
+            .map(|record| {
+                table
+                    .columns
+                    .iter()
+                    .map(|column| record.get(column).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect(),
+    );
     table
 }
 
@@ -209,16 +211,18 @@ where
             }
         }
     }
-    table.rows = records
-        .into_iter()
-        .map(|record| {
-            table
-                .columns
-                .iter()
-                .map(|column| record.get(column).cloned().unwrap_or_default())
-                .collect()
-        })
-        .collect();
+    table.rows = Arc::new(
+        records
+            .into_iter()
+            .map(|record| {
+                table
+                    .columns
+                    .iter()
+                    .map(|column| record.get(column).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect(),
+    );
     table
 }
 
@@ -318,7 +322,7 @@ mod tests {
     fn row_limit_does_not_limit_lines_scanned_before_a_match() {
         let input = format!("{}value=42", "irrelevant\n".repeat(6_000));
         let table = extract_table(&input, r"value=(\d+)", 5_000);
-        assert_eq!(table.rows, [["42"]]);
+        assert_eq!(table.rows.as_ref(), &vec![vec!["42".to_owned()]]);
         assert_eq!(table.scanned, 6_001);
     }
 

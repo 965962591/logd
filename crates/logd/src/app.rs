@@ -455,7 +455,7 @@ impl LogdApp {
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
-        let regex_table_panel = cx.new(|cx| RegexTablePanel::new(app.clone(), cx));
+        let regex_table_panel = cx.new(|cx| RegexTablePanel::new(app.clone(), window, cx));
         register_logd_panels(
             &log_panel,
             &filter_panel,
@@ -2649,62 +2649,39 @@ impl LogdApp {
         cx: &mut Context<RegexTablePanel>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
-        let (pattern, input, table) = {
+        let (pattern, input, table, table_key) = {
             let state = app.read(cx);
             let pattern = state.regex_table_pattern.read(cx).value().to_string();
-            let input = state
-                .active_view()
-                .map(|view| {
+            let (input, json_key) = state.active_view().map_or_else(
+                || (String::new(), "json:none".to_owned()),
+                |view| {
                     let doc = view.read(cx).doc();
                     if pattern.trim().is_empty() {
-                        const JSON_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
-                        doc.source()
-                            .decode(0, doc.source().len().min(JSON_SAMPLE_BYTES))
-                            .into_owned()
+                        let source = doc.source();
+                        (
+                            source.decode(0, source.len()).into_owned(),
+                            format!("json:{}:{}", source.path().display(), source.len()),
+                        )
                     } else {
-                        String::new()
+                        (String::new(), String::new())
                     }
-                })
-                .unwrap_or_default();
+                },
+            );
             let table = if pattern.trim().is_empty() {
-                extract_table(&input, &pattern, 5000)
+                extract_table(&input, &pattern, usize::MAX)
             } else if panel.table_pattern == pattern {
                 panel.table.clone()
             } else {
                 Default::default()
             };
-            (pattern, state.regex_table_pattern.clone(), table)
+            let table_key = if pattern.trim().is_empty() {
+                json_key
+            } else {
+                panel.table_key(&pattern)
+            };
+            (pattern, state.regex_table_pattern.clone(), table, table_key)
         };
-        for column in table.columns.iter().cloned() {
-            if panel.header_inputs.contains_key(&column) {
-                continue;
-            }
-            let alias = panel
-                .header_aliases
-                .get(&column)
-                .cloned()
-                .unwrap_or_else(|| column.clone());
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(alias));
-            let key = column.clone();
-            let weak_panel = cx.entity().downgrade();
-            cx.subscribe_in(
-                &input,
-                window,
-                move |_, state, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        let value = state.read(cx).value().to_string();
-                        if let Some(panel) = weak_panel.upgrade() {
-                            panel.update(cx, |panel, _cx| {
-                                panel.header_aliases.insert(key.clone(), value);
-                            });
-                        }
-                    }
-                },
-            )
-            .detach();
-            panel.header_inputs.insert(column, input);
-        }
-        let mut content = v_flex()
+        let content = v_flex()
             .size_full()
             .bg(palette.background)
             .text_color(palette.foreground)
@@ -2712,7 +2689,7 @@ impl LogdApp {
             .p_2()
             .gap_2()
             .child(Input::new(&input).small());
-        if let Some(error) = table.error {
+        if let Some(error) = table.error.clone() {
             return content
                 .child(div().text_color(palette.search_foreground).child(error))
                 .into_any_element();
@@ -2730,66 +2707,9 @@ impl LogdApp {
                 .child(div().text_color(palette.muted).child(message))
                 .into_any_element();
         }
-        let header = h_flex()
-            .h(px(28.))
-            .items_center()
-            .bg(palette.gutter)
-            .children(table.columns.iter().map(|column| {
-                let input = panel.header_inputs.get(column).cloned();
-                input
-                    .map(|input| {
-                        div()
-                            .w(px(180.))
-                            .flex_none()
-                            .px_1()
-                            .child(Input::new(&input).small().appearance(false))
-                            .into_any_element()
-                    })
-                    .unwrap_or_else(|| {
-                        div()
-                            .w(px(180.))
-                            .flex_none()
-                            .px_2()
-                            .text_color(palette.muted)
-                            .child(column.clone())
-                            .into_any_element()
-                    })
-            }));
-        let matched = table.matched;
-        let scanned = table.scanned;
-        let rows = table.rows;
-        let body = uniform_list("regex-table-rows", rows.len(), move |range, _, _| {
-            range
-                .map(|index| {
-                    let row = rows.get(index).cloned().unwrap_or_default();
-                    h_flex()
-                        .h(px(24.))
-                        .items_center()
-                        .border_b_1()
-                        .border_color(palette.border)
-                        .children(row.into_iter().map(|value| {
-                            div()
-                                .w(px(180.))
-                                .flex_none()
-                                .px_2()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(value)
-                        }))
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        })
-        .flex_1()
-        .min_h_0();
+        panel.sync_virtual_table(table_key, &table, window, cx);
         content
-            .child(
-                div()
-                    .text_color(palette.muted)
-                    .child(format!("Matched {matched}, scanned {scanned} lines")),
-            )
-            .child(header)
-            .child(body)
+            .child(div().flex_1().min_h_0().child(panel.data_table()))
             .into_any_element()
     }
 
