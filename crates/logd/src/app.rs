@@ -1768,6 +1768,29 @@ impl LogdApp {
         cx.notify();
     }
 
+    pub(crate) fn add_regex_table_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.regex_table_pattern.read(cx).value().to_string();
+        let next = self
+            .regex_table_panel
+            .update(cx, |panel, cx| panel.add_page(current, window, cx));
+        self.regex_table_pattern
+            .update(cx, |input, cx| input.set_value(next, window, cx));
+    }
+
+    pub(crate) fn remove_regex_table_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.regex_table_pattern.read(cx).value().to_string();
+        let next = self.regex_table_panel.update(cx, |panel, cx| {
+            panel.remove_active_page(current, window, cx)
+        });
+        self.regex_table_pattern
+            .update(cx, |input, cx| input.set_value(next, window, cx));
+    }
+
+    pub(crate) fn export_regex_table_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.regex_table_panel
+            .update(cx, |panel, cx| panel.export_csv(window, cx));
+    }
+
     pub(crate) fn search_results_title_status(&self, cx: &App) -> (String, Option<String>) {
         let has_search = !self.search_query.is_empty();
         let has_filter_results = self.has_multi_file_filter_results();
@@ -2229,6 +2252,7 @@ impl LogdApp {
         let app = cx.entity();
         let filters_open = self.filter_panel.read(cx).visible();
         let search_results_open = self.search_results_panel.read(cx).visible();
+        let regex_table_open = self.regex_table_panel.read(cx).visible();
         let search_history = self.search_history.clone();
         let has_search_history = !search_history.is_empty();
         let search_history_select = self.search_history_select.clone();
@@ -2239,6 +2263,7 @@ impl LogdApp {
         let lang = self.language;
         let filter_toggle_app = app.clone();
         let search_results_toggle_app = app.clone();
+        let regex_table_toggle_app = app.clone();
         let show_only_app = app.clone();
         let left = h_flex()
             .h_full()
@@ -2274,6 +2299,23 @@ impl LogdApp {
                 move |window, cx| {
                     show_only_app.update(cx, |app, cx| {
                         app.set_show_only(!app.show_only_filtered, window, cx)
+                    });
+                },
+            ))
+            .child(title_bar::regex_table_toggle(
+                regex_table_open,
+                text(
+                    if regex_table_open {
+                        Key::HideRegexTable
+                    } else {
+                        Key::ShowRegexTable
+                    },
+                    lang,
+                ),
+                palette,
+                move |_, window, cx| {
+                    regex_table_toggle_app.update(cx, |app, cx| {
+                        app.show_regex_table(!regex_table_open, window, cx)
                     });
                 },
             ))
@@ -2712,74 +2754,10 @@ impl LogdApp {
                     });
                 }
             });
-        let add_panel = cx.entity().downgrade();
-        let add_app = app.clone();
-        let remove_panel = cx.entity().downgrade();
-        let remove_app = app.clone();
-        let export_panel = cx.entity().downgrade();
         let toolbar = h_flex()
             .w_full()
             .items_center()
-            .child(div().flex_1().min_w_0().child(tab_bar))
-            .child(
-                Button::new("regex-table-add-page")
-                    .label("+")
-                    .xsmall()
-                    .ghost()
-                    .on_click(move |_, window, cx| {
-                        let current = add_app
-                            .read(cx)
-                            .regex_table_pattern
-                            .read(cx)
-                            .value()
-                            .to_string();
-                        if let Some(next) = add_panel
-                            .update(cx, |panel, cx| panel.add_page(current, window, cx))
-                            .ok()
-                        {
-                            add_app.update(cx, |app, cx| {
-                                app.regex_table_pattern
-                                    .update(cx, |input, cx| input.set_value(next, window, cx));
-                            });
-                        }
-                    }),
-            )
-            .child(
-                Button::new("regex-table-remove-page")
-                    .label("−")
-                    .xsmall()
-                    .ghost()
-                    .on_click(move |_, window, cx| {
-                        let current = remove_app
-                            .read(cx)
-                            .regex_table_pattern
-                            .read(cx)
-                            .value()
-                            .to_string();
-                        if let Some(next) = remove_panel
-                            .update(cx, |panel, cx| {
-                                panel.remove_active_page(current, window, cx)
-                            })
-                            .ok()
-                        {
-                            remove_app.update(cx, |app, cx| {
-                                app.regex_table_pattern
-                                    .update(cx, |input, cx| input.set_value(next, window, cx));
-                            });
-                        }
-                    }),
-            )
-            .child(
-                Button::new("regex-table-export-csv")
-                    .label("CSV")
-                    .xsmall()
-                    .ghost()
-                    .on_click(move |_, window, cx| {
-                        export_panel
-                            .update(cx, |panel, cx| panel.export_csv(window, cx))
-                            .ok();
-                    }),
-            );
+            .child(div().flex_1().min_w_0().child(tab_bar));
         let content = v_flex()
             .size_full()
             .bg(palette.background)

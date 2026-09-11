@@ -29,6 +29,10 @@ pub const WORKSPACE_PANEL: &str = "logd.workspace";
 pub const FILTER_PANEL: &str = "logd.filters";
 pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
 pub const REGEX_TABLE_PANEL: &str = "logd.regex-table";
+const EXPORT_ICON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../public/export.svg"
+));
 
 /// Builds the normal component dock, except that the central log workspace
 /// does not draw redundant single-panel chrome above its content.
@@ -1048,6 +1052,82 @@ impl Panel for RegexTablePanel {
             .upgrade()
             .map(|app| text(Key::RegexTable, app.read(cx).language()).to_string())
             .unwrap_or_else(|| "Regex Table".into())
+    }
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        let add_tip = if language == Language::ZhCn {
+            "新建正则表格标签"
+        } else {
+            "New regex table tab"
+        };
+        let remove_tip = if language == Language::ZhCn {
+            "删除当前正则表格标签"
+        } else {
+            "Delete current regex table tab"
+        };
+        let export_tip = if language == Language::ZhCn {
+            "导出当前表格为 CSV"
+        } else {
+            "Export current table as CSV"
+        };
+        let add_app = self.app.clone();
+        let remove_app = self.app.clone();
+        let export_app = self.app.clone();
+        Some(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new("regex-table-add-page")
+                        .label("+")
+                        .xsmall()
+                        .ghost()
+                        .tab_stop(false)
+                        .accessibility_label(add_tip)
+                        .tooltip(add_tip)
+                        .on_click(move |_, window, cx| {
+                            if let Some(app) = add_app.upgrade() {
+                                app.update(cx, |app, cx| app.add_regex_table_page(window, cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("regex-table-remove-page")
+                        .label("−")
+                        .xsmall()
+                        .ghost()
+                        .tab_stop(false)
+                        .accessibility_label(remove_tip)
+                        .tooltip(remove_tip)
+                        .on_click(move |_, window, cx| {
+                            if let Some(app) = remove_app.upgrade() {
+                                app.update(cx, |app, cx| app.remove_regex_table_page(window, cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("regex-table-export-csv")
+                        .children(vec![svg()
+                            .data(EXPORT_ICON)
+                            .size(px(16.))
+                            .flex_none()
+                            .text_color(theme::palette(cx).foreground)
+                            .into_any_element()])
+                        .xsmall()
+                        .ghost()
+                        .tab_stop(false)
+                        .accessibility_label(export_tip)
+                        .tooltip(export_tip)
+                        .on_click(move |_, window, cx| {
+                            if let Some(app) = export_app.upgrade() {
+                                app.update(cx, |app, cx| app.export_regex_table_csv(window, cx));
+                            }
+                        }),
+                ),
+        )
     }
     fn inner_padding(&self, _: &App) -> bool {
         false

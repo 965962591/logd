@@ -25,6 +25,8 @@ const SEARCH_MIN_WIDTH: f32 = 300.0;
 const SEARCH_WIDTH_RATIO: f32 = 0.4;
 const APP_ICON_BYTES: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/2.png"));
+const REGEX_TABLE_SVG: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/re.svg"));
 
 static APP_ICON: LazyLock<Arc<Image>> =
     LazyLock::new(|| Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON_BYTES.to_vec())));
@@ -53,6 +55,27 @@ pub fn panel_toggle(
         .on_click(move |event, window, cx| {
             // Panel buttons live inside the title bar, whose double-click
             // handler is reserved for maximizing the window.
+            cx.stop_propagation();
+            action(event, window, cx);
+        })
+}
+
+pub fn regex_table_toggle(
+    open: bool,
+    tooltip: impl Into<SharedString>,
+    palette: theme::Palette,
+    action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    Button::new("title-toggle-regex-table")
+        .children(vec![
+            inline_icon(REGEX_TABLE_SVG, palette).into_any_element()
+        ])
+        .small()
+        .ghost()
+        .toggled(open)
+        .tab_stop(false)
+        .tooltip(tooltip)
+        .on_click(move |event, window, cx| {
             cx.stop_propagation();
             action(event, window, cx);
         })
