@@ -39,8 +39,10 @@ use crate::i18n::{text, Key, Language};
 use crate::log_view::LogView;
 use crate::theme;
 use crate::ui::dock::{
-    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, SearchResultsPanel,
+    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, RegexTablePanel,
+    SearchResultsPanel,
 };
+use crate::regex_table::extract_table;
 use crate::ui::title_bar;
 
 struct Tab {
@@ -63,7 +65,7 @@ struct SearchResultFile {
 
 // Increment when the registered panel tree changes so stale persisted layouts
 // cannot restore panels that no longer exist.
-const DOCK_LAYOUT_VERSION: usize = 5;
+const DOCK_LAYOUT_VERSION: usize = 6;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
@@ -303,6 +305,7 @@ enum MenuCommand {
     CopySelection,
     ToggleFilters,
     ToggleSearchResults,
+    ToggleRegexTable,
     AddFilter,
     EditFilter,
     DeleteFilter,
@@ -343,6 +346,8 @@ pub struct LogdApp {
     tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
     search_results_panel: Entity<SearchResultsPanel>,
+    regex_table_panel: Entity<RegexTablePanel>,
+    regex_table_pattern: Entity<InputState>,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
     language: Language,
@@ -368,6 +373,7 @@ impl LogdApp {
         });
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
+        let regex_table_pattern = cx.new(|cx| InputState::new(window, cx).placeholder(text(Key::RegexTablePlaceholder, language)));
 
         let search_history_for_keyword = search_history_select.clone();
         cx.subscribe_in(
@@ -432,12 +438,21 @@ impl LogdApp {
             },
         )
         .detach();
+        cx.subscribe_in(
+            &regex_table_pattern,
+            window,
+            |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) { cx.notify(); }
+            },
+        )
+        .detach();
 
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
-        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, cx);
+        let regex_table_panel = cx.new(|cx| RegexTablePanel::new(app.clone(), cx));
+        register_logd_panels(&log_panel, &filter_panel, &search_results_panel, &regex_table_panel, cx);
 
         let legacy_filter_placement = crate::settings::load_filter_placement();
         let (dock_area, skin) =
@@ -457,6 +472,7 @@ impl LogdApp {
                 &log_panel,
                 &filter_panel,
                 &search_results_panel,
+                &regex_table_panel,
                 legacy_filter_placement,
                 window,
                 cx,
@@ -533,6 +549,8 @@ impl LogdApp {
             tab_scroll: ScrollHandle::new(),
             filter_panel,
             search_results_panel,
+            regex_table_panel,
+            regex_table_pattern,
             last_layout_state,
             save_layout_task: None,
             language,
@@ -550,6 +568,7 @@ impl LogdApp {
         workspace: &Entity<LogPanel>,
         filters: &Entity<FilterPanel>,
         search_results: &Entity<SearchResultsPanel>,
+        regex_table: &Entity<RegexTablePanel>,
         filter_placement: DockPlacement,
         window: &mut Window,
         cx: &mut App,
@@ -566,6 +585,7 @@ impl LogdApp {
             let filters = DockLayout::tabs().panel_view(panel_handle(filters.clone()), cx);
             let search_results =
                 DockLayout::tabs().panel_view(panel_handle(search_results.clone()), cx);
+            let regex_table = DockLayout::tabs().panel_view(panel_handle(regex_table.clone()), cx);
 
             // An outer dock protects its last visible panel from being
             // dragged away. One split tree keeps these tool panels movable.
@@ -573,20 +593,29 @@ impl LogdApp {
                 DockPlacement::Left => DockLayout::h_split().child(filters, Some(px(360.))).child(
                     DockLayout::v_split()
                         .child(workspace, None)
-                        .child(search_results, Some(px(240.))),
+                        .child(
+                            DockLayout::v_split().child(search_results, Some(px(200.))).child(regex_table, Some(px(200.))),
+                            Some(px(400.)),
+                        ),
                     None,
                 ),
                 DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
                     DockLayout::h_split()
-                        .child(search_results, None)
+                        .child(
+                            DockLayout::v_split().child(search_results, None).child(regex_table, Some(px(200.))),
+                            None,
+                        )
                         .child(filters, Some(px(360.))),
                     Some(px(240.)),
                 ),
                 DockPlacement::Right | DockPlacement::Center => DockLayout::h_split()
                     .child(
-                        DockLayout::v_split()
-                            .child(workspace, None)
-                            .child(search_results, Some(px(240.))),
+                            DockLayout::v_split()
+                                .child(workspace, None)
+                                .child(
+                                    DockLayout::v_split().child(search_results, Some(px(200.))).child(regex_table, Some(px(200.))),
+                                    Some(px(400.)),
+                                ),
                         None,
                     )
                     .child(filters, Some(px(360.))),
@@ -1691,6 +1720,14 @@ impl LogdApp {
         cx.notify();
     }
 
+    pub(crate) fn show_regex_table(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.regex_table_panel.update(cx, |panel, cx| panel.set_visible(show, cx));
+        self.normalize_hidden_dock_panels(window, cx);
+        let dock_area = self.dock_area.clone();
+        self.schedule_layout_save(&dock_area, window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn search_results_title_status(&self, cx: &App) -> (String, Option<String>) {
         let has_search = !self.search_query.is_empty();
         let has_filter_results = self.has_multi_file_filter_results();
@@ -1772,6 +1809,10 @@ impl LogdApp {
                 let visible = self.search_results_panel.read(cx).visible();
                 self.show_search_results(!visible, window, cx)
             }
+            MenuCommand::ToggleRegexTable => {
+                let visible = self.regex_table_panel.read(cx).visible();
+                self.show_regex_table(!visible, window, cx)
+            }
             MenuCommand::AddFilter => self.begin_add_filter(window, cx),
             MenuCommand::EditFilter => self.begin_edit_filter(window, cx),
             MenuCommand::DeleteFilter => self.delete_selected_filter(cx),
@@ -1825,6 +1866,7 @@ impl LogdApp {
         let recent = self.recent_files.clone();
         let selected = self.selected_filter.is_some();
         let has_view = self.active_view().is_some();
+        let regex_table_open = self.regex_table_panel.read(cx).visible();
         let can_export = self
             .active_view()
             .is_some_and(|view| view.read(cx).can_export());
@@ -1961,12 +2003,20 @@ impl LogdApp {
                 .dropdown_menu(move |menu, window, cx| {
                     let language_app = app.clone();
                     let copy_app = app.clone();
+                    let regex_table_app = app.clone();
                     let menu = menu.item(
                         PopupMenuItem::new(text(Key::Copy, lang))
                             .disabled(!has_view)
                             .on_click(window.listener_for(&copy_app, |this, _, window, cx| {
                                 this.dispatch(MenuCommand::CopySelection, window, cx)
                             })),
+                    );
+                    let menu = menu.item(
+                        PopupMenuItem::new(text(if regex_table_open { Key::HideRegexTable } else { Key::ShowRegexTable }, lang)).on_click(
+                            window.listener_for(&regex_table_app, |this, _, window, cx| {
+                                this.dispatch(MenuCommand::ToggleRegexTable, window, cx)
+                            }),
+                        ),
                     );
                     let menu = menu.submenu(
                         text(Key::Language, lang),
@@ -2542,6 +2592,79 @@ impl LogdApp {
                     .into_any_element()
             });
         view
+    }
+
+    pub fn render_regex_table(
+        app: &Entity<Self>,
+        _window: &mut Window,
+        cx: &mut Context<RegexTablePanel>,
+    ) -> AnyElement {
+        let palette = theme::palette(cx);
+        let (pattern, input, table) = {
+            let state = app.read(cx);
+            let pattern = state.regex_table_pattern.read(cx).value().to_string();
+            let input = state
+                .active_view()
+                .map(|view| {
+                    let doc = view.read(cx).doc();
+                    // Regex tables are intended for the active log, not only
+                    // the first viewport. Scan a generous bounded prefix so
+                    // records in normal-sized logs are found without making
+                    // the UI duplicate multi-gigabyte files.
+                    // Read the complete active snapshot. The extractor still
+                    // limits output rows, but must be able to find records
+                    // that occur after the beginning of a large log.
+                    const SAMPLE_BYTES: u64 = u64::MAX;
+                    doc.source().decode(0, doc.source().len().min(SAMPLE_BYTES)).into_owned()
+                })
+                .unwrap_or_default();
+            let table = extract_table(&input, &pattern, 5000);
+            (pattern, state.regex_table_pattern.clone(), table)
+        };
+        let mut content = v_flex()
+            .size_full()
+            .bg(palette.background)
+            .text_color(palette.foreground)
+            .text_size(px(12.))
+            .p_2()
+            .gap_2()
+            .child(Input::new(&input).small());
+        if let Some(error) = table.error {
+            return content.child(div().text_color(palette.search_foreground).child(error)).into_any_element();
+        }
+        if table.columns.is_empty() {
+            let message = if pattern.trim().is_empty() {
+                "Enter a regex, or open JSON/NDJSON to infer columns"
+            } else {
+                "No matches"
+            };
+            return content.child(div().text_color(palette.muted).child(message)).into_any_element();
+        }
+        let header = h_flex()
+            .h(px(24.))
+            .items_center()
+            .bg(palette.gutter)
+            .children(table.columns.iter().map(|column| {
+                div().w(px(180.)).flex_none().px_2().text_color(palette.muted).child(column.clone())
+            }));
+        let rows = table.rows;
+        let body = uniform_list("regex-table-rows", rows.len(), move |range, _, _| {
+            range
+                .map(|index| {
+                    let row = rows.get(index).cloned().unwrap_or_default();
+                    h_flex()
+                        .h(px(24.))
+                        .items_center()
+                        .border_b_1()
+                        .border_color(palette.border)
+                        .children(row.into_iter().map(|value| {
+                            div().w(px(180.)).flex_none().px_2().overflow_hidden().text_ellipsis().child(value)
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        });
+        content.child(header).child(body).into_any_element()
     }
 
     /// gpui-component keeps hidden split children in their original index so

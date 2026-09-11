@@ -20,6 +20,7 @@ use crate::theme;
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
 pub const FILTER_PANEL: &str = "logd.filters";
 pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
+pub const REGEX_TABLE_PANEL: &str = "logd.regex-table";
 
 /// Builds the normal component dock, except that the central log workspace
 /// does not draw redundant single-panel chrome above its content.
@@ -152,6 +153,7 @@ fn close_tool_panel_button(
             app.update(cx, |app, cx| match panel_name {
                 FILTER_PANEL => app.show_filter_panel(false, window, cx),
                 SEARCH_RESULTS_PANEL => app.show_search_results(false, window, cx),
+                REGEX_TABLE_PANEL => app.show_regex_table(false, window, cx),
                 _ => {}
             })
             .ok();
@@ -293,7 +295,7 @@ impl TabGroupRenderer for LogdTabGroupSkin {
             }
             [ix] if matches!(
                 group.panels()[*ix].panel_name(cx),
-                FILTER_PANEL | SEARCH_RESULTS_PANEL
+                FILTER_PANEL | SEARCH_RESULTS_PANEL | REGEX_TABLE_PANEL
             ) =>
             {
                 self.render_tool_panel_title(group, *ix, window, cx)
@@ -335,6 +337,7 @@ pub fn register_logd_panels(
     workspace: &Entity<LogPanel>,
     filters: &Entity<FilterPanel>,
     search_results: &Entity<SearchResultsPanel>,
+    regex_table: &Entity<RegexTablePanel>,
     cx: &mut App,
 ) {
     register_panel(cx, WORKSPACE_PANEL, {
@@ -357,6 +360,15 @@ pub fn register_logd_panels(
                 search_results.update(cx, |panel, cx| panel.set_visible(visible, cx));
             }
             panel_handle(search_results.clone())
+        }
+    });
+    register_panel(cx, REGEX_TABLE_PANEL, {
+        let regex_table = regex_table.clone();
+        move |context, _, cx| {
+            if let Some(visible) = restored_visibility(context.info()) {
+                regex_table.update(cx, |panel, cx| panel.set_visible(visible, cx));
+            }
+            panel_handle(regex_table.clone())
         }
     });
 }
@@ -592,6 +604,50 @@ pub struct SearchResultsPanel {
     collapsed_files: HashSet<PathBuf>,
     content_width: f32,
     visible: bool,
+}
+
+pub struct RegexTablePanel {
+    app: WeakEntity<LogdApp>,
+    focus: FocusHandle,
+    visible: bool,
+}
+
+impl RegexTablePanel {
+    pub fn new(app: WeakEntity<LogdApp>, cx: &mut Context<Self>) -> Self {
+        if let Some(app_entity) = app.upgrade() {
+            cx.observe(&app_entity, |_, _, cx| cx.notify()).detach();
+        }
+        Self { app, focus: cx.focus_handle(), visible: true }
+    }
+    pub fn visible(&self) -> bool { self.visible }
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible { self.visible = visible; cx.notify(); }
+    }
+}
+
+impl BasePanel for RegexTablePanel {
+    fn panel_name(&self) -> &'static str { REGEX_TABLE_PANEL }
+    fn visible(&self, _: &App) -> bool { self.visible }
+    fn closable(&self, _: &App) -> bool { false }
+    fn dump(&self, _: &App) -> PanelState { visibility_state(REGEX_TABLE_PANEL, self.visible) }
+}
+impl Panel for RegexTablePanel {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app.upgrade().map(|app| text(Key::RegexTable, app.read(cx).language()).to_string()).unwrap_or_else(|| "Regex Table".into())
+    }
+    fn inner_padding(&self, _: &App) -> bool { false }
+    fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        let language = self.app.upgrade().map(|app| app.read(cx).language()).unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button("close-regex-table-panel", REGEX_TABLE_PANEL, self.app.clone(), language)])
+    }
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> { Some(PanelControl::Toolbar) }
+}
+impl EventEmitter<PanelEvent> for RegexTablePanel {}
+impl Focusable for RegexTablePanel { fn focus_handle(&self, _: &App) -> FocusHandle { self.focus.clone() } }
+impl Render for RegexTablePanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app.upgrade().map(|app| LogdApp::render_regex_table(&app, window, cx)).unwrap_or_else(|| div().into_any_element())
+    }
 }
 
 impl SearchResultsPanel {

@@ -13,6 +13,7 @@ mod app;
 mod i18n;
 mod log_view;
 mod platform;
+mod regex_table;
 mod settings;
 mod theme;
 mod ui;
