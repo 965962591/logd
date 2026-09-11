@@ -26,6 +26,7 @@ use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
+use gpui_component::tab::{Tab as UiTab, TabBar};
 use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
     Root, Selectable as _, Sizable, WindowExt as _,
@@ -2669,10 +2670,8 @@ impl LogdApp {
             );
             let table = if pattern.trim().is_empty() {
                 extract_table(&input, &pattern, usize::MAX)
-            } else if panel.table_pattern == pattern {
-                panel.table.clone()
             } else {
-                Default::default()
+                panel.current_table(&pattern)
             };
             let table_key = if pattern.trim().is_empty() {
                 json_key
@@ -2681,6 +2680,106 @@ impl LogdApp {
             };
             (pattern, state.regex_table_pattern.clone(), table, table_key)
         };
+        let tabs = panel.page_tabs();
+        let active_page = tabs
+            .iter()
+            .position(|(_, selected)| *selected)
+            .unwrap_or_default();
+        let tab_panel = cx.entity().downgrade();
+        let tab_app = app.clone();
+        let tab_bar = TabBar::new("regex-table-pages")
+            .small()
+            .selected_index(active_page)
+            .children(
+                tabs.iter()
+                    .map(|(id, _)| UiTab::new().label(format!("Table {id}"))),
+            )
+            .on_click(move |index, window, cx| {
+                let current = tab_app
+                    .read(cx)
+                    .regex_table_pattern
+                    .read(cx)
+                    .value()
+                    .to_string();
+                let next = tab_panel
+                    .update(cx, |panel, cx| panel.select_page(*index, current, cx))
+                    .ok()
+                    .flatten();
+                if let Some(next) = next {
+                    tab_app.update(cx, |app, cx| {
+                        app.regex_table_pattern
+                            .update(cx, |input, cx| input.set_value(next, window, cx));
+                    });
+                }
+            });
+        let add_panel = cx.entity().downgrade();
+        let add_app = app.clone();
+        let remove_panel = cx.entity().downgrade();
+        let remove_app = app.clone();
+        let export_panel = cx.entity().downgrade();
+        let toolbar = h_flex()
+            .w_full()
+            .items_center()
+            .child(div().flex_1().min_w_0().child(tab_bar))
+            .child(
+                Button::new("regex-table-add-page")
+                    .label("+")
+                    .xsmall()
+                    .ghost()
+                    .on_click(move |_, window, cx| {
+                        let current = add_app
+                            .read(cx)
+                            .regex_table_pattern
+                            .read(cx)
+                            .value()
+                            .to_string();
+                        if let Some(next) = add_panel
+                            .update(cx, |panel, cx| panel.add_page(current, window, cx))
+                            .ok()
+                        {
+                            add_app.update(cx, |app, cx| {
+                                app.regex_table_pattern
+                                    .update(cx, |input, cx| input.set_value(next, window, cx));
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new("regex-table-remove-page")
+                    .label("−")
+                    .xsmall()
+                    .ghost()
+                    .on_click(move |_, window, cx| {
+                        let current = remove_app
+                            .read(cx)
+                            .regex_table_pattern
+                            .read(cx)
+                            .value()
+                            .to_string();
+                        if let Some(next) = remove_panel
+                            .update(cx, |panel, cx| {
+                                panel.remove_active_page(current, window, cx)
+                            })
+                            .ok()
+                        {
+                            remove_app.update(cx, |app, cx| {
+                                app.regex_table_pattern
+                                    .update(cx, |input, cx| input.set_value(next, window, cx));
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new("regex-table-export-csv")
+                    .label("CSV")
+                    .xsmall()
+                    .ghost()
+                    .on_click(move |_, window, cx| {
+                        export_panel
+                            .update(cx, |panel, cx| panel.export_csv(window, cx))
+                            .ok();
+                    }),
+            );
         let content = v_flex()
             .size_full()
             .bg(palette.background)
@@ -2688,6 +2787,7 @@ impl LogdApp {
             .text_size(px(12.))
             .p_2()
             .gap_2()
+            .child(toolbar)
             .child(Input::new(&input).small());
         if let Some(error) = table.error.clone() {
             return content
@@ -2695,14 +2795,13 @@ impl LogdApp {
                 .into_any_element();
         }
         if table.columns.is_empty() || table.matched == 0 {
-            let message = if panel.running && panel.table_pattern == pattern {
+            let message = if panel.is_running(&pattern) {
                 "Parsing..."
             } else if pattern.trim().is_empty() {
                 "Enter a regex, or open JSON/NDJSON to infer columns"
             } else {
                 "No matches"
             };
-            let message = format!("{message} (scanned {} lines)", table.scanned);
             return content
                 .child(div().text_color(palette.muted).child(message))
                 .into_any_element();

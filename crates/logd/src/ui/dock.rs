@@ -16,7 +16,7 @@ use gpui_component::dock::{
     DockContext, DockSkin, DropIndicator, NodeId, Panel, PanelControl, PanelEvent, PanelHandle,
     PanelInfo, PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputState};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{h_flex, IconName, Sizable as _};
 
@@ -869,6 +869,7 @@ impl RegexTablePanel {
             return;
         }
         let page = self.active_mut();
+        page.table = table.clone();
         for column in &table.columns {
             if page.header_inputs.contains_key(column) {
                 continue;
@@ -983,9 +984,24 @@ fn write_regex_csv(
 ) -> anyhow::Result<()> {
     use std::io::{BufWriter, Write as _};
     let mut writer = BufWriter::new(std::fs::File::create(path)?);
-    writeln!(writer, "{}", headers.iter().map(|value| csv_field(value)).collect::<Vec<_>>().join(","))?;
+    writeln!(
+        writer,
+        "{}",
+        headers
+            .iter()
+            .map(|value| csv_field(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
     for row in rows.iter() {
-        writeln!(writer, "{}", row.iter().map(|value| csv_field(value)).collect::<Vec<_>>().join(","))?;
+        writeln!(
+            writer,
+            "{}",
+            row.iter()
+                .map(|value| csv_field(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
     }
     writer.flush()?;
     Ok(())
@@ -996,6 +1012,19 @@ fn csv_field(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod regex_table_csv_tests {
+    use super::csv_field;
+
+    #[test]
+    fn csv_fields_escape_commas_quotes_and_newlines() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
     }
 }
 
