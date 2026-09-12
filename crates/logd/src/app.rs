@@ -1957,6 +1957,23 @@ impl LogdApp {
         cx.notify();
     }
 
+    pub(crate) fn copy_marked_lines(&self, lines: &[(PathBuf, u64)], cx: &mut Context<Self>) {
+        let output = self
+            .marked_lines(cx)
+            .into_iter()
+            .filter(|mark| {
+                lines
+                    .iter()
+                    .any(|(path, file_line)| path == &mark.path && *file_line == mark.file_line)
+            })
+            .map(|mark| mark.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !output.is_empty() {
+            cx.write_to_clipboard(output.into());
+        }
+    }
+
     pub(crate) fn show_regex_table(
         &mut self,
         show: bool,

@@ -20,6 +20,7 @@ use gpui_component::dock::{
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable as _};
 
@@ -632,6 +633,7 @@ pub struct MarkPanel {
     visible: bool,
     selected: BTreeSet<(PathBuf, u64)>,
     selection_anchor: Option<(PathBuf, u64)>,
+    current_line: Option<(PathBuf, u64)>,
 }
 
 impl MarkPanel {
@@ -645,6 +647,7 @@ impl MarkPanel {
             visible: true,
             selected: BTreeSet::new(),
             selection_anchor: None,
+            current_line: None,
         }
     }
 
@@ -668,6 +671,7 @@ impl MarkPanel {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
+        self.current_line = Some(key.clone());
         if extend {
             let anchor = self.selection_anchor.clone().unwrap_or_else(|| key.clone());
             let anchor_index = keys
@@ -696,6 +700,13 @@ impl MarkPanel {
     fn select_all(&mut self, keys: &[(PathBuf, u64)], cx: &mut Context<Self>) {
         self.selected = keys.iter().cloned().collect();
         self.selection_anchor = keys.first().cloned();
+        if self
+            .current_line
+            .as_ref()
+            .is_none_or(|current| !self.selected.contains(current))
+        {
+            self.current_line = keys.first().cloned();
+        }
         cx.notify();
     }
 
@@ -708,6 +719,7 @@ impl MarkPanel {
         key: (PathBuf, u64),
         cx: &mut Context<Self>,
     ) -> Vec<(PathBuf, u64)> {
+        self.current_line = Some(key.clone());
         if !self.selected.contains(&key) {
             self.selected.clear();
             self.selected.insert(key.clone());
@@ -725,6 +737,13 @@ impl MarkPanel {
             .is_some_and(|anchor| removed.contains(anchor))
         {
             self.selection_anchor = None;
+        }
+        if self
+            .current_line
+            .as_ref()
+            .is_some_and(|current| removed.contains(current))
+        {
+            self.current_line = self.selected.iter().next().cloned();
         }
         cx.notify();
     }
@@ -769,13 +788,12 @@ impl MarkPanel {
         let right_key = key.clone();
         let left_keys = keys.clone();
         let log_text = mark.text.clone();
-        let source_tooltip = mark.title.clone();
         let context_key = key.clone();
         h_flex()
             .id(("mark-row", index))
             .min_h(px(24.))
-            .w_full()
-            .min_w_0()
+            .w_auto()
+            .min_w_full()
             .px_2()
             .gap_2()
             .items_center()
@@ -803,9 +821,7 @@ impl MarkPanel {
                 MouseButton::Right,
                 cx.listener(move |this, _, window, cx| {
                     window.focus(&this.focus, cx);
-                    if !this.selected.contains(&right_key) {
-                        this.select(right_key.clone(), index, keys.as_slice(), false, false, cx);
-                    }
+                    this.selected_lines_for_context(right_key.clone(), cx);
                 }),
             )
             .child(
@@ -834,38 +850,36 @@ impl MarkPanel {
                 div()
                     .id(("mark-source", index))
                     .flex_none()
-                    .w(px(52.))
+                    .min_w(px(52.))
                     .text_right()
                     .text_color(palette.muted)
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(source_tooltip.clone())
-                            .build(window, cx)
-                    })
+                    .whitespace_nowrap()
                     .child((mark.file_line + 1).to_string()),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(log_text),
-            )
+            .child(div().flex_none().whitespace_nowrap().child(log_text))
             .context_menu(move |menu, _window, cx| {
                 let remove_app = app.clone();
+                let copy_app = app.clone();
                 let selected = remove_panel
                     .update(cx, |panel, cx| {
                         panel.selected_lines_for_context(context_key.clone(), cx)
                     })
                     .unwrap_or_default();
-                menu.item(PopupMenuItem::new(text(Key::Unmark, language)).on_click(
+                let copy_selected = selected.clone();
+                menu.item(PopupMenuItem::new(text(Key::Copy, language)).on_click(
                     move |_, _, cx| {
-                        remove_app
-                            .update(cx, |app, cx| app.unmark_lines(&selected, cx))
+                        copy_app
+                            .update(cx, |app, cx| app.copy_marked_lines(&copy_selected, cx))
                             .ok();
                     },
                 ))
+                .item(
+                    PopupMenuItem::new(text(Key::Unmark, language)).on_click(move |_, _, cx| {
+                        remove_app
+                            .update(cx, |app, cx| app.unmark_lines(&selected, cx))
+                            .ok();
+                    }),
+                )
             })
             .into_any_element()
     }
@@ -891,10 +905,20 @@ impl BasePanel for MarkPanel {
 
 impl Panel for MarkPanel {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.app
-            .upgrade()
-            .map(|app| text(Key::Marks, app.read(cx).language()))
-            .unwrap_or_else(|| text(Key::Marks, Language::EnUs))
+        let Some(app) = self.app.upgrade() else {
+            return text(Key::Marks, Language::EnUs).to_string();
+        };
+        let app = app.read(cx);
+        let base = text(Key::Marks, app.language());
+        self.current_line
+            .as_ref()
+            .and_then(|(path, file_line)| {
+                app.marked_lines(cx)
+                    .into_iter()
+                    .find(|mark| &mark.path == path && mark.file_line == *file_line)
+                    .map(|mark| format!("{base} - {}", mark.title))
+            })
+            .unwrap_or_else(|| base.to_string())
     }
 
     fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -994,7 +1018,7 @@ impl Render for MarkPanel {
                         .id("mark-list")
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
+                        .overflow_scrollbar()
                         .children(rows),
                 )
             })

@@ -381,9 +381,10 @@ impl LogView {
     where
         I: IntoIterator<Item = u64>,
     {
-        let changed = lines
-            .into_iter()
-            .any(|file_line| self.marked_lines.remove(&file_line));
+        let mut changed = false;
+        for file_line in lines {
+            changed |= self.marked_lines.remove(&file_line);
+        }
         if changed {
             cx.notify();
         }
