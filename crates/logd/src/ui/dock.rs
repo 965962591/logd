@@ -1237,6 +1237,7 @@ impl RegexTablePanel {
         cx.notify();
 
         let weak = cx.entity().downgrade();
+        let app = self.app.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_, cx| {
             let table = executor
@@ -1255,6 +1256,9 @@ impl RegexTablePanel {
                 cx.notify();
             })
             .ok();
+            if let Some(app) = app.upgrade() {
+                app.update(cx, |_, cx| cx.notify());
+            }
         })
         .detach();
     }
@@ -1741,24 +1745,18 @@ impl Panel for SearchResultsPanel {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let palette = theme::palette(cx);
-        let (summary, progress) = self
+        let summary = self
             .app
             .upgrade()
-            .map(|app| app.read(cx).search_results_title_status(cx))
-            .unwrap_or_else(|| ("0 Matches  |  0 Files".to_string(), None));
+            .map(|app| app.read(cx).search_results_title_summary(cx))
+            .unwrap_or_else(|| "0 Matches  |  0 Files".to_string());
 
         Some(
             h_flex()
                 .flex_shrink_0()
-                .gap_2()
                 .text_size(px(12.))
                 .text_color(palette.muted)
-                .child(summary)
-                .children(
-                    progress.map(|progress| {
-                        div().text_color(palette.search_foreground).child(progress)
-                    }),
-                ),
+                .child(summary),
         )
     }
 

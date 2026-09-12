@@ -797,6 +797,7 @@ impl LogdApp {
                 this.regex_table_panel.update(cx, |panel, cx| {
                     panel.extract_source(source, index, encoding, pattern, cx)
                 });
+                cx.notify();
             });
         }));
     }
@@ -2022,24 +2023,14 @@ impl LogdApp {
             .update(cx, |panel, cx| panel.export_csv(window, cx));
     }
 
-    pub(crate) fn search_results_title_status(&self, cx: &App) -> (String, Option<String>) {
+    pub(crate) fn search_results_title_summary(&self, cx: &App) -> String {
         let has_search = !self.search_query.is_empty();
         let has_filter_results = self.has_multi_file_filter_results();
-        let has_results = has_search || has_filter_results;
         let mut total_matches = 0usize;
         let mut matched_files = 0usize;
-        let mut scanning = 0usize;
 
         for tab in &self.tabs {
             let view = tab.view.read(cx);
-            let result_scanning = if has_search {
-                view.search_scanning_progress().is_some()
-            } else {
-                has_filter_results && view.scanning_progress().is_some()
-            };
-            if has_results && (result_scanning || view.indexing_progress().is_some()) {
-                scanning += 1;
-            }
             let lines = if has_search {
                 view.search_matches()
             } else if has_filter_results {
@@ -2053,22 +2044,45 @@ impl LogdApp {
             }
         }
 
-        let summary = format!(
+        format!(
             "{} {}  |  {} {}",
             group(total_matches as u64),
             text(Key::Matches, self.language),
             group(matched_files as u64),
             text(Key::Files, self.language)
-        );
-        let progress = (scanning > 0).then(|| {
-            format!(
-                "{} {}/{}",
-                text(Key::SearchInProgress, self.language),
-                self.tabs.len().saturating_sub(scanning),
-                self.tabs.len(),
-            )
-        });
-        (summary, progress)
+        )
+    }
+
+    fn search_results_progress(&self, cx: &App) -> Option<f32> {
+        let has_search = !self.search_query.is_empty();
+        let has_filter_results = self.has_multi_file_filter_results();
+        if (!has_search && !has_filter_results) || self.tabs.is_empty() {
+            return None;
+        }
+
+        let mut pending = false;
+        let completed = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let view = tab.view.read(cx);
+                let result_progress = if has_search {
+                    view.search_scanning_progress()
+                } else {
+                    view.scanning_progress()
+                };
+                let indexing_progress = view.indexing_progress();
+                pending |= result_progress.is_some() || indexing_progress.is_some();
+                match (result_progress, indexing_progress) {
+                    (Some(result), Some(indexing)) => result.min(indexing),
+                    (Some(result), None) => result,
+                    (None, Some(indexing)) => indexing,
+                    (None, None) => 1.0,
+                }
+            })
+            .sum::<f32>();
+
+        pending.then(|| completed / self.tabs.len() as f32)
     }
 
     fn dispatch(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -3667,6 +3681,9 @@ impl LogdApp {
 
     fn render_status(&self, cx: &App) -> AnyElement {
         let palette = theme::palette(cx);
+        let search_progress = self.search_results_progress(cx);
+        let regex_pattern = self.regex_table_pattern.read(cx).value();
+        let regex_running = self.regex_table_panel.read(cx).is_running(&regex_pattern);
         let mut bar = h_flex()
             .h(px(22.))
             .w_full()
@@ -3724,6 +3741,34 @@ impl LogdApp {
         }
         if let Some(status) = &self.status {
             bar = bar.child(status.clone());
+        }
+        if let Some(progress) = search_progress {
+            let label = format!(
+                "{} {:.0}%",
+                text(Key::SearchInProgress, self.language),
+                progress * 100.
+            );
+            bar = bar.child(
+                h_flex().flex_none().gap_2().child(label.clone()).child(
+                    Progress::new("status-search-results-progress")
+                        .value(progress * 100.)
+                        .accessibility_label(label)
+                        .xsmall()
+                        .w(px(96.)),
+                ),
+            );
+        }
+        if regex_running {
+            let label = text(Key::RegexTable, self.language);
+            bar = bar.child(
+                h_flex().flex_none().gap_2().child(label).child(
+                    Progress::new("status-regex-table-progress")
+                        .loading(true)
+                        .accessibility_label(label)
+                        .xsmall()
+                        .w(px(96.)),
+                ),
+            );
         }
         bar.into_any_element()
     }

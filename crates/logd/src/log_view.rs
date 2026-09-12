@@ -19,6 +19,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Copy, Input, InputEvent, InputState};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::scroll::{AutoScroll, Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_component::Sizable as _;
 use gpui_component::{GlobalState, Icon, IconName};
@@ -2244,6 +2245,8 @@ impl Render for LogView {
         let bounds_sink = self.area.clone();
         let handle = cx.entity().downgrade();
         let drag_handle = cx.entity().downgrade();
+        let context_handle = cx.entity().downgrade();
+        let language = self.language;
 
         div()
             .id("log-view")
@@ -2395,6 +2398,25 @@ impl Render for LogView {
             )
             .when(show_vertical, |el| el.child(scrollbar))
             .when(show_horizontal, |el| el.child(h_scrollbar))
+            .context_menu(move |menu, _window, cx| {
+                let can_copy = context_handle
+                    .update(cx, |this, cx| {
+                        this.editing_line.is_none() && this.selected_text(cx).is_some()
+                    })
+                    .unwrap_or(false);
+                if !can_copy {
+                    return menu;
+                }
+
+                let copy_handle = context_handle.clone();
+                menu.item(PopupMenuItem::new(text(Key::Copy, language)).on_click(
+                    move |_, _, cx| {
+                        copy_handle
+                            .update(cx, |this, cx| this.copy_selection(cx))
+                            .ok();
+                    },
+                ))
+            })
     }
 }
 
