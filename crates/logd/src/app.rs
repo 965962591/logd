@@ -3683,7 +3683,7 @@ impl LogdApp {
         let palette = theme::palette(cx);
         let search_progress = self.search_results_progress(cx);
         let regex_pattern = self.regex_table_pattern.read(cx).value();
-        let regex_running = self.regex_table_panel.read(cx).is_running(&regex_pattern);
+        let regex_progress = self.regex_table_panel.read(cx).progress(&regex_pattern);
         let mut bar = h_flex()
             .h(px(22.))
             .w_full()
@@ -3758,12 +3758,16 @@ impl LogdApp {
                 ),
             );
         }
-        if regex_running {
-            let label = text(Key::RegexTable, self.language);
+        if let Some(progress) = regex_progress {
+            let label = format!(
+                "{} {:.0}%",
+                text(Key::RegexTable, self.language),
+                progress * 100.
+            );
             bar = bar.child(
-                h_flex().flex_none().gap_2().child(label).child(
+                h_flex().flex_none().gap_2().child(label.clone()).child(
                     Progress::new("status-regex-table-progress")
-                        .loading(true)
+                        .value(progress * 100.)
                         .accessibility_label(label)
                         .xsmall()
                         .w(px(96.)),

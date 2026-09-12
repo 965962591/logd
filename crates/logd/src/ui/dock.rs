@@ -1062,6 +1062,7 @@ struct RegexTablePage {
     table: RecordTable,
     table_pattern: String,
     running: bool,
+    progress: Option<Arc<logd_core::Progress>>,
     generation: u64,
     table_revision: u64,
     rendered_table_key: String,
@@ -1234,6 +1235,8 @@ impl RegexTablePanel {
         page.table_pattern = pattern.clone();
         page.table = RecordTable::default();
         page.running = true;
+        let progress = Arc::new(logd_core::Progress::new(index.total_lines.max(1)));
+        page.progress = Some(progress.clone());
         cx.notify();
 
         let weak = cx.entity().downgrade();
@@ -1241,7 +1244,16 @@ impl RegexTablePanel {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_, cx| {
             let table = executor
-                .spawn(async move { extract_source(source, index, encoding, &pattern, usize::MAX) })
+                .spawn(async move {
+                    extract_source(
+                        source,
+                        index,
+                        encoding,
+                        &pattern,
+                        usize::MAX,
+                        Some(&progress),
+                    )
+                })
                 .await;
             weak.update(cx, |panel, cx| {
                 let Some(page) = panel.pages.iter_mut().find(|page| page.id == page_id) else {
@@ -1270,6 +1282,7 @@ impl RegexTablePanel {
         page.table_pattern.clear();
         page.table = RecordTable::default();
         page.running = false;
+        page.progress = None;
         cx.notify();
     }
 
@@ -1289,6 +1302,15 @@ impl RegexTablePanel {
     pub(crate) fn is_running(&self, pattern: &str) -> bool {
         let page = self.active();
         page.running && page.table_pattern == pattern
+    }
+
+    pub(crate) fn progress(&self, pattern: &str) -> Option<f32> {
+        let page = self.active();
+        if page.running && page.table_pattern == pattern {
+            page.progress.as_ref().map(|progress| progress.fraction())
+        } else {
+            None
+        }
     }
 
     pub(crate) fn sync_virtual_table(
@@ -1437,6 +1459,7 @@ fn new_regex_page(
         table: RecordTable::default(),
         table_pattern: String::new(),
         running: false,
+        progress: None,
         generation: 0,
         table_revision: 0,
         rendered_table_key: String::new(),

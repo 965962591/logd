@@ -234,7 +234,11 @@ pub fn extract_text_source(
     encoding: Encoding,
     pattern: &str,
     max_rows: usize,
+    progress: Option<&logd_core::Progress>,
 ) -> RecordTable {
+    if let Some(progress) = progress {
+        progress.set_total(index.total_lines.max(1));
+    }
     let data = source.data();
     let mut spans = Vec::with_capacity(1);
     let lines = (0..index.total_lines).filter_map(|line| {
@@ -247,7 +251,78 @@ pub fn extract_text_source(
         }
         Some(encoding.decode_bytes(&data[start..end]).into_owned())
     });
-    extract_text_lines(lines, pattern, max_rows)
+    let mut table = RecordTable::default();
+    let mut lines = lines;
+    let mut records = Vec::<BTreeMap<String, String>>::new();
+    let regex = match Regex::new(pattern.trim()) {
+        Ok(regex) => regex,
+        Err(error) => {
+            table.error = Some(error.to_string());
+            return table;
+        }
+    };
+    table.columns = regex
+        .capture_names()
+        .skip(1)
+        .enumerate()
+        .map(|(index, name)| {
+            name.map(str::to_owned)
+                .unwrap_or_else(|| format!("group_{}", index + 1))
+        })
+        .collect();
+    if table.columns.is_empty() {
+        table.columns.push("match".into());
+    }
+    for line in &mut lines {
+        if let Some(progress) = progress {
+            progress.add(1);
+        }
+        table.scanned += 1;
+        let Some(captures) = regex.captures(&line) else {
+            continue;
+        };
+        let mut record = BTreeMap::new();
+        if regex.captures_len() > 1 {
+            for index in 1..regex.captures_len() {
+                let key = regex
+                    .capture_names()
+                    .nth(index)
+                    .flatten()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("group_{index}"));
+                record.insert(
+                    key,
+                    captures
+                        .get(index)
+                        .map(|m| m.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
+        } else if let Some(matched) = captures.get(0) {
+            record.insert("match".into(), matched.as_str().into());
+        }
+        if !record.is_empty() {
+            records.push(record);
+            table.matched += 1;
+            if records.len() >= max_rows {
+                break;
+            }
+        }
+    }
+    table.rows = Arc::new(
+        records
+            .into_iter()
+            .map(|record| {
+                table
+                    .columns
+                    .iter()
+                    .map(|column| record.get(column).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect(),
+    );
+    table
 }
 
 /// Extract a regex or JSON/NDJSON table from a memory-mapped source. The
@@ -260,9 +335,10 @@ pub fn extract_source(
     encoding: Encoding,
     pattern: &str,
     max_rows: usize,
+    progress: Option<&logd_core::Progress>,
 ) -> RecordTable {
     if !pattern.trim().is_empty() {
-        return extract_text_source(source, index, encoding, pattern, max_rows);
+        return extract_text_source(source, index, encoding, pattern, max_rows, progress);
     }
 
     let prefix_end = source.len().min(64 * 1024);
@@ -275,6 +351,10 @@ pub fn extract_source(
     }
 
     let input = source.decode(0, source.len());
+    if let Some(progress) = progress {
+        progress.set_total(1);
+        progress.add(1);
+    }
     extract_table(&input, "", max_rows)
 }
 
