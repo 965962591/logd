@@ -3787,6 +3787,7 @@ dependencies = [
  "kaishin",
  "logd-core",
  "parking_lot",
+ "rayon",
  "regex",
  "semver",
  "serde",

@@ -1,5 +1,6 @@
 //! Extract tabular values from text (regex) and JSON/NDJSON (object nodes).
 
+use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -239,28 +240,16 @@ pub fn extract_text_source(
     if let Some(progress) = progress {
         progress.set_total(index.total_lines.max(1));
     }
-    let data = source.data();
-    let mut spans = Vec::with_capacity(1);
-    let lines = (0..index.total_lines).filter_map(|line| {
-        index.line_spans(data, line, 1, &mut spans);
-        let &(start, end) = spans.first()?;
-        let mut start = start as usize;
-        let end = end as usize;
-        if start == 0 {
-            start = source.bom_len().min(end);
-        }
-        Some(encoding.decode_bytes(&data[start..end]).into_owned())
-    });
-    let mut table = RecordTable::default();
-    let mut lines = lines;
-    let mut records = Vec::<BTreeMap<String, String>>::new();
     let regex = match Regex::new(pattern.trim()) {
         Ok(regex) => regex,
         Err(error) => {
-            table.error = Some(error.to_string());
-            return table;
+            return RecordTable {
+                error: Some(error.to_string()),
+                ..Default::default()
+            };
         }
     };
+    let mut table = RecordTable::default();
     table.columns = regex
         .capture_names()
         .skip(1)
@@ -273,43 +262,71 @@ pub fn extract_text_source(
     if table.columns.is_empty() {
         table.columns.push("match".into());
     }
-    for line in &mut lines {
-        if let Some(progress) = progress {
-            progress.add(1);
-        }
-        table.scanned += 1;
-        let Some(captures) = regex.captures(&line) else {
-            continue;
-        };
-        let mut record = BTreeMap::new();
-        if regex.captures_len() > 1 {
-            for index in 1..regex.captures_len() {
-                let key = regex
-                    .capture_names()
-                    .nth(index)
-                    .flatten()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("group_{index}"));
-                record.insert(
-                    key,
-                    captures
-                        .get(index)
-                        .map(|m| m.as_str())
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
+    let names = regex
+        .capture_names()
+        .skip(1)
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    let data = source.data();
+    let records = index
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut spans = Vec::with_capacity(1);
+            let mut records = Vec::new();
+            for line in chunk.start_line..chunk.start_line + chunk.line_count {
+                index.line_spans(data, line, 1, &mut spans);
+                let Some(&(start, end)) = spans.first() else {
+                    continue;
+                };
+                let mut start = start as usize;
+                let end = end as usize;
+                if start == 0 {
+                    start = source.bom_len().min(end);
+                }
+                let text = encoding.decode_bytes(&data[start..end]);
+                if let Some(progress) = progress {
+                    progress.add(1);
+                }
+                let Some(captures) = regex.captures(&text) else {
+                    continue;
+                };
+                let mut record = BTreeMap::new();
+                if regex.captures_len() > 1 {
+                    for index in 1..regex.captures_len() {
+                        let key = names
+                            .get(index - 1)
+                            .and_then(|name| name.clone())
+                            .unwrap_or_else(|| format!("group_{index}"));
+                        record.insert(
+                            key,
+                            captures
+                                .get(index)
+                                .map(|m| m.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                    }
+                } else if let Some(matched) = captures.get(0) {
+                    record.insert("match".into(), matched.as_str().into());
+                }
+                if !record.is_empty() {
+                    records.push((line, record));
+                }
             }
-        } else if let Some(matched) = captures.get(0) {
-            record.insert("match".into(), matched.as_str().into());
-        }
-        if !record.is_empty() {
-            records.push(record);
-            table.matched += 1;
-            if records.len() >= max_rows {
-                break;
-            }
-        }
-    }
+            records
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    table.scanned = index.total_lines as usize;
+    let mut records = records;
+    records.sort_by_key(|(line, _)| *line);
+    let records = records
+        .into_iter()
+        .map(|(_, record)| record)
+        .take(max_rows)
+        .collect::<Vec<_>>();
+    table.matched = records.len();
     table.rows = Arc::new(
         records
             .into_iter()
