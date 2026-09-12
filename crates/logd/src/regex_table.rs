@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use logd_core::{Encoding, FileSource, LineIndex};
@@ -153,6 +154,7 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
 }
 
 /// Extract a text log without materializing the whole file in memory.
+#[cfg(test)]
 pub fn extract_text_lines<I>(lines: I, pattern: &str, max_rows: usize) -> RecordTable
 where
     I: IntoIterator<Item = String>,
@@ -234,11 +236,14 @@ pub fn extract_text_source(
     index: Arc<LineIndex>,
     encoding: Encoding,
     pattern: &str,
+    line_range: Range<u64>,
     max_rows: usize,
     progress: Option<&logd_core::Progress>,
 ) -> RecordTable {
+    let line_range = line_range.start.min(index.total_lines)..line_range.end.min(index.total_lines);
+    let line_count = line_range.end.saturating_sub(line_range.start);
     if let Some(progress) = progress {
-        progress.set_total(index.total_lines.max(1));
+        progress.set_total(line_count.max(1));
     }
     let regex = match Regex::new(pattern.trim()) {
         Ok(regex) => regex,
@@ -274,7 +279,16 @@ pub fn extract_text_source(
         .map(|chunk| {
             let mut spans = Vec::with_capacity(1);
             let mut records = Vec::new();
-            for line in chunk.start_line..chunk.start_line + chunk.line_count {
+            if progress.is_some_and(|progress| progress.is_cancelled()) {
+                return records;
+            }
+            let chunk_range = chunk.start_line..chunk.start_line + chunk.line_count;
+            let start = line_range.start.max(chunk_range.start);
+            let end = line_range.end.min(chunk_range.end);
+            for line in start..end {
+                if line % 4096 == 0 && progress.is_some_and(|progress| progress.is_cancelled()) {
+                    break;
+                }
                 index.line_spans(data, line, 1, &mut spans);
                 let Some(&(start, end)) = spans.first() else {
                     continue;
@@ -318,7 +332,7 @@ pub fn extract_text_source(
         })
         .flatten()
         .collect::<Vec<_>>();
-    table.scanned = index.total_lines as usize;
+    table.scanned = line_count as usize;
     let mut records = records;
     records.sort_by_key(|(line, _)| *line);
     let records = records
@@ -351,11 +365,15 @@ pub fn extract_source(
     index: Arc<LineIndex>,
     encoding: Encoding,
     pattern: &str,
+    line_range: Option<Range<u64>>,
     max_rows: usize,
     progress: Option<&logd_core::Progress>,
 ) -> RecordTable {
     if !pattern.trim().is_empty() {
-        return extract_text_source(source, index, encoding, pattern, max_rows, progress);
+        let line_range = line_range.unwrap_or(0..index.total_lines);
+        return extract_text_source(
+            source, index, encoding, pattern, line_range, max_rows, progress,
+        );
     }
 
     let prefix_end = source.len().min(64 * 1024);
@@ -373,6 +391,14 @@ pub fn extract_source(
         progress.add(1);
     }
     extract_table(&input, "", max_rows)
+}
+
+/// Parse a 1-based inclusive line range such as `1-100`.
+pub fn parse_line_range(value: &str, total_lines: u64) -> Option<Range<u64>> {
+    let (start, end) = value.trim().split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?.saturating_sub(1);
+    let end = end.trim().parse::<u64>().ok()?.min(total_lines);
+    (start < end).then(|| start.min(total_lines)..end)
 }
 
 fn json_record(value: Value) -> Option<BTreeMap<String, String>> {
@@ -396,7 +422,60 @@ fn json_record(value: Value) -> Option<BTreeMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_table;
+    use super::{extract_table, parse_line_range};
+    use logd_core::{FileSource, LineIndex, Progress};
+    use std::sync::Arc;
+
+    #[test]
+    fn parses_one_based_inclusive_line_ranges() {
+        assert_eq!(parse_line_range("1-100", 1_000), Some(0..100));
+        assert_eq!(parse_line_range("999-2000", 1_000), Some(998..1_000));
+        assert_eq!(
+            parse_line_range("10000-15000", 200_000),
+            Some(9_999..15_000)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_line_ranges() {
+        assert_eq!(parse_line_range("", 100), None);
+        assert_eq!(parse_line_range("20-10", 100), None);
+        assert_eq!(parse_line_range("from-to", 100), None);
+    }
+
+    #[test]
+    fn source_extraction_scans_only_the_requested_line_range() {
+        let path = std::env::temp_dir().join(format!(
+            "logd-regex-range-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n").unwrap();
+        let source = Arc::new(FileSource::open(&path).unwrap());
+        let index = Arc::new(LineIndex::build_full(source.data(), &Progress::default()).unwrap());
+
+        let table = super::extract_text_source(
+            source,
+            index,
+            logd_core::Encoding::Utf8,
+            r"line (?P<number>\d+)",
+            2..5,
+            usize::MAX,
+            None,
+        );
+
+        assert_eq!(table.scanned, 3);
+        assert_eq!(
+            table.rows.as_ref(),
+            &vec![
+                vec![String::from("3")],
+                vec![String::from("4")],
+                vec![String::from("5")]
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn named_capture_groups_form_columns() {
         let table = extract_table(

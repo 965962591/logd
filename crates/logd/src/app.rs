@@ -358,6 +358,7 @@ pub struct LogdApp {
     search_results_panel: Entity<SearchResultsPanel>,
     regex_table_panel: Entity<RegexTablePanel>,
     regex_table_pattern: Entity<InputState>,
+    regex_table_range: Entity<InputState>,
     regex_table_refresh_task: Option<Task<()>>,
     last_layout_state: Option<DockAreaState>,
     save_layout_task: Option<Task<()>>,
@@ -389,6 +390,9 @@ impl LogdApp {
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
         let regex_table_pattern = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::RegexTablePlaceholder, language))
+        });
+        let regex_table_range = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::RegexTableRangePlaceholder, language))
         });
         let (live_sender, live_events) = std::sync::mpsc::channel();
 
@@ -457,6 +461,16 @@ impl LogdApp {
         .detach();
         cx.subscribe_in(
             &regex_table_pattern,
+            window,
+            |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.schedule_regex_table_refresh(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &regex_table_range,
             window,
             |this, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) {
@@ -580,6 +594,7 @@ impl LogdApp {
             search_results_panel,
             regex_table_panel,
             regex_table_pattern,
+            regex_table_range,
             regex_table_refresh_task: None,
             last_layout_state,
             save_layout_task: None,
@@ -784,6 +799,7 @@ impl LogdApp {
                 .await;
             _ = this.update_in(window, |this, _, cx| {
                 let pattern = this.regex_table_pattern.read(cx).value().to_string();
+                let range = this.regex_table_range.read(cx).value().to_string();
                 let Some(view) = this.active_view() else {
                     this.regex_table_panel
                         .update(cx, |panel, cx| panel.clear_extraction(cx));
@@ -795,7 +811,7 @@ impl LogdApp {
                     (doc.source().clone(), doc.index().clone(), doc.encoding())
                 };
                 this.regex_table_panel.update(cx, |panel, cx| {
-                    panel.extract_source(source, index, encoding, pattern, cx)
+                    panel.extract_source(source, index, encoding, pattern, range, cx)
                 });
                 cx.notify();
             });
@@ -2965,12 +2981,18 @@ impl LogdApp {
         cx: &mut Context<RegexTablePanel>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
-        let (pattern, input, table, table_key) = {
+        let (pattern, input, range_input, table, table_key) = {
             let state = app.read(cx);
             let pattern = state.regex_table_pattern.read(cx).value().to_string();
             let table = panel.current_table(&pattern);
             let table_key = panel.table_key(&pattern);
-            (pattern, state.regex_table_pattern.clone(), table, table_key)
+            (
+                pattern,
+                state.regex_table_pattern.clone(),
+                state.regex_table_range.clone(),
+                table,
+                table_key,
+            )
         };
         let tabs = panel.page_tabs();
         let active_page = tabs
@@ -3016,7 +3038,8 @@ impl LogdApp {
             .p_2()
             .gap_2()
             .child(toolbar)
-            .child(Input::new(&input).small());
+            .child(Input::new(&input).small())
+            .child(Input::new(&range_input).small());
         if let Some(error) = table.error.clone() {
             return content
                 .child(div().text_color(palette.search_foreground).child(error))

@@ -26,7 +26,7 @@ use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable as _};
 
 use crate::app::{LogdApp, MarkedLogLine};
 use crate::i18n::{text, Key, Language};
-use crate::regex_table::{extract_source, RecordTable};
+use crate::regex_table::{extract_source, parse_line_range, RecordTable};
 use crate::theme;
 
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
@@ -1225,9 +1225,13 @@ impl RegexTablePanel {
         index: Arc<logd_core::LineIndex>,
         encoding: logd_core::Encoding,
         pattern: String,
+        range: String,
         cx: &mut Context<Self>,
     ) {
         let page = self.active_mut();
+        if let Some(progress) = page.progress.take() {
+            progress.cancel();
+        }
         page.pattern = pattern.clone();
         page.generation = page.generation.wrapping_add(1);
         let generation = page.generation;
@@ -1235,13 +1239,43 @@ impl RegexTablePanel {
         page.table_pattern = pattern.clone();
         page.table = RecordTable::default();
         page.running = true;
-        let progress = Arc::new(logd_core::Progress::new(index.total_lines.max(1)));
+        let line_range = parse_line_range(&range, index.total_lines);
+        let progress_total = line_range
+            .as_ref()
+            .map(|range| range.end.saturating_sub(range.start))
+            .unwrap_or(index.total_lines)
+            .max(1);
+        let progress = Arc::new(logd_core::Progress::new(progress_total));
         page.progress = Some(progress.clone());
         cx.notify();
 
         let weak = cx.entity().downgrade();
         let app = self.app.clone();
         let executor = cx.background_executor().clone();
+        let poll_panel = weak.clone();
+        let poll_app = app.clone();
+        let poll_executor = executor.clone();
+        cx.spawn(async move |_, cx| loop {
+            poll_executor
+                .timer(std::time::Duration::from_millis(33))
+                .await;
+            let running = poll_panel
+                .update(cx, |panel, _| {
+                    panel
+                        .pages
+                        .iter()
+                        .find(|page| page.id == page_id)
+                        .is_some_and(|page| page.generation == generation && page.running)
+                })
+                .unwrap_or(false);
+            if let Some(app) = poll_app.upgrade() {
+                app.update(cx, |_, cx| cx.notify());
+            }
+            if !running {
+                break;
+            }
+        })
+        .detach();
         cx.spawn(async move |_, cx| {
             let table = executor
                 .spawn(async move {
@@ -1250,6 +1284,7 @@ impl RegexTablePanel {
                         index,
                         encoding,
                         &pattern,
+                        line_range,
                         usize::MAX,
                         Some(&progress),
                     )
@@ -1277,12 +1312,14 @@ impl RegexTablePanel {
 
     pub(crate) fn clear_extraction(&mut self, cx: &mut Context<Self>) {
         let page = self.active_mut();
+        if let Some(progress) = page.progress.take() {
+            progress.cancel();
+        }
         page.pattern.clear();
         page.generation = page.generation.wrapping_add(1);
         page.table_pattern.clear();
         page.table = RecordTable::default();
         page.running = false;
-        page.progress = None;
         cx.notify();
     }
 
@@ -1311,6 +1348,10 @@ impl RegexTablePanel {
         } else {
             None
         }
+    }
+
+    fn scanned_lines(&self) -> usize {
+        self.active().table.scanned
     }
 
     pub(crate) fn sync_virtual_table(
@@ -1560,12 +1601,15 @@ impl Panel for RegexTablePanel {
         } else {
             "Export current table as CSV"
         };
+        let scanned = format!("{} {}", self.scanned_lines(), text(Key::Lines, language));
         let add_app = self.app.clone();
         let remove_app = self.app.clone();
         let export_app = self.app.clone();
         Some(
             h_flex()
                 .gap_1()
+                .text_color(theme::palette(cx).muted)
+                .child(div().mr_2().child(scanned))
                 .child(
                     Button::new("regex-table-add-page")
                         .icon(IconName::Plus)

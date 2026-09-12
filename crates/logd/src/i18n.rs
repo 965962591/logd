@@ -107,6 +107,7 @@ pub enum Key {
     Unmark,
     NoMarkedLines,
     RegexTablePlaceholder,
+    RegexTableRangePlaceholder,
     SearchResultsPrompt,
     NoSearchResults,
     SearchInProgress,
@@ -290,6 +291,10 @@ pub fn text(key: Key, lang: Language) -> &'static str {
         (Key::RegexTablePlaceholder, Language::ZhCn) => "正则表达式（命名捕获组作为列）",
         (Key::RegexTablePlaceholder, Language::EnUs) => {
             "Regex (named capture groups become columns)"
+        }
+        (Key::RegexTableRangePlaceholder, Language::ZhCn) => "行范围，例如 1-100（留空为全部）",
+        (Key::RegexTableRangePlaceholder, Language::EnUs) => {
+            "Line range, e.g. 1-100 (all lines when empty)"
         }
         (Key::SearchResultsPrompt, Language::ZhCn) => "在标题栏输入关键字并按回车搜索",
         (Key::SearchResultsPrompt, Language::EnUs) => {
