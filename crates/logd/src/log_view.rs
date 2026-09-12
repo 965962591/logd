@@ -20,8 +20,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Copy, Input, InputEvent, InputState};
 use gpui_component::scroll::{AutoScroll, Scrollbar, ScrollbarHandle, ScrollbarMode};
-use gpui_component::GlobalState;
 use gpui_component::Sizable as _;
+use gpui_component::{GlobalState, Icon, IconName};
 use logd_core::{
     cache, index::HEAD_BYTES, scan_all_with_temporary_query_and_counts_for_filters, scan_query_all,
     CompileOptions, Document, Encoding, FileSource, FilterScanResult, FilterSpec, LineIndex,
@@ -173,6 +173,8 @@ pub struct LogView {
     editing_changed: bool,
     font_size: f32,
     line_height: f32,
+    /// File-line numbers explicitly saved by the user for the Mark dock.
+    marked_lines: BTreeSet<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -298,6 +300,7 @@ impl LogView {
             editing_changed: false,
             font_size: theme::FONT_SIZE,
             line_height: theme::LINE_HEIGHT,
+            marked_lines: BTreeSet::new(),
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -351,6 +354,31 @@ impl LogView {
 
     pub fn from_cache(&self) -> bool {
         self.from_cache
+    }
+
+    /// Return the marked file lines in stable file order. File lines, rather
+    /// than filtered view rows, keep marks valid while filters change.
+    pub fn marked_lines(&self) -> Vec<u64> {
+        self.marked_lines.iter().copied().collect()
+    }
+
+    pub fn unmark_lines<I>(&mut self, lines: I, cx: &mut Context<Self>)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let changed = lines
+            .into_iter()
+            .any(|file_line| self.marked_lines.remove(&file_line));
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn toggle_mark(&mut self, file_line: u64, cx: &mut Context<Self>) {
+        if !self.marked_lines.insert(file_line) {
+            self.marked_lines.remove(&file_line);
+        }
+        cx.notify();
     }
 
     // ---- 后台索引 ----
@@ -1647,6 +1675,8 @@ impl LogView {
         let selected = self
             .selection
             .is_some_and(|selection| selection.range().contains(&view_row));
+        let marked = self.marked_lines.contains(&row.file_line);
+        let file_line = row.file_line;
         let edited = self.edits.get(&row.file_line);
         let is_editing = self.editing_line == Some(row.file_line);
         let input = self
@@ -1869,12 +1899,58 @@ impl LogView {
                     .flex()
                     .flex_none()
                     .w(px(gutter_w))
-                    .pr_2()
+                    .pr_1()
+                    .gap_1()
+                    .items_center()
                     .justify_end()
                     .bg(palette.gutter)
                     .text_color(palette.muted)
+                    .child(
+                        div()
+                            .id(("log-mark", file_line as usize))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_none()
+                            .w(px(14.))
+                            .h_full()
+                            .when(marked, |marker| {
+                                marker.child(
+                                    Icon::new(IconName::ArrowRight)
+                                        .xsmall()
+                                        .text_color(palette.search_foreground),
+                                )
+                            })
+                            .when(!marked, |marker| {
+                                marker.child(
+                                    div()
+                                        .w(px(10.))
+                                        .h(px(10.))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(palette.muted),
+                                )
+                            })
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Toggle mark")
+                                    .build(window, cx)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    // The dot is an independent command, not a row-selection click.
+                                    cx.stop_propagation();
+                                    this.toggle_mark(file_line, cx);
+                                }),
+                            ),
+                    )
                     // 行号槽显示的永远是**文件行号**，筛选视图下也不变
-                    .child(format!("{}", row.file_line + 1)),
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_right()
+                            .child(format!("{}", row.file_line + 1)),
+                    ),
             )
             .child(line_content)
             .into_any_element()
@@ -1883,7 +1959,7 @@ impl LogView {
     /// 行号槽宽度按总行数的位数算，别让它随滚动跳来跳去。
     fn gutter_width(&self) -> f32 {
         let digits = (self.doc.total_file_lines().max(1) as f64).log10().floor() as usize + 1;
-        (digits.max(4) as f32) * (self.font_size * 0.62) + 20.0
+        (digits.max(4) as f32) * (self.font_size * 0.62) + 22.0
     }
 }
 

@@ -42,7 +42,7 @@ use crate::log_view::LogView;
 use crate::regex_table::extract_table;
 use crate::theme;
 use crate::ui::dock::{
-    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, RegexTablePanel,
+    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, MarkPanel, RegexTablePanel,
     SearchResultsPanel,
 };
 use crate::ui::title_bar;
@@ -52,6 +52,16 @@ struct Tab {
     title: String,
     path: PathBuf,
     field_catalog: Arc<FieldCatalog>,
+}
+
+/// A line shown in the Mark dock. The path and file-line pair remains stable
+/// when the log's filtered view changes.
+#[derive(Clone)]
+pub(crate) struct MarkedLogLine {
+    pub path: PathBuf,
+    pub title: String,
+    pub file_line: u64,
+    pub text: String,
 }
 
 #[derive(Clone)]
@@ -67,7 +77,7 @@ struct SearchResultFile {
 
 // Increment when the registered panel tree changes so stale persisted layouts
 // cannot restore panels that no longer exist.
-const DOCK_LAYOUT_VERSION: usize = 6;
+const DOCK_LAYOUT_VERSION: usize = 7;
 const DEVELOPER: &str = "barry chen";
 const GITHUB_REPOSITORY: &str = "https://github.com/965962591/logd";
 const CONTACT_EMAIL: &str = "barrymchen@gmail.com";
@@ -345,6 +355,7 @@ pub struct LogdApp {
     dock_area: Entity<DockArea>,
     tab_scroll: ScrollHandle,
     filter_panel: Entity<FilterPanel>,
+    mark_panel: Entity<MarkPanel>,
     search_results_panel: Entity<SearchResultsPanel>,
     regex_table_panel: Entity<RegexTablePanel>,
     regex_table_pattern: Entity<InputState>,
@@ -459,11 +470,13 @@ impl LogdApp {
         let app = cx.weak_entity();
         let log_panel = cx.new(|cx| LogPanel::new(app.clone(), cx));
         let filter_panel = cx.new(|cx| FilterPanel::new(app.clone(), cx));
+        let mark_panel = cx.new(|cx| MarkPanel::new(app.clone(), cx));
         let search_results_panel = cx.new(|cx| SearchResultsPanel::new(app.clone(), cx));
         let regex_table_panel = cx.new(|cx| RegexTablePanel::new(app.clone(), window, cx));
         register_logd_panels(
             &log_panel,
             &filter_panel,
+            &mark_panel,
             &search_results_panel,
             &regex_table_panel,
             cx,
@@ -486,6 +499,7 @@ impl LogdApp {
                 &dock_area,
                 &log_panel,
                 &filter_panel,
+                &mark_panel,
                 &search_results_panel,
                 &regex_table_panel,
                 legacy_filter_placement,
@@ -563,6 +577,7 @@ impl LogdApp {
             dock_area,
             tab_scroll: ScrollHandle::new(),
             filter_panel,
+            mark_panel,
             search_results_panel,
             regex_table_panel,
             regex_table_pattern,
@@ -664,6 +679,7 @@ impl LogdApp {
         dock_area: &Entity<DockArea>,
         workspace: &Entity<LogPanel>,
         filters: &Entity<FilterPanel>,
+        marks: &Entity<MarkPanel>,
         search_results: &Entity<SearchResultsPanel>,
         regex_table: &Entity<RegexTablePanel>,
         filter_placement: DockPlacement,
@@ -680,6 +696,7 @@ impl LogdApp {
             }
             let workspace = DockLayout::tabs().panel_view(panel_handle(workspace.clone()), cx);
             let filters = DockLayout::tabs().panel_view(panel_handle(filters.clone()), cx);
+            let marks = DockLayout::tabs().panel_view(panel_handle(marks.clone()), cx);
             let search_results =
                 DockLayout::tabs().panel_view(panel_handle(search_results.clone()), cx);
             let regex_table = DockLayout::tabs().panel_view(panel_handle(regex_table.clone()), cx);
@@ -691,17 +708,25 @@ impl LogdApp {
                     DockLayout::v_split().child(workspace, None).child(
                         DockLayout::v_split()
                             .child(search_results, Some(px(200.)))
-                            .child(regex_table, Some(px(200.))),
-                        Some(px(400.)),
+                            .child(
+                                DockLayout::v_split()
+                                    .child(regex_table, Some(px(200.)))
+                                    .child(marks, Some(px(200.))),
+                                None,
+                            ),
+                        Some(px(520.)),
                     ),
                     None,
                 ),
                 DockPlacement::Bottom => DockLayout::v_split().child(workspace, None).child(
                     DockLayout::h_split()
                         .child(
-                            DockLayout::v_split()
-                                .child(search_results, None)
-                                .child(regex_table, Some(px(200.))),
+                            DockLayout::v_split().child(search_results, None).child(
+                                DockLayout::v_split()
+                                    .child(regex_table, Some(px(200.)))
+                                    .child(marks, Some(px(200.))),
+                                None,
+                            ),
                             None,
                         )
                         .child(filters, Some(px(360.))),
@@ -712,8 +737,13 @@ impl LogdApp {
                         DockLayout::v_split().child(workspace, None).child(
                             DockLayout::v_split()
                                 .child(search_results, Some(px(200.)))
-                                .child(regex_table, Some(px(200.))),
-                            Some(px(400.)),
+                                .child(
+                                    DockLayout::v_split()
+                                        .child(regex_table, Some(px(200.)))
+                                        .child(marks, Some(px(200.))),
+                                    None,
+                                ),
+                            Some(px(520.)),
                         ),
                         None,
                     )
@@ -1074,6 +1104,7 @@ impl LogdApp {
     fn observe_log_view(&self, view: &Entity<LogView>, cx: &mut Context<Self>) {
         cx.observe(view, |this, _, cx| {
             this.search_results_panel.update(cx, |_, cx| cx.notify());
+            this.mark_panel.update(cx, |_, cx| cx.notify());
             cx.notify();
         })
         .detach();
@@ -1878,6 +1909,54 @@ impl LogdApp {
         cx.notify();
     }
 
+    pub(crate) fn show_mark_panel(
+        &mut self,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mark_panel
+            .update(cx, |panel, cx| panel.set_visible(show, cx));
+        self.normalize_hidden_dock_panels(window, cx);
+        let dock_area = self.dock_area.clone();
+        self.schedule_layout_save(&dock_area, window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn marked_lines(&self, cx: &App) -> Vec<MarkedLogLine> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| {
+                let view = tab.view.read(cx);
+                view.marked_lines()
+                    .into_iter()
+                    .map(move |file_line| MarkedLogLine {
+                        path: tab.path.clone(),
+                        title: tab.title.clone(),
+                        file_line,
+                        text: view.doc().line_text(file_line).unwrap_or_default(),
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn unmark_lines(&mut self, lines: &[(PathBuf, u64)], cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            let file_lines = lines
+                .iter()
+                .filter(|(path, _)| path == &tab.path)
+                .map(|(_, file_line)| *file_line)
+                .collect::<Vec<_>>();
+            if !file_lines.is_empty() {
+                tab.view
+                    .update(cx, |view, cx| view.unmark_lines(file_lines, cx));
+            }
+        }
+        self.mark_panel
+            .update(cx, |panel, cx| panel.prune_selection(lines, cx));
+        cx.notify();
+    }
+
     pub(crate) fn show_regex_table(
         &mut self,
         show: bool,
@@ -2363,6 +2442,7 @@ impl LogdApp {
         let palette = theme::palette(cx);
         let app = cx.entity();
         let filters_open = self.filter_panel.read(cx).visible();
+        let mark_panel_open = self.mark_panel.read(cx).visible();
         let search_results_open = self.search_results_panel.read(cx).visible();
         let regex_table_open = self.regex_table_panel.read(cx).visible();
         let search_history = self.search_history.clone();
@@ -2379,6 +2459,7 @@ impl LogdApp {
         let show_only_app = app.clone();
         let capture_running = self.live_capture_running();
         let capture_app = app.clone();
+        let mark_toggle_app = app.clone();
         let left = h_flex()
             .h_full()
             .items_center()
@@ -2418,6 +2499,21 @@ impl LogdApp {
                 palette,
                 move |_, _, cx| {
                     capture_app.update(cx, |app, cx| app.toggle_live_capture(cx));
+                },
+            ))
+            .child(title_bar::mark_toggle(
+                mark_panel_open,
+                match (mark_panel_open, lang) {
+                    (true, Language::ZhCn) => "隐藏标记",
+                    (false, Language::ZhCn) => "显示标记",
+                    (true, Language::EnUs) => "Hide Marks",
+                    (false, Language::EnUs) => "Show Marks",
+                },
+                palette,
+                move |_, window, cx| {
+                    mark_toggle_app.update(cx, |app, cx| {
+                        app.show_mark_panel(!mark_panel_open, window, cx)
+                    });
                 },
             ))
             .child(title_bar::show_only_toggle(

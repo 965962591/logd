@@ -1,13 +1,15 @@
 //! Dock panel adapters. Business state remains owned by `LogdApp`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
 
 use gpui::prelude::FluentBuilder as _;
+use gpui::InteractiveElement as _;
+use gpui::StatefulInteractiveElement as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
@@ -17,10 +19,11 @@ use gpui_component::dock::{
     PanelInfo, PanelState, TabGroupContext, TabGroupRenderer, TilesRenderer,
 };
 use gpui_component::input::{Input, InputState};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
-use gpui_component::{h_flex, IconName, Sizable as _};
+use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable as _};
 
-use crate::app::LogdApp;
+use crate::app::{LogdApp, MarkedLogLine};
 use crate::i18n::{text, Key, Language};
 use crate::regex_table::{extract_text_source, RecordTable};
 use crate::theme;
@@ -29,6 +32,7 @@ pub const WORKSPACE_PANEL: &str = "logd.workspace";
 pub const FILTER_PANEL: &str = "logd.filters";
 pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
 pub const REGEX_TABLE_PANEL: &str = "logd.regex-table";
+pub const MARK_PANEL: &str = "logd.marks";
 const EXPORT_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../public/export.svg"
@@ -164,6 +168,7 @@ fn close_tool_panel_button(
         .on_click(move |_, window, cx| {
             app.update(cx, |app, cx| match panel_name {
                 FILTER_PANEL => app.show_filter_panel(false, window, cx),
+                MARK_PANEL => app.show_mark_panel(false, window, cx),
                 SEARCH_RESULTS_PANEL => app.show_search_results(false, window, cx),
                 REGEX_TABLE_PANEL => app.show_regex_table(false, window, cx),
                 _ => {}
@@ -307,7 +312,7 @@ impl TabGroupRenderer for LogdTabGroupSkin {
             }
             [ix] if matches!(
                 group.panels()[*ix].panel_name(cx),
-                FILTER_PANEL | SEARCH_RESULTS_PANEL | REGEX_TABLE_PANEL
+                FILTER_PANEL | MARK_PANEL | SEARCH_RESULTS_PANEL | REGEX_TABLE_PANEL
             ) =>
             {
                 self.render_tool_panel_title(group, *ix, window, cx)
@@ -348,6 +353,7 @@ impl TabGroupRenderer for LogdTabGroupSkin {
 pub fn register_logd_panels(
     workspace: &Entity<LogPanel>,
     filters: &Entity<FilterPanel>,
+    marks: &Entity<MarkPanel>,
     search_results: &Entity<SearchResultsPanel>,
     regex_table: &Entity<RegexTablePanel>,
     cx: &mut App,
@@ -363,6 +369,15 @@ pub fn register_logd_panels(
                 filters.update(cx, |panel, cx| panel.set_visible(visible, cx));
             }
             panel_handle(filters.clone())
+        }
+    });
+    register_panel(cx, MARK_PANEL, {
+        let marks = marks.clone();
+        move |context, _, cx| {
+            if let Some(visible) = restored_visibility(context.info()) {
+                marks.update(cx, |panel, cx| panel.set_visible(visible, cx));
+            }
+            panel_handle(marks.clone())
         }
     });
     register_panel(cx, SEARCH_RESULTS_PANEL, {
@@ -606,6 +621,360 @@ impl Render for FilterPanel {
             .upgrade()
             .map(|app| LogdApp::render_filters(&app, window, cx))
             .unwrap_or_else(|| div().into_any_element())
+    }
+}
+
+/// User-selected log lines. Selection belongs to the panel so Ctrl/Shift
+/// interactions remain intact while individual LogViews redraw.
+pub struct MarkPanel {
+    app: WeakEntity<LogdApp>,
+    focus: FocusHandle,
+    visible: bool,
+    selected: BTreeSet<(PathBuf, u64)>,
+    selection_anchor: Option<(PathBuf, u64)>,
+}
+
+impl MarkPanel {
+    pub fn new(app: WeakEntity<LogdApp>, cx: &mut Context<Self>) -> Self {
+        if let Some(app) = app.upgrade() {
+            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        }
+        Self {
+            app,
+            focus: cx.focus_handle(),
+            visible: true,
+            selected: BTreeSet::new(),
+            selection_anchor: None,
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
+    }
+
+    fn select(
+        &mut self,
+        key: (PathBuf, u64),
+        index: usize,
+        keys: &[(PathBuf, u64)],
+        additive: bool,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if extend {
+            let anchor = self.selection_anchor.clone().unwrap_or_else(|| key.clone());
+            let anchor_index = keys
+                .iter()
+                .position(|candidate| *candidate == anchor)
+                .unwrap_or(index);
+            if !additive {
+                self.selected.clear();
+            }
+            for candidate in &keys[anchor_index.min(index)..=anchor_index.max(index)] {
+                self.selected.insert(candidate.clone());
+            }
+        } else if additive {
+            if !self.selected.insert(key.clone()) {
+                self.selected.remove(&key);
+            }
+            self.selection_anchor = Some(key);
+        } else {
+            self.selected.clear();
+            self.selected.insert(key.clone());
+            self.selection_anchor = Some(key);
+        }
+        cx.notify();
+    }
+
+    fn select_all(&mut self, keys: &[(PathBuf, u64)], cx: &mut Context<Self>) {
+        self.selected = keys.iter().cloned().collect();
+        self.selection_anchor = keys.first().cloned();
+        cx.notify();
+    }
+
+    fn selected_lines(&self) -> Vec<(PathBuf, u64)> {
+        self.selected.iter().cloned().collect()
+    }
+
+    pub(crate) fn prune_selection(&mut self, removed: &[(PathBuf, u64)], cx: &mut Context<Self>) {
+        self.selected.retain(|selected| !removed.contains(selected));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|anchor| removed.contains(anchor))
+        {
+            self.selection_anchor = None;
+        }
+        cx.notify();
+    }
+
+    fn on_key(
+        &mut self,
+        event: &KeyDownEvent,
+        keys: &[(PathBuf, u64)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window)
+            || !crate::platform::primary_modifier(&event.keystroke.modifiers)
+            || event.keystroke.key != "a"
+        {
+            return;
+        }
+        self.select_all(keys, cx);
+        cx.stop_propagation();
+    }
+
+    fn render_mark_row(
+        &self,
+        mark: &MarkedLogLine,
+        index: usize,
+        keys: Arc<Vec<(PathBuf, u64)>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = theme::palette(cx);
+        let key = (mark.path.clone(), mark.file_line);
+        let selected = self.selected.contains(&key);
+        let app = self.app.clone();
+        let arrow_app = self.app.clone();
+        let remove_panel = cx.entity().downgrade();
+        let select_key = key.clone();
+        let right_key = key.clone();
+        let left_keys = keys.clone();
+        let text = mark.text.clone();
+        let title = mark.title.clone();
+        h_flex()
+            .id(("mark-row", index))
+            .min_h(px(24.))
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(palette.border)
+            .when(selected, |row| row.bg(palette.selection))
+            .when(!selected, |row| {
+                row.hover(|row| row.bg(palette.control_hover))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.select(
+                        select_key.clone(),
+                        index,
+                        left_keys.as_slice(),
+                        crate::platform::primary_modifier(&event.modifiers),
+                        event.modifiers.shift,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    if !this.selected.contains(&right_key) {
+                        this.select(right_key.clone(), index, keys.as_slice(), false, false, cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .id(("unmark-arrow", index))
+                    .flex()
+                    .flex_none()
+                    .w(px(16.))
+                    .h_full()
+                    .items_center()
+                    .justify_center()
+                    .text_color(palette.search_foreground)
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new("Unmark").build(window, cx)
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        arrow_app
+                            .update(cx, |app, cx| app.unmark_lines(&[key.clone()], cx))
+                            .ok();
+                    })
+                    .child(Icon::new(IconName::ArrowRight).xsmall()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(88.))
+                    .text_right()
+                    .text_color(palette.muted)
+                    .child(format!("{}:{}", title, mark.file_line + 1)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(text),
+            )
+            .context_menu(move |menu, _window, _| {
+                let remove_app = app.clone();
+                let remove_panel = remove_panel.clone();
+                menu.item(PopupMenuItem::new("Unmark").on_click(move |_, _, cx| {
+                    let selected = remove_panel
+                        .update(cx, |panel, _| panel.selected_lines())
+                        .unwrap_or_default();
+                    remove_app
+                        .update(cx, |app, cx| app.unmark_lines(&selected, cx))
+                        .ok();
+                }))
+            })
+            .into_any_element()
+    }
+}
+
+impl BasePanel for MarkPanel {
+    fn panel_name(&self) -> &'static str {
+        MARK_PANEL
+    }
+
+    fn visible(&self, _: &App) -> bool {
+        self.visible
+    }
+
+    fn closable(&self, _: &App) -> bool {
+        false
+    }
+
+    fn dump(&self, _: &App) -> PanelState {
+        visibility_state(MARK_PANEL, self.visible)
+    }
+}
+
+impl Panel for MarkPanel {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app
+            .upgrade()
+            .map(|app| match app.read(cx).language() {
+                Language::ZhCn => "标记",
+                Language::EnUs => "Marks",
+            })
+            .unwrap_or("Marks")
+    }
+
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let count = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).marked_lines(cx).len())
+            .unwrap_or_default();
+        Some(
+            div()
+                .text_size(px(12.))
+                .text_color(theme::palette(cx).muted)
+                .child(count.to_string()),
+        )
+    }
+
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
+
+    fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
+        Some(vec![close_tool_panel_button(
+            "close-mark-panel",
+            MARK_PANEL,
+            self.app.clone(),
+            language,
+        )])
+    }
+
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
+    }
+}
+
+impl EventEmitter<PanelEvent> for MarkPanel {}
+
+impl Focusable for MarkPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for MarkPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
+        let marks = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).marked_lines(cx))
+            .unwrap_or_default();
+        let keys = Arc::new(
+            marks
+                .iter()
+                .map(|mark| (mark.path.clone(), mark.file_line))
+                .collect::<Vec<_>>(),
+        );
+        let rows = marks
+            .iter()
+            .enumerate()
+            .map(|(index, mark)| self.render_mark_row(mark, index, keys.clone(), window, cx))
+            .collect::<Vec<_>>();
+        let empty_label = self
+            .app
+            .upgrade()
+            .map(|app| match app.read(cx).language() {
+                Language::ZhCn => "尚未标记日志行",
+                Language::EnUs => "No marked log lines",
+            })
+            .unwrap_or("No marked log lines");
+
+        v_flex()
+            .id("mark-panel")
+            .track_focus(&self.focus)
+            .size_full()
+            .min_h_0()
+            .bg(palette.background)
+            .text_color(palette.foreground)
+            .text_size(px(12.))
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.on_key(event, keys.as_slice(), window, cx)
+            }))
+            .when(marks.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .text_color(palette.muted)
+                        .child(empty_label),
+                )
+            })
+            .when(!marks.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .id("mark-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
+            })
     }
 }
 

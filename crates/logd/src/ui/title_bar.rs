@@ -35,6 +35,10 @@ const CAPTURE_STOP_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../public/capture-stop.svg"
 ));
+const MARK_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../public/mark.svg"
+));
 
 static APP_ICON: LazyLock<Arc<Image>> =
     LazyLock::new(|| Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON_BYTES.to_vec())));
@@ -104,6 +108,25 @@ pub fn capture_toggle(
         .children(vec![inline_icon(icon, palette).into_any_element()])
         .small()
         .ghost()
+        .tab_stop(false)
+        .tooltip(tooltip)
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            action(event, window, cx);
+        })
+}
+
+pub fn mark_toggle(
+    open: bool,
+    tooltip: impl Into<SharedString>,
+    palette: theme::Palette,
+    action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    Button::new("title-toggle-marks")
+        .children(vec![inline_icon(MARK_SVG, palette).into_any_element()])
+        .small()
+        .ghost()
+        .toggled(open)
         .tab_stop(false)
         .tooltip(tooltip)
         .on_click(move |event, window, cx| {
