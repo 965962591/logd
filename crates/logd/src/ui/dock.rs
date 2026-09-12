@@ -1350,8 +1350,8 @@ impl RegexTablePanel {
         }
     }
 
-    fn scanned_lines(&self) -> usize {
-        self.active().table.scanned
+    fn result_rows(&self) -> usize {
+        self.active().table.rows.len()
     }
 
     pub(crate) fn sync_virtual_table(
@@ -1486,9 +1486,26 @@ fn new_regex_page(
     cx.subscribe_in(
         &table_state,
         window,
-        |_, table, event: &TableEvent, window, cx| {
-            if matches!(event, TableEvent::SelectCell(_, _)) {
+        move |panel, table, event: &TableEvent, window, cx| {
+            if let TableEvent::SelectCell(row, _) = event {
                 window.focus(&table.read(cx).focus_handle(cx), cx);
+                let target = panel
+                    .pages
+                    .iter()
+                    .find(|page| page.id == id)
+                    .and_then(|page| {
+                        Some((
+                            page.table.source_path.clone()?,
+                            *page.table.source_lines.get(*row)?,
+                        ))
+                    });
+                if let Some((path, file_line)) = target {
+                    if let Some(app) = panel.app.upgrade() {
+                        app.update(cx, |app, cx| {
+                            app.goto_regex_table_line(&path, file_line, cx)
+                        });
+                    }
+                }
             }
         },
     )
@@ -1601,7 +1618,7 @@ impl Panel for RegexTablePanel {
         } else {
             "Export current table as CSV"
         };
-        let scanned = format!("{} {}", self.scanned_lines(), text(Key::Lines, language));
+        let result_rows = format!("{} {}", self.result_rows(), text(Key::Lines, language));
         let add_app = self.app.clone();
         let remove_app = self.app.clone();
         let export_app = self.app.clone();
@@ -1609,7 +1626,7 @@ impl Panel for RegexTablePanel {
             h_flex()
                 .gap_1()
                 .text_color(theme::palette(cx).muted)
-                .child(div().mr_2().child(scanned))
+                .child(div().mr_2().child(result_rows))
                 .child(
                     Button::new("regex-table-add-page")
                         .icon(IconName::Plus)

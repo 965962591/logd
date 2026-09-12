@@ -1353,6 +1353,20 @@ impl LogdApp {
         view.update(cx, |view, cx| view.reveal_search_result(file_line, cx));
     }
 
+    pub(crate) fn goto_regex_table_line(
+        &mut self,
+        path: &Path,
+        file_line: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.path == path) else {
+            return;
+        };
+        self.set_active(tab_index, cx);
+        let view = self.tabs[tab_index].view.clone();
+        view.update(cx, |view, cx| view.reveal_search_result(file_line, cx));
+    }
+
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
         self.filters_dirty = true;
         let refresh_all = self.has_multi_file_filter_results()

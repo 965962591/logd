@@ -5,6 +5,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use logd_core::{Encoding, FileSource, LineIndex};
@@ -13,6 +14,8 @@ use logd_core::{Encoding, FileSource, LineIndex};
 pub struct RecordTable {
     pub columns: Vec<String>,
     pub rows: Arc<Vec<Vec<String>>>,
+    pub source_path: Option<PathBuf>,
+    pub source_lines: Arc<Vec<u64>>,
     pub error: Option<String>,
     pub scanned: usize,
     pub matched: usize,
@@ -335,15 +338,14 @@ pub fn extract_text_source(
     table.scanned = line_count as usize;
     let mut records = records;
     records.sort_by_key(|(line, _)| *line);
-    let records = records
-        .into_iter()
-        .map(|(_, record)| record)
-        .take(max_rows)
-        .collect::<Vec<_>>();
+    let records = records.into_iter().take(max_rows).collect::<Vec<_>>();
     table.matched = records.len();
+    table.source_path = Some(source.path().to_path_buf());
+    table.source_lines = Arc::new(records.iter().map(|(line, _)| *line).collect());
     table.rows = Arc::new(
         records
             .into_iter()
+            .map(|(_, record)| record)
             .map(|record| {
                 table
                     .columns
@@ -465,6 +467,7 @@ mod tests {
         );
 
         assert_eq!(table.scanned, 3);
+        assert_eq!(table.source_lines.as_slice(), &[2, 3, 4]);
         assert_eq!(
             table.rows.as_ref(),
             &vec![
