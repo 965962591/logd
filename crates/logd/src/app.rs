@@ -906,7 +906,7 @@ impl LogdApp {
             Ok(loaded) => {
                 let catalog_source = loaded.source.clone();
                 let catalog_encoding = catalog_source.encoding();
-                let view = cx.new(|cx| LogView::new(loaded, window, cx));
+                let view = cx.new(|cx| LogView::new(loaded, self.language, window, cx));
                 self.observe_log_view(&view, cx);
                 let tab_index = self.tabs.len();
                 self.tabs.push(Tab {
@@ -1185,7 +1185,7 @@ impl LogdApp {
             Ok(loaded) => {
                 let catalog_source = loaded.source.clone();
                 let catalog_encoding = catalog_source.encoding();
-                let view = cx.new(|cx| LogView::new(loaded, window, cx));
+                let view = cx.new(|cx| LogView::new(loaded, self.language, window, cx));
                 self.observe_log_view(&view, cx);
                 self.apply_filters_to_view(self.active, &view, cx);
                 self.apply_search_to_view(&view, cx);
@@ -2082,6 +2082,11 @@ impl LogdApp {
             MenuCommand::SaveFilters => self.save_tat(window, false, cx),
             MenuCommand::ToggleLanguage => {
                 self.language = self.language.toggle();
+                let language = self.language;
+                for tab in &self.tabs {
+                    tab.view
+                        .update(cx, |view, cx| view.set_language(language, cx));
+                }
                 cx.notify();
             }
         }
@@ -2503,12 +2508,14 @@ impl LogdApp {
             ))
             .child(title_bar::mark_toggle(
                 mark_panel_open,
-                match (mark_panel_open, lang) {
-                    (true, Language::ZhCn) => "隐藏标记",
-                    (false, Language::ZhCn) => "显示标记",
-                    (true, Language::EnUs) => "Hide Marks",
-                    (false, Language::EnUs) => "Show Marks",
-                },
+                text(
+                    if mark_panel_open {
+                        Key::HideMarks
+                    } else {
+                        Key::ShowMarks
+                    },
+                    lang,
+                ),
                 palette,
                 move |_, window, cx| {
                     mark_toggle_app.update(cx, |app, cx| {

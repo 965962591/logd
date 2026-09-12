@@ -28,6 +28,7 @@ use logd_core::{
     MatcherSet, Progress, Query, RenderRow, ScanOutcome, ScrollTo,
 };
 
+use crate::i18n::{text, Key, Language};
 use crate::theme;
 
 #[derive(Clone)]
@@ -175,6 +176,7 @@ pub struct LogView {
     line_height: f32,
     /// File-line numbers explicitly saved by the user for the Mark dock.
     marked_lines: BTreeSet<u64>,
+    language: Language,
 }
 
 #[derive(Clone, Copy)]
@@ -255,7 +257,12 @@ impl LogView {
         })
     }
 
-    pub fn new(loaded: Loaded, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        loaded: Loaded,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let complete = loaded.index.complete;
         let search_query = Arc::new(Query::always_true());
         let area = Rc::new(Cell::new(Bounds::default()));
@@ -301,6 +308,7 @@ impl LogView {
             font_size: theme::FONT_SIZE,
             line_height: theme::LINE_HEIGHT,
             marked_lines: BTreeSet::new(),
+            language,
         };
         window.focus(&view.focus, cx);
         // 阶段 B：文件没索引完就丢到后台跑全量
@@ -360,6 +368,13 @@ impl LogView {
     /// than filtered view rows, keep marks valid while filters change.
     pub fn marked_lines(&self) -> Vec<u64> {
         self.marked_lines.iter().copied().collect()
+    }
+
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.language != language {
+            self.language = language;
+            cx.notify();
+        }
     }
 
     pub fn unmark_lines<I>(&mut self, lines: I, cx: &mut Context<Self>)
@@ -1677,6 +1692,7 @@ impl LogView {
             .is_some_and(|selection| selection.range().contains(&view_row));
         let marked = self.marked_lines.contains(&row.file_line);
         let file_line = row.file_line;
+        let language = self.language;
         let edited = self.edits.get(&row.file_line);
         let is_editing = self.editing_line == Some(row.file_line);
         let input = self
@@ -1918,7 +1934,7 @@ impl LogView {
                                 marker.child(
                                     Icon::new(IconName::ArrowRight)
                                         .xsmall()
-                                        .text_color(palette.search_foreground),
+                                        .text_color(palette.tab_active_indicator),
                                 )
                             })
                             .when(!marked, |marker| {
@@ -1931,9 +1947,12 @@ impl LogView {
                                         .border_color(palette.muted),
                                 )
                             })
-                            .tooltip(|window, cx| {
-                                gpui_component::tooltip::Tooltip::new("Toggle mark")
-                                    .build(window, cx)
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(text(
+                                    Key::ToggleMark,
+                                    language,
+                                ))
+                                .build(window, cx)
                             })
                             .on_mouse_down(
                                 MouseButton::Left,

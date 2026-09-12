@@ -39,6 +39,10 @@ const MARK_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../public/mark.svg"
 ));
+const MARK_FILLED_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../public/mark-filled.svg"
+));
 
 static APP_ICON: LazyLock<Arc<Image>> =
     LazyLock::new(|| Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON_BYTES.to_vec())));
@@ -122,8 +126,9 @@ pub fn mark_toggle(
     palette: theme::Palette,
     action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let icon = if open { MARK_FILLED_SVG } else { MARK_SVG };
     Button::new("title-toggle-marks")
-        .children(vec![inline_icon(MARK_SVG, palette).into_any_element()])
+        .children(vec![inline_icon(icon, palette).into_any_element()])
         .small()
         .ghost()
         .toggled(open)

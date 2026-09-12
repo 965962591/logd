@@ -703,6 +703,20 @@ impl MarkPanel {
         self.selected.iter().cloned().collect()
     }
 
+    fn selected_lines_for_context(
+        &mut self,
+        key: (PathBuf, u64),
+        cx: &mut Context<Self>,
+    ) -> Vec<(PathBuf, u64)> {
+        if !self.selected.contains(&key) {
+            self.selected.clear();
+            self.selected.insert(key.clone());
+            self.selection_anchor = Some(key);
+            cx.notify();
+        }
+        self.selected_lines()
+    }
+
     pub(crate) fn prune_selection(&mut self, removed: &[(PathBuf, u64)], cx: &mut Context<Self>) {
         self.selected.retain(|selected| !removed.contains(selected));
         if self
@@ -741,6 +755,11 @@ impl MarkPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).language())
+            .unwrap_or(Language::EnUs);
         let key = (mark.path.clone(), mark.file_line);
         let selected = self.selected.contains(&key);
         let app = self.app.clone();
@@ -749,8 +768,9 @@ impl MarkPanel {
         let select_key = key.clone();
         let right_key = key.clone();
         let left_keys = keys.clone();
-        let text = mark.text.clone();
-        let title = mark.title.clone();
+        let log_text = mark.text.clone();
+        let source_tooltip = mark.title.clone();
+        let context_key = key.clone();
         h_flex()
             .id(("mark-row", index))
             .min_h(px(24.))
@@ -797,9 +817,10 @@ impl MarkPanel {
                     .h_full()
                     .items_center()
                     .justify_center()
-                    .text_color(palette.search_foreground)
-                    .tooltip(|window, cx| {
-                        gpui_component::tooltip::Tooltip::new("Unmark").build(window, cx)
+                    .text_color(palette.tab_active_indicator)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(text(Key::Unmark, language))
+                            .build(window, cx)
                     })
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         cx.stop_propagation();
@@ -811,11 +832,16 @@ impl MarkPanel {
             )
             .child(
                 div()
+                    .id(("mark-source", index))
                     .flex_none()
-                    .w(px(88.))
+                    .w(px(52.))
                     .text_right()
                     .text_color(palette.muted)
-                    .child(format!("{}:{}", title, mark.file_line + 1)),
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(source_tooltip.clone())
+                            .build(window, cx)
+                    })
+                    .child((mark.file_line + 1).to_string()),
             )
             .child(
                 div()
@@ -824,19 +850,22 @@ impl MarkPanel {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .child(text),
+                    .child(log_text),
             )
-            .context_menu(move |menu, _window, _| {
+            .context_menu(move |menu, _window, cx| {
                 let remove_app = app.clone();
-                let remove_panel = remove_panel.clone();
-                menu.item(PopupMenuItem::new("Unmark").on_click(move |_, _, cx| {
-                    let selected = remove_panel
-                        .update(cx, |panel, _| panel.selected_lines())
-                        .unwrap_or_default();
-                    remove_app
-                        .update(cx, |app, cx| app.unmark_lines(&selected, cx))
-                        .ok();
-                }))
+                let selected = remove_panel
+                    .update(cx, |panel, cx| {
+                        panel.selected_lines_for_context(context_key.clone(), cx)
+                    })
+                    .unwrap_or_default();
+                menu.item(PopupMenuItem::new(text(Key::Unmark, language)).on_click(
+                    move |_, _, cx| {
+                        remove_app
+                            .update(cx, |app, cx| app.unmark_lines(&selected, cx))
+                            .ok();
+                    },
+                ))
             })
             .into_any_element()
     }
@@ -864,11 +893,8 @@ impl Panel for MarkPanel {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.app
             .upgrade()
-            .map(|app| match app.read(cx).language() {
-                Language::ZhCn => "标记",
-                Language::EnUs => "Marks",
-            })
-            .unwrap_or("Marks")
+            .map(|app| text(Key::Marks, app.read(cx).language()))
+            .unwrap_or_else(|| text(Key::Marks, Language::EnUs))
     }
 
     fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -938,11 +964,8 @@ impl Render for MarkPanel {
         let empty_label = self
             .app
             .upgrade()
-            .map(|app| match app.read(cx).language() {
-                Language::ZhCn => "尚未标记日志行",
-                Language::EnUs => "No marked log lines",
-            })
-            .unwrap_or("No marked log lines");
+            .map(|app| text(Key::NoMarkedLines, app.read(cx).language()))
+            .unwrap_or_else(|| text(Key::NoMarkedLines, Language::EnUs));
 
         v_flex()
             .id("mark-panel")
