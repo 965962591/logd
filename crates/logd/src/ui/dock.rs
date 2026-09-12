@@ -26,7 +26,7 @@ use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable as _};
 
 use crate::app::{LogdApp, MarkedLogLine};
 use crate::i18n::{text, Key, Language};
-use crate::regex_table::{extract_text_source, RecordTable};
+use crate::regex_table::{extract_source, RecordTable};
 use crate::theme;
 
 pub const WORKSPACE_PANEL: &str = "logd.workspace";
@@ -1206,7 +1206,7 @@ impl RegexTablePanel {
         self.active().pattern.clone()
     }
 
-    pub(crate) fn extract_text(
+    pub(crate) fn extract_source(
         &mut self,
         source: Arc<logd_core::FileSource>,
         index: Arc<logd_core::LineIndex>,
@@ -1227,12 +1227,9 @@ impl RegexTablePanel {
         let weak = cx.entity().downgrade();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_, cx| {
-            let table =
-                executor
-                    .spawn(async move {
-                        extract_text_source(source, index, encoding, &pattern, usize::MAX)
-                    })
-                    .await;
+            let table = executor
+                .spawn(async move { extract_source(source, index, encoding, &pattern, usize::MAX) })
+                .await;
             weak.update(cx, |panel, cx| {
                 let Some(page) = panel.pages.iter_mut().find(|page| page.id == page_id) else {
                     return;

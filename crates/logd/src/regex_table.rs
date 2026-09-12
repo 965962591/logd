@@ -23,44 +23,44 @@ pub fn extract_table(input: &str, pattern: &str, max_rows: usize) -> RecordTable
     let pattern = pattern.trim();
     // A non-empty pattern explicitly selects text-log mode. This avoids a
     // mixed/JSON-looking file accidentally swallowing a user regex.
-    let json_lines = input
-        .lines()
-        .take(max_rows)
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    let looks_json = pattern.is_empty()
-        && (serde_json::from_str::<Value>(input.trim()).is_ok()
-            || (!json_lines.is_empty()
-                && json_lines
-                    .iter()
-                    .all(|line| serde_json::from_str::<Value>(line.trim()).is_ok())));
+    let whole_json = pattern
+        .is_empty()
+        .then(|| serde_json::from_str::<Value>(input.trim()).ok())
+        .flatten();
+    let looks_ndjson = pattern.is_empty() && whole_json.is_none() && {
+        let mut lines = input
+            .lines()
+            .take(max_rows)
+            .filter(|line| !line.trim().is_empty())
+            .peekable();
+        lines.peek().is_some()
+            && lines.all(|line| serde_json::from_str::<Value>(line.trim()).is_ok())
+    };
     let mut records = Vec::<BTreeMap<String, String>>::new();
-    if looks_json {
-        if let Ok(value) = serde_json::from_str::<Value>(input.trim()) {
-            match value {
-                Value::Array(values) => {
-                    table.scanned = values.len().min(max_rows);
-                    records.extend(values.into_iter().take(max_rows).filter_map(json_record));
-                    table.matched = records.len();
-                }
-                value => {
-                    table.scanned = 1;
-                    if let Some(record) = json_record(value) {
-                        records.push(record);
-                        table.matched = 1;
-                    }
+    if let Some(value) = whole_json {
+        match value {
+            Value::Array(values) => {
+                table.scanned = values.len().min(max_rows);
+                records.extend(values.into_iter().take(max_rows).filter_map(json_record));
+                table.matched = records.len();
+            }
+            value => {
+                table.scanned = 1;
+                if let Some(record) = json_record(value) {
+                    records.push(record);
+                    table.matched = 1;
                 }
             }
-        } else {
-            for line in input.lines() {
-                table.scanned += 1;
-                if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-                    if let Some(record) = json_record(value) {
-                        records.push(record);
-                        table.matched += 1;
-                        if records.len() >= max_rows {
-                            break;
-                        }
+        }
+    } else if looks_ndjson {
+        for line in input.lines() {
+            table.scanned += 1;
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+                if let Some(record) = json_record(value) {
+                    records.push(record);
+                    table.matched += 1;
+                    if records.len() >= max_rows {
+                        break;
                     }
                 }
             }
@@ -248,6 +248,34 @@ pub fn extract_text_source(
         Some(encoding.decode_bytes(&data[start..end]).into_owned())
     });
     extract_text_lines(lines, pattern, max_rows)
+}
+
+/// Extract a regex or JSON/NDJSON table from a memory-mapped source. The
+/// caller must run this on a background executor: JSON arrays still require a
+/// whole-document decode, while ordinary logs are rejected from a small
+/// prefix without materializing the complete file.
+pub fn extract_source(
+    source: Arc<FileSource>,
+    index: Arc<LineIndex>,
+    encoding: Encoding,
+    pattern: &str,
+    max_rows: usize,
+) -> RecordTable {
+    if !pattern.trim().is_empty() {
+        return extract_text_source(source, index, encoding, pattern, max_rows);
+    }
+
+    let prefix_end = source.len().min(64 * 1024);
+    let prefix = source.decode(0, prefix_end);
+    if !matches!(
+        prefix.chars().find(|ch| !ch.is_whitespace()),
+        Some('{' | '[')
+    ) {
+        return RecordTable::default();
+    }
+
+    let input = source.decode(0, source.len());
+    extract_table(&input, "", max_rows)
 }
 
 fn json_record(value: Value) -> Option<BTreeMap<String, String>> {

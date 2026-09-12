@@ -39,7 +39,6 @@ use logd_core::{
 use crate::i18n::{text, Key, Language};
 use crate::live_log::{LiveLogEvent, LiveLogService};
 use crate::log_view::LogView;
-use crate::regex_table::extract_table;
 use crate::theme;
 use crate::ui::dock::{
     logd_dock_area, register_logd_panels, FilterPanel, LogPanel, MarkPanel, RegexTablePanel,
@@ -785,11 +784,6 @@ impl LogdApp {
                 .await;
             _ = this.update_in(window, |this, _, cx| {
                 let pattern = this.regex_table_pattern.read(cx).value().to_string();
-                if pattern.trim().is_empty() {
-                    this.regex_table_panel
-                        .update(cx, |panel, cx| panel.clear_extraction(cx));
-                    return;
-                }
                 let Some(view) = this.active_view() else {
                     this.regex_table_panel
                         .update(cx, |panel, cx| panel.clear_extraction(cx));
@@ -801,7 +795,7 @@ impl LogdApp {
                     (doc.source().clone(), doc.index().clone(), doc.encoding())
                 };
                 this.regex_table_panel.update(cx, |panel, cx| {
-                    panel.extract_text(source, index, encoding, pattern, cx)
+                    panel.extract_source(source, index, encoding, pattern, cx)
                 });
             });
         }));
@@ -1982,6 +1976,9 @@ impl LogdApp {
     ) {
         self.regex_table_panel
             .update(cx, |panel, cx| panel.set_visible(show, cx));
+        if show {
+            self.schedule_regex_table_refresh(window, cx);
+        }
         self.normalize_hidden_dock_panels(window, cx);
         let dock_area = self.dock_area.clone();
         self.schedule_layout_save(&dock_area, window, cx);
@@ -2943,31 +2940,8 @@ impl LogdApp {
         let (pattern, input, table, table_key) = {
             let state = app.read(cx);
             let pattern = state.regex_table_pattern.read(cx).value().to_string();
-            let (input, json_key) = state.active_view().map_or_else(
-                || (String::new(), "json:none".to_owned()),
-                |view| {
-                    let doc = view.read(cx).doc();
-                    if pattern.trim().is_empty() {
-                        let source = doc.source();
-                        (
-                            source.decode(0, source.len()).into_owned(),
-                            format!("json:{}:{}", source.path().display(), source.len()),
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    }
-                },
-            );
-            let table = if pattern.trim().is_empty() {
-                extract_table(&input, &pattern, usize::MAX)
-            } else {
-                panel.current_table(&pattern)
-            };
-            let table_key = if pattern.trim().is_empty() {
-                json_key
-            } else {
-                panel.table_key(&pattern)
-            };
+            let table = panel.current_table(&pattern);
+            let table_key = panel.table_key(&pattern);
             (pattern, state.regex_table_pattern.clone(), table, table_key)
         };
         let tabs = panel.page_tabs();
