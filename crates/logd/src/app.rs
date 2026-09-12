@@ -1968,6 +1968,20 @@ impl LogdApp {
         }
     }
 
+    pub(crate) fn copy_log_lines(&self, lines: &[(PathBuf, u64)], cx: &mut Context<Self>) {
+        let output = lines
+            .iter()
+            .filter_map(|(path, file_line)| {
+                let tab = self.tabs.iter().find(|tab| &tab.path == path)?;
+                tab.view.read(cx).doc().line_text(*file_line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !output.is_empty() {
+            cx.write_to_clipboard(output.into());
+        }
+    }
+
     pub(crate) fn show_regex_table(
         &mut self,
         show: bool,
@@ -3355,6 +3369,7 @@ impl LogdApp {
         app: &Entity<Self>,
         vertical_scroll: &UniformListScrollHandle,
         collapsed_files: &HashSet<PathBuf>,
+        selected_line: Option<(PathBuf, u64)>,
         remembered_content_width: f32,
         panel_handle: WeakEntity<SearchResultsPanel>,
         _window: &mut Window,
@@ -3466,7 +3481,7 @@ impl LogdApp {
         let rows = uniform_list(
             "multi-file-search-results",
             tree_rows,
-            move |range, window, cx| {
+            move |range, _window, cx| {
                 let mut elements = Vec::with_capacity(range.len());
                 let mut widest = observed_content_width;
                 for result_index in range {
@@ -3533,7 +3548,12 @@ impl LogdApp {
                         .unwrap_or_default();
                     widest = widest.max(estimated_search_text_width(&line_text) + 142.0);
                     let target_app = row_app.clone();
+                    let target_panel = row_panel.clone();
                     let tab_index = file.tab_index;
+                    let path = file.path.clone();
+                    let is_selected = selected_line
+                        .as_ref()
+                        .is_some_and(|selected| selected == &(path.clone(), file_line));
                     elements.push(
                         h_flex()
                             .id(("search-result", result_index))
@@ -3543,10 +3563,20 @@ impl LogdApp {
                             .items_center()
                             .border_b_1()
                             .border_color(palette.border)
-                            .hover(|row| row.bg(palette.control_hover))
-                            .on_click(window.listener_for(&target_app, move |this, _, _, cx| {
-                                this.goto_search_result(tab_index, file_line, cx)
-                            }))
+                            .when(is_selected, |row| row.bg(palette.selection))
+                            .when(!is_selected, |row| {
+                                row.hover(|row| row.bg(palette.control_hover))
+                            })
+                            .on_click(move |_, window, cx| {
+                                target_panel
+                                    .update(cx, |panel, cx| {
+                                        panel.select_line(path.clone(), file_line, window, cx)
+                                    })
+                                    .ok();
+                                target_app.update(cx, |app, cx| {
+                                    app.goto_search_result(tab_index, file_line, cx)
+                                });
+                            })
                             .child(
                                 div()
                                     .w(px(34.))

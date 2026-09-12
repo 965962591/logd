@@ -21,7 +21,7 @@ use gpui_component::dock::{
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
+use gpui_component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable as _};
 
 use crate::app::{LogdApp, MarkedLogLine};
@@ -757,12 +757,23 @@ impl MarkPanel {
     ) {
         if !self.focus.is_focused(window)
             || !crate::platform::primary_modifier(&event.keystroke.modifiers)
-            || event.keystroke.key != "a"
         {
             return;
         }
-        self.select_all(keys, cx);
-        cx.stop_propagation();
+        match event.keystroke.key.as_str() {
+            "a" => {
+                self.select_all(keys, cx);
+                cx.stop_propagation();
+            }
+            "c" if !self.selected.is_empty() => {
+                let selected = self.selected_lines();
+                if let Some(app) = self.app.upgrade() {
+                    app.update(cx, |app, cx| app.copy_marked_lines(&selected, cx));
+                }
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
     }
 
     fn render_mark_row(
@@ -1030,6 +1041,7 @@ pub struct SearchResultsPanel {
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
     collapsed_files: HashSet<PathBuf>,
+    selected_line: Option<(PathBuf, u64)>,
     content_width: f32,
     visible: bool,
 }
@@ -1324,6 +1336,28 @@ impl RegexTablePanel {
             .scrollbar_visible(true, true)
     }
 
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::platform::primary_modifier(&event.keystroke.modifiers)
+            || event.keystroke.key != "c"
+        {
+            return;
+        }
+        let table_state = self.active().table_state.clone();
+        let table_focused = table_state.read(cx).focus_handle(cx).is_focused(window);
+        if !table_focused {
+            return;
+        }
+        let value = table_state
+            .read(cx)
+            .selected_cell()
+            .and_then(|(row, column)| self.active().table.rows.get(row)?.get(column))
+            .cloned();
+        if let Some(value) = value {
+            cx.write_to_clipboard(value.into());
+            cx.stop_propagation();
+        }
+    }
+
     pub(crate) fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.active();
         if page.table.rows.is_empty() {
@@ -1377,9 +1411,21 @@ fn new_regex_page(
         TableState::new(RegexTableDelegate::default(), window, cx)
             .col_selectable(false)
             .row_selectable(false)
+            .cell_selectable(true)
+            .row_header(false)
             .col_movable(false)
             .sortable(false)
     });
+    cx.subscribe_in(
+        &table_state,
+        window,
+        |_, table, event: &TableEvent, window, cx| {
+            if matches!(event, TableEvent::SelectCell(_, _)) {
+                window.focus(&table.read(cx).focus_handle(cx), cx);
+            }
+        },
+    )
+    .detach();
     RegexTablePage {
         id,
         pattern: String::new(),
@@ -1570,10 +1616,16 @@ impl Focusable for RegexTablePanel {
 }
 impl Render for RegexTablePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.app
+        let content = self
+            .app
             .upgrade()
             .map(|app| LogdApp::render_regex_table(&app, self, window, cx))
-            .unwrap_or_else(|| div().into_any_element())
+            .unwrap_or_else(|| div().into_any_element());
+        div()
+            .id("regex-table-panel-content")
+            .size_full()
+            .on_key_down(cx.listener(Self::on_key))
+            .child(content)
     }
 }
 
@@ -1584,6 +1636,7 @@ impl SearchResultsPanel {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             collapsed_files: HashSet::new(),
+            selected_line: None,
             content_width: 720.0,
             visible: true,
         }
@@ -1608,7 +1661,36 @@ impl SearchResultsPanel {
             .base_handle
             .set_offset(point(px(0.), px(0.)));
         self.collapsed_files.clear();
+        self.selected_line = None;
         self.content_width = 720.0;
+    }
+
+    pub(crate) fn select_line(
+        &mut self,
+        path: PathBuf,
+        file_line: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        self.selected_line = Some((path, file_line));
+        cx.notify();
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window)
+            || !crate::platform::primary_modifier(&event.keystroke.modifiers)
+            || event.keystroke.key != "c"
+        {
+            return;
+        }
+        let Some(selected) = self.selected_line.clone() else {
+            return;
+        };
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |app, cx| app.copy_log_lines(&[selected], cx));
+        }
+        cx.stop_propagation();
     }
 
     pub(crate) fn toggle_file(&mut self, path: PathBuf, row: usize, cx: &mut Context<Self>) {
@@ -1718,20 +1800,27 @@ impl Focusable for SearchResultsPanel {
 impl Render for SearchResultsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.entity().downgrade();
-        self.app
+        let content = self
+            .app
             .upgrade()
             .map(|app| {
                 LogdApp::render_search_results(
                     &app,
                     &self.scroll,
                     &self.collapsed_files,
+                    self.selected_line.clone(),
                     self.content_width,
                     panel,
                     window,
                     cx,
                 )
             })
-            .unwrap_or_else(|| div().into_any_element())
+            .unwrap_or_else(|| div().into_any_element());
+        div()
+            .size_full()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .child(content)
     }
 }
 
