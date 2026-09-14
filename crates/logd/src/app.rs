@@ -137,6 +137,14 @@ impl UpdateDialog {
         crate::updater::download_and_restart(release, self.sender.clone());
     }
 
+    fn activate(&mut self) {
+        if matches!(self.status, UpdateStatus::Available(_)) {
+            self.download();
+        } else {
+            self.check();
+        }
+    }
+
     fn poll(&mut self) -> bool {
         let mut restarting = false;
         while let Ok(event) = self.receiver.try_recv() {
@@ -172,9 +180,8 @@ impl UpdateDialog {
 impl Render for UpdateDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
-        let check = cx.entity().clone();
-        let download = cx.entity().clone();
-        let (status_text, progress, can_download) = match &self.status {
+        let update = cx.entity().clone();
+        let (status_text, progress, update_available) = match &self.status {
             UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
             UpdateStatus::Checking => (
                 text(Key::CheckingForUpdates, language).to_string(),
@@ -230,49 +237,43 @@ impl Render for UpdateDialog {
             content = content.child(Progress::new("update-progress").value(value).w_full());
         }
         content.child(
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("check-update")
-                        .label(text(Key::CheckForUpdates, language))
-                        .disabled(matches!(
-                            self.status,
-                            UpdateStatus::Checking
-                                | UpdateStatus::Downloading { .. }
-                                | UpdateStatus::Restarting
-                        ))
-                        .on_click(move |_, _, cx| {
-                            check.update(cx, |this, cx| {
-                                this.check();
-                                cx.notify();
-                            });
-                        }),
-                )
-                .child(
-                    Button::new("download-update")
-                        .primary()
-                        .label(text(Key::InstallUpdate, language))
-                        .disabled(!can_download)
-                        .on_click(move |_, _, cx| {
-                            download.update(cx, |this, cx| {
-                                this.download();
-                                cx.notify();
-                            });
-                        }),
-                ), // .child(
-                   //     Button::new("close-about")
-                   //         .label(text(Key::Close, language))
-                   //         .disabled(matches!(
-                   //             self.status,
-                   //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
-                   //         ))
-                   //         .on_click(window.listener_for(
-                   //             &close,
-                   //             |_: &mut UpdateDialog, _, window, cx| {
-                   //                 window.close_dialog(cx);
-                   //             },
-                   //         )),
-                   // ),
+            h_flex().gap_2().child(
+                Button::new("update-action")
+                    .label(text(
+                        if update_available {
+                            Key::InstallUpdate
+                        } else {
+                            Key::CheckForUpdates
+                        },
+                        language,
+                    ))
+                    .when(update_available, |button| button.primary())
+                    .disabled(matches!(
+                        self.status,
+                        UpdateStatus::Checking
+                            | UpdateStatus::Downloading { .. }
+                            | UpdateStatus::Restarting
+                    ))
+                    .on_click(move |_, _, cx| {
+                        update.update(cx, |this, cx| {
+                            this.activate();
+                            cx.notify();
+                        });
+                    }),
+            ), // .child(
+               //     Button::new("close-about")
+               //         .label(text(Key::Close, language))
+               //         .disabled(matches!(
+               //             self.status,
+               //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+               //         ))
+               //         .on_click(window.listener_for(
+               //             &close,
+               //             |_: &mut UpdateDialog, _, window, cx| {
+               //                 window.close_dialog(cx);
+               //             },
+               //         )),
+               // ),
         )
     }
 }
@@ -2558,7 +2559,7 @@ impl LogdApp {
             .child(self.menu_button(Key::Filters, window, cx))
             .child(self.about_button(window, cx))
             .into_any_element();
-        let right = h_flex()
+        let search_leading = h_flex()
             .h_full()
             .flex_none()
             .items_center()
@@ -2578,6 +2579,22 @@ impl LogdApp {
                     capture_app.update(cx, |app, cx| app.toggle_live_capture(cx));
                 },
             ))
+            .child(title_bar::show_only_toggle(
+                self.show_only_filtered,
+                lang,
+                palette,
+                move |window, cx| {
+                    show_only_app.update(cx, |app, cx| {
+                        app.set_show_only(!app.show_only_filtered, window, cx)
+                    });
+                },
+            ))
+            .into_any_element();
+        let right = h_flex()
+            .h_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
             .child(title_bar::mark_toggle(
                 mark_panel_open,
                 text(
@@ -2592,16 +2609,6 @@ impl LogdApp {
                 move |_, window, cx| {
                     mark_toggle_app.update(cx, |app, cx| {
                         app.show_mark_panel(!mark_panel_open, window, cx)
-                    });
-                },
-            ))
-            .child(title_bar::show_only_toggle(
-                self.show_only_filtered,
-                lang,
-                palette,
-                move |window, cx| {
-                    show_only_app.update(cx, |app, cx| {
-                        app.set_show_only(!app.show_only_filtered, window, cx)
                     });
                 },
             ))
@@ -2826,6 +2833,7 @@ impl LogdApp {
         let close_app = cx.weak_entity();
         title_bar::render(
             left,
+            search_leading,
             center,
             right,
             window,
