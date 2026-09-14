@@ -44,13 +44,6 @@ impl LogField {
         }
     }
 
-    const fn completion_operator(self) -> &'static str {
-        match self {
-            Self::Tag | Self::Message => ":",
-            Self::Level | Self::Pid | Self::Tid => "=",
-        }
-    }
-
     fn parse_prefix(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "level" | "lvl" | "priority" => Some(Self::Level),
@@ -367,8 +360,9 @@ impl FieldCatalog {
     /// 根据当前输入返回最多 `limit` 个联想项。
     ///
     /// 输入形如 `tag:ae`、`level=` 时只联想对应字段；没有字段前缀时，
-    /// 联想字段名以及所有字段中匹配的值。匹配支持大小写不敏感子序列和
-    /// 小编辑距离，因此输入少量拼写错误也能得到结果。
+    /// 联想所有字段中匹配的值。字段前缀只用于限制候选字段，
+    /// 值补全本身始终返回普通文本，避免标题栏搜索将其当成结构化项而不高亮。
+    /// 匹配支持大小写不敏感子序列和小编辑距离，因此输入少量拼写错误也能得到结果。
     pub fn suggest(&self, input: &str, limit: usize) -> Vec<Suggestion> {
         if limit == 0 {
             return Vec::new();
@@ -382,27 +376,6 @@ impl FieldCatalog {
             .matcher
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if field.is_none() {
-            for candidate in LogField::ALL {
-                let expression = format!("{}{}", candidate.name(), candidate.completion_operator());
-                if let Some(score) = nucleo_score(&atom, &expression, &mut matcher, &mut char_buf) {
-                    out.push((
-                        match_priority(prefix, &expression),
-                        ValueStats {
-                            count: u64::MAX,
-                            last_seen: u64::MAX,
-                        },
-                        Suggestion {
-                            field: Some(candidate),
-                            value: candidate.name().to_owned(),
-                            expression: format!("{expression_prefix}{expression}"),
-                            score,
-                        },
-                    ));
-                }
-            }
-        }
-
         let fields = field
             .map(|f| vec![f])
             .unwrap_or_else(|| LogField::ALL.to_vec());
@@ -419,7 +392,7 @@ impl FieldCatalog {
                         value: value.to_owned(),
                         expression: format!(
                             "{expression_prefix}{}",
-                            format_field_expression(candidate, value)
+                            format_completion_value(value)
                         ),
                         score,
                     },
@@ -515,20 +488,15 @@ fn match_priority(query: &str, candidate: &str) -> u8 {
     }
 }
 
-fn format_field_expression(field: LogField, value: &str) -> String {
+fn format_completion_value(value: &str) -> String {
     if value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        format!("{}{}{}", field.name(), field.completion_operator(), value)
+        value.to_owned()
     } else {
         let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-        format!(
-            "{}{}\"{}\"",
-            field.name(),
-            field.completion_operator(),
-            escaped
-        )
+        format!("\"{escaped}\"")
     }
 }
 
@@ -750,7 +718,7 @@ mod tests {
         assert!(catalog
             .suggest("msg:worker", 10)
             .iter()
-            .any(|suggestion| suggestion.expression == "msg:worker-cache"));
+            .any(|suggestion| suggestion.expression == "worker-cache"));
     }
 
     #[test]
@@ -782,8 +750,18 @@ mod tests {
     fn field_prefix_limits_suggestions() {
         let catalog = FieldCatalog::from_sample(DATA.as_bytes(), Encoding::Utf8);
         let out = catalog.suggest("tag:ae", 10);
-        assert!(out.iter().any(|s| s.expression == "tag:AeAlgo"));
-        assert!(out.iter().all(|s| s.expression.starts_with("tag:")));
+        assert!(out.iter().any(|s| s.expression == "AeAlgo"));
+        assert!(out.iter().all(|s| !s.expression.starts_with("tag:")));
+    }
+
+    #[test]
+    fn suggestions_never_add_field_prefixes() {
+        let catalog = FieldCatalog::from_sample(DATA.as_bytes(), Encoding::Utf8);
+        let out = catalog.suggest("Mag", 10);
+        assert!(out.iter().any(|s| s.expression == "Magic"));
+        assert!(out
+            .iter()
+            .all(|s| !s.expression.contains(':') && !s.expression.contains('=')));
     }
 
     #[test]
@@ -805,8 +783,8 @@ mod tests {
     #[test]
     fn suggestions_quote_field_values_with_spaces() {
         assert_eq!(
-            format_field_expression(LogField::Tag, "Audio Service"),
-            "tag:\"Audio Service\""
+            format_completion_value("Audio Service"),
+            "\"Audio Service\""
         );
     }
 
@@ -822,7 +800,7 @@ mod tests {
         let out = catalog.suggest("Magic & tag:ae", 10);
         assert!(out
             .iter()
-            .any(|suggestion| suggestion.expression == "Magic & tag:AeAlgo"));
+            .any(|suggestion| suggestion.expression == "Magic & AeAlgo"));
     }
 
     #[test]
@@ -831,7 +809,7 @@ mod tests {
         let out = catalog.suggest("Magic &  tag:ae", 10);
         assert!(out
             .iter()
-            .any(|suggestion| suggestion.expression == "Magic &  tag:AeAlgo"));
+            .any(|suggestion| suggestion.expression == "Magic &  AeAlgo"));
     }
 
     #[test]
