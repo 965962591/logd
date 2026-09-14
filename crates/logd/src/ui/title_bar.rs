@@ -20,7 +20,6 @@ const RIGHT_BUTTONS_MIN_WIDTH: f32 = 120.0;
 const RIGHT_SLOT_MIN_WIDTH: f32 =
     WINDOW_CONTROLS_WIDTH + SIDE_DRAG_MIN_WIDTH + RIGHT_BUTTONS_MIN_WIDTH;
 const SEARCH_MIN_WIDTH: f32 = 300.0;
-const SEARCH_LEADING_WIDTH: f32 = 60.0;
 // Size the search box against the full title bar, rather than against the
 // flex-sized side slots, so its visual center stays aligned with the window.
 const SEARCH_WIDTH_RATIO: f32 = 0.4;
@@ -194,7 +193,6 @@ pub fn show_only_toggle(
 
 pub fn render(
     left: AnyElement,
-    search_leading: AnyElement,
     center: AnyElement,
     right: AnyElement,
     window: &mut Window,
@@ -205,9 +203,9 @@ pub fn render(
     let maximized = window.is_maximized();
     let palette = theme::palette(cx);
 
-    // Lay the search controls over the full title bar. A matching trailing
-    // spacer balances the two leading SVG buttons, keeping the input itself
-    // centered against the window rather than the whole control group.
+    // Lay the search field over the full title bar. The left and right slots
+    // remain in normal flow below it, preserving their drag/button hitboxes;
+    // only the input itself is centered by this overlay.
     let center_slot = h_flex()
         .absolute()
         .top_0()
@@ -218,22 +216,12 @@ pub fn render(
         .items_center()
         .justify_center()
         .child(
-            h_flex()
-                .w(px(SEARCH_LEADING_WIDTH))
-                .h_full()
-                .flex_none()
-                .items_center()
-                .justify_end()
-                .child(search_leading),
-        )
-        .child(
             div()
                 .w(relative(SEARCH_WIDTH_RATIO))
                 .min_w(px(SEARCH_MIN_WIDTH))
                 .flex_none()
                 .child(center),
-        )
-        .child(div().w(px(SEARCH_LEADING_WIDTH)).h_full().flex_none());
+        );
 
     h_flex()
         .id("app-title-bar")
