@@ -155,10 +155,6 @@ fn dark_surface() -> Hsla {
     Hsla::from(rgb(DARK_SURFACE_RGB))
 }
 
-pub fn search_foreground_rgb(cx: &App) -> u32 {
-    u32::from(palette(cx).search_foreground.to_rgb()) >> 8
-}
-
 /// 等宽字体。Consolas 在 Windows 上必然存在。
 #[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";

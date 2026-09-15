@@ -326,13 +326,12 @@ pub struct LogdApp {
     tabs: Vec<Tab>,
     active: usize,
     filters: Vec<FilterSpec>,
-    /// Temporary title-bar search terms. They are applied to every tab but
-    /// are intentionally kept out of the persisted/configured filter list.
-    search_filters: Vec<FilterSpec>,
     search_query: String,
+    search_keywords: Vec<String>,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
-    filters_dirty: bool,
+    saved_filters: Vec<FilterSpec>,
+    saved_show_only_filtered: bool,
     filter_save_prompt_open: bool,
     recent_files: Vec<PathBuf>,
     search_history: Vec<String>,
@@ -564,11 +563,12 @@ impl LogdApp {
             tabs: Vec::new(),
             active: 0,
             filters: Vec::new(),
-            search_filters: Vec::new(),
             search_query: String::new(),
+            search_keywords: Vec::new(),
             show_only_filtered: false,
             tat_path: None,
-            filters_dirty: false,
+            saved_filters: Vec::new(),
+            saved_show_only_filtered: false,
             filter_save_prompt_open: false,
             recent_files: crate::settings::load_recent_files(),
             search_history,
@@ -1074,8 +1074,7 @@ impl LogdApp {
     }
 
     fn filters_for_tab(&self, tab_index: usize) -> Vec<FilterSpec> {
-        let mut filters = self
-            .filters
+        self.filters
             .iter()
             .cloned()
             .map(|mut filter| {
@@ -1084,26 +1083,22 @@ impl LogdApp {
                 }
                 filter
             })
-            .collect::<Vec<_>>();
-        // Keep title-bar terms after the configured prefix. They are temporary
-        // filters for the current scan and never enter the persisted filter list.
-        filters.extend(self.search_filters.iter().cloned());
-        filters
+            .collect()
     }
 
     fn apply_filters_to_view(&self, tab_index: usize, view: &Entity<LogView>, cx: &mut App) {
         let filters = self.filters_for_tab(tab_index);
-        let configured_filter_count = self.filters.len();
         let only = self.show_only_filtered;
         view.update(cx, |view, cx| {
-            view.apply_filters(filters, configured_filter_count, cx);
+            view.apply_filters(filters, cx);
             view.set_show_only_filtered(only, cx);
         });
     }
 
     fn apply_search_to_view(&self, view: &Entity<LogView>, cx: &mut App) {
         let query = self.search_query.clone();
-        view.update(cx, |view, cx| view.apply_search(query, cx));
+        let keywords = self.search_keywords.clone();
+        view.update(cx, |view, cx| view.apply_search(query, keywords, cx));
     }
 
     fn has_multi_file_filter_results(&self) -> bool {
@@ -1368,7 +1363,6 @@ impl LogdApp {
     }
 
     fn filters_changed(&mut self, cx: &mut Context<Self>) {
-        self.filters_dirty = true;
         let refresh_all = self.has_multi_file_filter_results()
             || self
                 .tabs
@@ -1381,8 +1375,11 @@ impl LogdApp {
                 tab.view.update(cx, |view, _| view.mark_dirty());
             }
         }
+        let has_search = !self.search_query.is_empty();
         self.search_results_panel.update(cx, |panel, cx| {
-            panel.reset_scroll();
+            if !has_search {
+                panel.reset_scroll();
+            }
             cx.notify();
         });
         cx.notify();
@@ -1421,24 +1418,17 @@ impl LogdApp {
         }
         let expression = parse_search_expression(&value);
         self.search_query = expression.query;
-        self.search_filters = expression
-            .keywords
-            .into_iter()
-            .map(|keyword| FilterSpec {
-                text: keyword,
-                mode: HighlightMode::Field,
-                fore: Some(theme::search_foreground_rgb(cx)),
-                ..Default::default()
-            })
-            .collect();
+        self.search_keywords = expression.keywords;
 
-        // A title-bar search is intentionally independent of configured
-        // filters and is scanned in every imported file.
-        let tab_filters = (0..self.tabs.len())
-            .map(|index| (index, self.tabs[index].view.clone()))
+        // Search results are separate from the configured-filter scan. Updating
+        // the title-bar query must not rebuild the matcher or invalidate the
+        // filtered view.
+        let search_views = self
+            .tabs
+            .iter()
+            .map(|tab| tab.view.clone())
             .collect::<Vec<_>>();
-        for (index, view) in tab_filters {
-            self.apply_filters_to_view(index, &view, cx);
+        for view in search_views {
             self.apply_search_to_view(&view, cx);
         }
         let has_search = !self.search_query.is_empty();
@@ -1584,7 +1574,6 @@ impl LogdApp {
             return;
         }
         self.show_only_filtered = only;
-        self.filters_dirty = true;
         if let Some(view) = self.active_view().cloned() {
             let pointer_y = f32::from(window.mouse_position().y);
             view.update(cx, |view, cx| {
@@ -1602,12 +1591,12 @@ impl LogdApp {
             return;
         }
         let filters = self.filters_for_tab(self.active);
-        let configured_filter_count = self.filters.len();
         let search_query = self.search_query.clone();
+        let search_keywords = self.search_keywords.clone();
         let source = view.read(cx).doc().source().clone();
         let path = self.tabs[self.active].path.clone();
         view.update(cx, |view, cx| {
-            view.set_encoding(encoding, filters, configured_filter_count, search_query, cx)
+            view.set_encoding(encoding, filters, search_query, search_keywords, cx)
         });
         self.tabs[self.active].field_catalog = Arc::new(FieldCatalog::default());
         self.build_field_catalog(path, source, encoding, window, cx);
@@ -1622,22 +1611,6 @@ impl LogdApp {
         if !theme::apply_named_theme(name.as_ref(), Some(window), cx) {
             return;
         }
-        let search_foreground = theme::search_foreground_rgb(cx);
-        if !self.search_filters.is_empty() {
-            for filter in &mut self.search_filters {
-                filter.fore = Some(search_foreground);
-            }
-            let updates = self
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| (tab.view.clone(), self.filters_for_tab(index)))
-                .collect::<Vec<_>>();
-            for (view, filters) in updates {
-                view.update(cx, |view, cx| view.restyle_filters(filters, cx));
-            }
-        }
-
         let _ = crate::settings::save_theme_name(name.as_ref());
         cx.refresh_windows();
         cx.notify();
@@ -1658,7 +1631,8 @@ impl LogdApp {
                     self.filters.len()
                 ));
                 self.filters_changed(cx);
-                self.filters_dirty = false;
+                self.saved_filters = self.filters.clone();
+                self.saved_show_only_filtered = self.show_only_filtered;
             }
             Err(error) => {
                 self.status = Some(format!(".tat: {error:#}"));
@@ -1680,7 +1654,8 @@ impl LogdApp {
                     self.filters.len()
                 ));
                 self.filters_changed(cx);
-                self.filters_dirty = false;
+                self.saved_filters = self.filters.clone();
+                self.saved_show_only_filtered = self.show_only_filtered;
             }
             Err(error) => {
                 self.status = Some(format!(".logd: {error:#}"));
@@ -1738,7 +1713,8 @@ impl LogdApp {
         self.status = Some(match &saved {
             Ok(()) => {
                 self.tat_path = Some(path.clone());
-                self.filters_dirty = false;
+                self.saved_filters = self.filters.clone();
+                self.saved_show_only_filtered = self.show_only_filtered;
                 format!(
                     "{}: {}",
                     text(Key::SaveFilter, self.language),
@@ -1752,7 +1728,9 @@ impl LogdApp {
     }
 
     fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.filters_dirty {
+        if self.filters == self.saved_filters
+            && self.show_only_filtered == self.saved_show_only_filtered
+        {
             return true;
         }
         self.prompt_save_filters_before_close(window, cx);

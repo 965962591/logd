@@ -33,6 +33,17 @@ pub fn prepare_line(
     spans: &mut Vec<Span>,
     max_bytes: usize,
 ) -> RenderLine {
+    prepare_line_with_extra_spans(raw, enc, spans, &mut Vec::new(), max_bytes)
+}
+
+/// Decode one line and remap two independent sets of raw-byte spans.
+pub fn prepare_line_with_extra_spans(
+    raw: &[u8],
+    enc: Encoding,
+    spans: &mut Vec<Span>,
+    extra_spans: &mut Vec<Span>,
+    max_bytes: usize,
+) -> RenderLine {
     // 先按原始字节截断，避免解码几百 KB 只为了丢掉
     let raw_cut = floor_raw_boundary(raw, enc, max_bytes);
     let truncated = raw_cut < raw.len();
@@ -42,6 +53,9 @@ pub fn prepare_line(
 
     if !spans.is_empty() {
         remap_spans(head, enc, &text, spans);
+    }
+    if !extra_spans.is_empty() {
+        remap_spans(head, enc, &text, extra_spans);
     }
     if truncated {
         text.push('…');
@@ -189,6 +203,19 @@ mod tests {
             "换算后应仍然框住 Magic:"
         );
         assert_eq!(s[0].start, 10, "UTF-8 下应从第 10 字节开始");
+    }
+
+    #[test]
+    fn independent_extra_spans_are_remapped_with_filter_spans() {
+        let (raw, _, _) = encoding_rs::GB18030.encode("曝光表 Magic: 42");
+        let mut filters = vec![span(0, 2)];
+        let mut search = vec![span(7, 13)];
+
+        let line =
+            prepare_line_with_extra_spans(&raw, Encoding::Gb18030, &mut filters, &mut search, 4096);
+
+        assert_eq!(&line.text[filters[0].start..filters[0].end], "曝");
+        assert_eq!(&line.text[search[0].start..search[0].end], "Magic:");
     }
 
     #[test]

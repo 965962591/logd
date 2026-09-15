@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::index::LineIndex;
 use crate::matcher::{MatcherSet, Span};
-use crate::render::{prepare_line, prepare_plain, DEFAULT_MAX_RENDER_BYTES};
+use crate::render::{prepare_line_with_extra_spans, prepare_plain, DEFAULT_MAX_RENDER_BYTES};
 use crate::source::{Encoding, FileSource};
 use crate::viewport::{ScrollTo, Viewport};
 
@@ -26,6 +26,8 @@ pub struct RenderRow {
     pub line_filter: Option<usize>,
     /// 字段模式命中区间，坐标已经是 `text` 的字节偏移且落在 char 边界。
     pub spans: Vec<Span>,
+    /// 标题栏搜索命中区间，与过滤器结果和样式独立。
+    pub search_spans: Vec<Span>,
 }
 
 pub struct Document {
@@ -34,6 +36,9 @@ pub struct Document {
     matcher: Arc<MatcherSet>,
     /// `Some` = 已经跑过筛选；`None` = 还没筛过。
     matches: Option<Arc<Vec<u64>>>,
+    /// “仅显示筛选结果”模式实际展示的文件行。默认与 `matches` 相同，
+    /// UI 可在不改变过滤器结果的前提下合并独立搜索结果。
+    display_matches: Option<Arc<Vec<u64>>>,
     /// UI 的「仅显示筛选结果」开关。
     show_only_filtered: bool,
     viewport: Viewport,
@@ -50,6 +55,7 @@ impl Document {
             index,
             matcher: Arc::new(MatcherSet::empty()),
             matches: None,
+            display_matches: None,
             show_only_filtered: false,
             viewport: Viewport::new(line_height),
             max_render_bytes: DEFAULT_MAX_RENDER_BYTES,
@@ -70,6 +76,7 @@ impl Document {
         if self.encoding != enc {
             self.encoding = enc;
             self.matches = None;
+            self.display_matches = None;
             self.sync_viewport();
         }
     }
@@ -109,7 +116,7 @@ impl Document {
         self.matches.as_ref().map(|m| m.len())
     }
 
-    /// The complete set of file lines selected by the current filters/search.
+    /// The complete set of file lines selected by the configured filters.
     /// `None` means every line is visible (there is no active restriction, or
     /// the completed scan determined that all lines match).
     pub fn matched_lines(&self) -> Option<Arc<Vec<u64>>> {
@@ -131,7 +138,7 @@ impl Document {
     /// 真正生效的命中集：只有开了「仅显示筛选」且确实筛过，才用它。
     fn active_matches(&self) -> Option<&Arc<Vec<u64>>> {
         if self.show_only_filtered {
-            self.matches.as_ref()
+            self.display_matches.as_ref()
         } else {
             None
         }
@@ -153,6 +160,7 @@ impl Document {
         self.source = source;
         self.index = index;
         self.matches = None;
+        self.display_matches = None;
         self.sync_viewport();
         if follow_tail {
             self.viewport.scroll_to_bottom();
@@ -163,11 +171,20 @@ impl Document {
     pub fn set_matcher(&mut self, matcher: Arc<MatcherSet>) {
         self.matcher = matcher;
         self.matches = None;
+        self.display_matches = None;
         self.sync_viewport();
     }
 
     pub fn set_matches(&mut self, matches: Option<Arc<Vec<u64>>>) {
-        self.matches = matches;
+        self.matches = matches.clone();
+        self.display_matches = matches;
+        self.sync_viewport();
+    }
+
+    /// Override only the filtered main view's rows. The configured-filter
+    /// result returned by [`matched_lines`](Self::matched_lines) is unchanged.
+    pub fn set_display_matches(&mut self, matches: Option<Arc<Vec<u64>>>) {
+        self.display_matches = matches;
         self.sync_viewport();
     }
 
@@ -248,6 +265,13 @@ impl Document {
 
     /// 当前视口应该画的那些行。每帧调用。
     pub fn rows(&self) -> Vec<RenderRow> {
+        self.rows_with_search_highlighter(None)
+    }
+
+    pub fn rows_with_search_highlighter(
+        &self,
+        search_highlighter: Option<&MatcherSet>,
+    ) -> Vec<RenderRow> {
         let count = self.viewport.visible_rows();
         if count == 0 {
             return Vec::new();
@@ -256,6 +280,7 @@ impl Document {
         let mut out = Vec::with_capacity(count);
         let mut line_buf = Vec::with_capacity(count);
         let mut spans = Vec::new();
+        let mut search_spans = Vec::new();
 
         match self.active_matches() {
             // 筛选视图：命中行号是跳跃的，只能逐行定位
@@ -265,7 +290,14 @@ impl Document {
                     self.index
                         .line_spans(self.source.data(), file_line, 1, &mut line_buf);
                     if let Some(&(s, e)) = line_buf.first() {
-                        out.push(self.make_row(file_line, s, e, &mut spans));
+                        out.push(self.make_row(
+                            file_line,
+                            s,
+                            e,
+                            &mut spans,
+                            &mut search_spans,
+                            search_highlighter,
+                        ));
                     }
                 }
             }
@@ -274,14 +306,29 @@ impl Document {
                 self.index
                     .line_spans(self.source.data(), first, count, &mut line_buf);
                 for (i, &(s, e)) in line_buf.iter().enumerate() {
-                    out.push(self.make_row(first + i as u64, s, e, &mut spans));
+                    out.push(self.make_row(
+                        first + i as u64,
+                        s,
+                        e,
+                        &mut spans,
+                        &mut search_spans,
+                        search_highlighter,
+                    ));
                 }
             }
         }
         out
     }
 
-    fn make_row(&self, file_line: u64, start: u64, end: u64, spans: &mut Vec<Span>) -> RenderRow {
+    fn make_row(
+        &self,
+        file_line: u64,
+        start: u64,
+        end: u64,
+        spans: &mut Vec<Span>,
+        search_spans: &mut Vec<Span>,
+        search_highlighter: Option<&MatcherSet>,
+    ) -> RenderRow {
         let data = self.source.data();
         let mut s = start as usize;
         // 第一行的原始切片含 BOM，别把它画出来
@@ -291,7 +338,7 @@ impl Document {
         let raw = &data[s..end as usize];
         let enc = self.encoding;
 
-        if self.matcher.is_noop() {
+        if self.matcher.is_noop() && search_highlighter.is_none_or(MatcherSet::is_noop) {
             let line = prepare_plain(raw, enc, self.max_render_bytes);
             return RenderRow {
                 file_line,
@@ -299,17 +346,24 @@ impl Document {
                 truncated: line.truncated,
                 line_filter: None,
                 spans: Vec::new(),
+                search_spans: Vec::new(),
             };
         }
 
         let verdict = self.matcher.analyze(raw, spans);
-        let line = prepare_line(raw, enc, spans, self.max_render_bytes);
+        search_spans.clear();
+        if let Some(highlighter) = search_highlighter {
+            highlighter.analyze(raw, search_spans);
+        }
+        let line =
+            prepare_line_with_extra_spans(raw, enc, spans, search_spans, self.max_render_bytes);
         RenderRow {
             file_line,
             text: line.text,
             truncated: line.truncated,
             line_filter: verdict.line_filter,
             spans: std::mem::take(spans),
+            search_spans: std::mem::take(search_spans),
         }
     }
 }
@@ -424,6 +478,22 @@ mod tests {
     }
 
     #[test]
+    fn display_matches_can_include_search_rows_without_changing_filter_matches() {
+        let mut d = sample();
+        d.set_matches(Some(Arc::new(vec![10, 20])));
+        d.set_display_matches(Some(Arc::new(vec![3, 10, 20])));
+        d.set_show_only_filtered(true);
+
+        assert_eq!(d.match_count(), Some(2));
+        assert_eq!(d.matched_lines().unwrap().as_slice(), &[10, 20]);
+        assert_eq!(d.display_rows(), 3);
+        assert_eq!(
+            d.rows().iter().map(|row| row.file_line).collect::<Vec<_>>(),
+            vec![3, 10, 20]
+        );
+    }
+
+    #[test]
     fn toggling_filter_view_keeps_top_file_line() {
         let mut d = sample();
         set_filter(
@@ -514,6 +584,43 @@ mod tests {
             "TARGET"
         );
         assert!(rows[1].spans.is_empty(), "span 不该串到下一行");
+    }
+
+    #[test]
+    fn search_highlights_are_separate_from_filter_highlights() {
+        let mut d = sample();
+        set_filter(
+            &mut d,
+            FilterSpec {
+                text: "TARGET".into(),
+                mode: HighlightMode::Field,
+                ..Default::default()
+            },
+        );
+        let search = MatcherSet::new(
+            vec![FilterSpec {
+                text: "payload".into(),
+                mode: HighlightMode::Field,
+                ..Default::default()
+            }],
+            Encoding::Utf8,
+        )
+        .unwrap();
+
+        let rows = d.rows_with_search_highlighter(Some(&search));
+        assert_eq!(
+            &rows[0].text[rows[0].spans[0].start..rows[0].spans[0].end],
+            "TARGET"
+        );
+        assert_eq!(
+            &rows[0].text[rows[0].search_spans[0].start..rows[0].search_spans[0].end],
+            "payload"
+        );
+        assert!(rows[1].spans.is_empty());
+        assert_eq!(
+            &rows[1].text[rows[1].search_spans[0].start..rows[1].search_spans[0].end],
+            "payload"
+        );
     }
 
     #[test]

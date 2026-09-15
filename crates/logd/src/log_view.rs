@@ -24,7 +24,7 @@ use gpui_component::scroll::{AutoScroll, Scrollbar, ScrollbarHandle, ScrollbarMo
 use gpui_component::Sizable as _;
 use gpui_component::{GlobalState, Icon, IconName};
 use logd_core::{
-    cache, index::HEAD_BYTES, scan_all_with_temporary_query_and_counts_for_filters, scan_query_all,
+    cache, index::HEAD_BYTES, scan_all_with_query_and_counts_for_filters, scan_query_all,
     CompileOptions, Document, Encoding, FileSource, FilterScanResult, FilterSpec, LineIndex,
     MatcherSet, Progress, Query, RenderRow, ScanOutcome, ScrollTo,
 };
@@ -107,7 +107,6 @@ pub struct Loaded {
 struct RefreshScanSnapshot {
     matcher: Arc<MatcherSet>,
     query: Arc<Query>,
-    configured_filter_count: usize,
     multi_file_filter_mask: Arc<Vec<bool>>,
     matches: Option<Arc<Vec<u64>>>,
     filter_counts: Option<Arc<Vec<u64>>>,
@@ -137,10 +136,8 @@ pub struct LogView {
     filter_match_counts: Option<Arc<Vec<u64>>>,
     multi_file_filter_mask: Arc<Vec<bool>>,
     multi_file_filter_matches: Option<Arc<Vec<u64>>>,
-    /// Number of leading matcher entries supplied by the persisted filter
-    /// configuration; trailing entries are temporary title-bar filters.
-    configured_filter_count: usize,
     search_query: Arc<Query>,
+    search_highlighter: Arc<MatcherSet>,
     search_matches: Option<Arc<Vec<u64>>>,
     search_scanning: Option<Arc<Progress>>,
     search_result_flash: Option<(u64, u64)>,
@@ -266,6 +263,7 @@ impl LogView {
     ) -> Self {
         let complete = loaded.index.complete;
         let search_query = Arc::new(Query::always_true());
+        let search_highlighter = Arc::new(MatcherSet::empty());
         let area = Rc::new(Cell::new(Bounds::default()));
         let mut view = Self {
             doc: Document::new(loaded.source, loaded.index, theme::LINE_HEIGHT),
@@ -279,8 +277,8 @@ impl LogView {
             filter_match_counts: None,
             multi_file_filter_mask: Arc::new(Vec::new()),
             multi_file_filter_matches: None,
-            configured_filter_count: 0,
             search_query,
+            search_highlighter,
             search_matches: None,
             search_scanning: None,
             search_result_flash: None,
@@ -355,6 +353,33 @@ impl LogView {
 
     pub fn search_matches(&self) -> Option<Arc<Vec<u64>>> {
         self.search_matches.clone()
+    }
+
+    /// Rebuild only the main view's presentation set. Configured filters and
+    /// title-bar search retain separate scans and separate result ownership.
+    fn refresh_display_matches(&mut self) {
+        let filter_active = !self.doc.matcher().is_noop();
+        let search_active = !self.search_query.is_empty();
+        let filter_matches = self.doc.matched_lines();
+        let display_matches = match (filter_active, search_active) {
+            (false, false) => None,
+            (true, false) => filter_matches,
+            (false, true) => Some(
+                self.search_matches
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(Vec::new())),
+            ),
+            (true, true) => match (filter_matches, &self.search_matches) {
+                (Some(filtered), Some(searched)) => Some(Arc::new(union_sorted(
+                    filtered.as_slice(),
+                    searched.as_slice(),
+                ))),
+                (Some(filtered), None) => Some(filtered),
+                (None, Some(searched)) => Some(searched.clone()),
+                (None, None) => Some(Arc::new(Vec::new())),
+            },
+        };
+        self.doc.set_display_matches(display_matches);
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -480,7 +505,6 @@ impl LogView {
                         RefreshScanSnapshot {
                             matcher: this.doc.matcher().clone(),
                             query: this.search_query.clone(),
-                            configured_filter_count: this.configured_filter_count,
                             multi_file_filter_mask: this.multi_file_filter_mask.clone(),
                             matches: this.doc.matched_lines(),
                             filter_counts: this.filter_match_counts.clone(),
@@ -575,26 +599,39 @@ impl LogView {
                     }
                     this.indexing = None;
                     if let Ok(Some((source, index, results))) = refreshed {
-                        let scan_unchanged =
+                        let filters_unchanged =
                             Arc::ptr_eq(this.doc.matcher(), &scan_snapshot.matcher)
-                                && Arc::ptr_eq(&this.search_query, &scan_snapshot.query)
-                                && this.configured_filter_count
-                                    == scan_snapshot.configured_filter_count
                                 && Arc::ptr_eq(
                                     &this.multi_file_filter_mask,
                                     &scan_snapshot.multi_file_filter_mask,
                                 );
+                        let search_unchanged =
+                            Arc::ptr_eq(&this.search_query, &scan_snapshot.query);
                         this.doc.replace_source_and_index(source, index);
                         this.from_cache = false;
-                        if scan_unchanged {
-                            if let Some(results) = results {
-                                this.apply_incremental_refresh_results(results);
-                            } else {
-                                this.start_scan(cx);
-                                this.start_search_scan(cx);
-                            }
+                        let filter_results_ready = filters_unchanged && results.is_some();
+                        let search_results_ready = search_unchanged
+                            && (this.search_query.is_empty()
+                                || results
+                                    .as_ref()
+                                    .is_some_and(|results| results.search_matches.is_some()));
+
+                        if filter_results_ready {
+                            this.apply_incremental_filter_results(
+                                results.as_ref().expect("filter result was checked"),
+                            );
                         } else {
                             this.start_scan(cx);
+                        }
+                        if search_results_ready {
+                            if this.search_query.is_empty() {
+                                this.search_matches = None;
+                            } else {
+                                this.apply_incremental_search_results(
+                                    results.as_ref().expect("search result was checked"),
+                                );
+                            }
+                        } else {
                             this.start_search_scan(cx);
                         }
                     }
@@ -608,19 +645,18 @@ impl LogView {
         .detach();
     }
 
-    fn apply_incremental_refresh_results(&mut self, results: IncrementalRefreshResults) {
-        if let Some(progress) = self.scanning.take() {
-            progress.cancel();
-        }
-        if let Some(progress) = self.search_scanning.take() {
-            progress.cancel();
-        }
+    fn apply_incremental_filter_results(&mut self, results: &IncrementalRefreshResults) {
         self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.doc.set_matches(results.matches.clone());
+        self.filter_match_counts = Some(results.filter_counts.clone());
+        self.multi_file_filter_matches = results.selected_filter_lines.clone();
+        self.refresh_display_matches();
+    }
+
+    fn apply_incremental_search_results(&mut self, results: &IncrementalRefreshResults) {
         self.search_scan_gen = self.search_scan_gen.wrapping_add(1);
-        self.doc.set_matches(results.matches);
-        self.filter_match_counts = Some(results.filter_counts);
-        self.multi_file_filter_matches = results.selected_filter_lines;
-        self.search_matches = results.search_matches;
+        self.search_matches = results.search_matches.clone();
+        self.refresh_display_matches();
     }
 
     // ---- 筛选 ----
@@ -634,23 +670,14 @@ impl LogView {
     }
 
     /// 换一套过滤器。非活动标签页可以先 [`mark_dirty`]，切过去时再调这个。
-    pub fn apply_filters(
-        &mut self,
-        filters: Vec<FilterSpec>,
-        configured_filter_count: usize,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn apply_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
         self.dirty = false;
         self.filter_match_counts = None;
-        self.configured_filter_count = configured_filter_count.min(filters.len());
         self.multi_file_filter_mask = Arc::new(
             filters
                 .iter()
-                .enumerate()
-                .map(|(index, filter)| {
-                    index < configured_filter_count
-                        && filter.is_active()
-                        && filter.scope == logd_core::FilterScope::AllFiles
+                .map(|filter| {
+                    filter.is_active() && filter.scope == logd_core::FilterScope::AllFiles
                 })
                 .collect(),
         );
@@ -662,25 +689,13 @@ impl LogView {
                 self.selection = None;
                 self.selecting = false;
                 self.doc.set_matcher(Arc::new(m));
+                // Keep completed search hits visible while the independent
+                // configured-filter scan catches up.
+                self.refresh_display_matches();
                 self.start_scan(cx);
             }
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
-                cx.notify();
-            }
-        }
-    }
-
-    /// Replace presentation-only filter colors without rescanning the file.
-    pub fn restyle_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
-        match MatcherSet::new(filters, self.doc.encoding()) {
-            Ok(matcher) => {
-                self.error = None;
-                self.doc.set_matcher(Arc::new(matcher));
-                cx.notify();
-            }
-            Err(error) => {
-                self.error = Some(format!("{error:#}"));
                 cx.notify();
             }
         }
@@ -746,17 +761,22 @@ impl LogView {
         &mut self,
         enc: Encoding,
         filters: Vec<FilterSpec>,
-        configured_filter_count: usize,
         search_query: String,
+        search_keywords: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
-        self.apply_filters(filters, configured_filter_count, cx);
-        self.apply_search(search_query, cx);
+        self.apply_filters(filters, cx);
+        self.apply_search(search_query, search_keywords, cx);
     }
 
-    pub fn apply_search(&mut self, query_source: String, cx: &mut Context<Self>) {
+    pub fn apply_search(
+        &mut self,
+        query_source: String,
+        search_keywords: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         // Use the first structured log timestamp as the date context for
         // time-of-day queries. This keeps searches on logs with an explicit
         // year aligned with the same file's timestamps.
@@ -783,8 +803,23 @@ impl LogView {
         );
         match query {
             Ok(query) => {
+                let search_highlights = search_keywords
+                    .into_iter()
+                    .map(|text| FilterSpec {
+                        text,
+                        mode: logd_core::HighlightMode::Field,
+                        ..Default::default()
+                    })
+                    .collect();
+                match MatcherSet::new(search_highlights, self.doc.encoding()) {
+                    Ok(highlighter) => self.search_highlighter = Arc::new(highlighter),
+                    Err(error) => {
+                        self.error = Some(format!("{error:#}"));
+                        cx.notify();
+                        return;
+                    }
+                }
                 self.search_query = Arc::new(query);
-                self.start_scan(cx);
                 self.start_search_scan(cx);
             }
             Err(error) => {
@@ -801,21 +836,23 @@ impl LogView {
         }
         self.filter_match_counts = None;
         self.multi_file_filter_matches = None;
-        if self.doc.matcher().is_noop() && self.search_query.is_empty() {
+        // Invalidate callbacks from the previous filter scan even when the
+        // new matcher is a no-op and no replacement scan is needed.
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        if self.doc.matcher().is_noop() {
             self.filter_match_counts = Some(Arc::new(vec![0; self.doc.matcher().filters().len()]));
             self.doc.set_matches(None);
+            self.refresh_display_matches();
             cx.notify();
             return;
         }
 
-        self.scan_gen += 1;
         let gen = self.scan_gen;
         let source = self.doc.source().clone();
         let index = self.doc.index().clone();
         let matcher = self.doc.matcher().clone();
-        let configured_filter_count = self.configured_filter_count;
         let multi_file_filter_mask = self.multi_file_filter_mask.clone();
-        let query = self.search_query.clone();
+        let query = Query::always_true();
         let progress = Arc::new(Progress::new(index.indexed_bytes.max(1)));
         self.scanning = Some(progress.clone());
 
@@ -823,12 +860,11 @@ impl LogView {
             let out = cx
                 .background_executor()
                 .spawn(async move {
-                    scan_all_with_temporary_query_and_counts_for_filters(
+                    scan_all_with_query_and_counts_for_filters(
                         source.data(),
                         &index,
                         &matcher,
                         &query,
-                        configured_filter_count,
                         multi_file_filter_mask.as_slice(),
                         &progress,
                     )
@@ -855,6 +891,7 @@ impl LogView {
                             }
                             ScanOutcome::AllVisible => this.doc.set_matches(None),
                         }
+                        this.refresh_display_matches();
                     }
                     None => {} // 被取消
                 }
@@ -873,6 +910,7 @@ impl LogView {
             progress.cancel();
         }
         self.search_matches = None;
+        self.refresh_display_matches();
         self.search_scan_gen += 1;
         let generation = self.search_scan_gen;
         if self.search_query.is_empty() {
@@ -902,6 +940,7 @@ impl LogView {
                     Some(ScanOutcome::AllVisible) => this.search_matches = None,
                     None => {}
                 }
+                this.refresh_display_matches();
                 this.search_scanning = None;
                 cx.notify();
             })
@@ -1758,26 +1797,51 @@ impl LogView {
 
         if let Some(edited) = edited {
             content = content.child(edited.clone());
-        } else if row.spans.is_empty() {
+        } else if row.spans.is_empty() && row.search_spans.is_empty() {
             content = content.child(row.text.clone());
         } else {
-            let runs: Vec<(std::ops::Range<usize>, HighlightStyle)> = row
-                .spans
-                .iter()
-                .filter_map(|s| {
-                    let f = filters.get(s.filter)?;
-                    Some((
-                        s.start..s.end,
-                        HighlightStyle {
-                            color: f.fore.map(|c| Hsla::from(theme::c(c))),
-                            background_color: f.back.map(|c| Hsla::from(theme::c(c))),
-                            font_weight: f.bold.then_some(FontWeight::BOLD),
-                            font_style: f.italic.then_some(FontStyle::Italic),
-                            ..Default::default()
-                        },
-                    ))
-                })
-                .collect();
+            let mut runs = Vec::new();
+            for span in &row.spans {
+                let Some(filter) = filters.get(span.filter) else {
+                    continue;
+                };
+                let style = HighlightStyle {
+                    color: filter.fore.map(|color| Hsla::from(theme::c(color))),
+                    background_color: filter.back.map(|color| Hsla::from(theme::c(color))),
+                    font_weight: filter.bold.then_some(FontWeight::BOLD),
+                    font_style: filter.italic.then_some(FontStyle::Italic),
+                    ..Default::default()
+                };
+                let mut start = span.start;
+                for search in &row.search_spans {
+                    if search.end <= start {
+                        continue;
+                    }
+                    if search.start >= span.end {
+                        break;
+                    }
+                    if start < search.start {
+                        runs.push((start..search.start.min(span.end), style.clone()));
+                    }
+                    start = start.max(search.end);
+                    if start >= span.end {
+                        break;
+                    }
+                }
+                if start < span.end {
+                    runs.push((start..span.end, style));
+                }
+            }
+            runs.extend(row.search_spans.iter().map(|span| {
+                (
+                    span.start..span.end,
+                    HighlightStyle {
+                        color: Some(palette.search_foreground),
+                        ..Default::default()
+                    },
+                )
+            }));
+            runs.sort_unstable_by_key(|(range, _)| range.start);
             content = content.child(StyledText::new(row.text.clone()).with_highlights(runs));
         }
 
@@ -2143,7 +2207,9 @@ impl Render for LogView {
                 .viewport_mut()
                 .set_line_height(configured_line_height);
         }
-        let rows = self.doc.rows();
+        let rows = self
+            .doc
+            .rows_with_search_highlighter(Some(&self.search_highlighter));
         let editing_line = self.editing_line;
         let editing_text = editing_line
             .and_then(|file_line| self.line_inputs.get(&file_line))
@@ -2428,37 +2494,27 @@ fn incremental_refresh_results(
     refresh_line: u64,
     snapshot: &RefreshScanSnapshot,
 ) -> Option<IncrementalRefreshResults> {
-    let has_combined_filter = !snapshot.matcher.is_noop() || !snapshot.query.is_empty();
+    let has_filter = !snapshot.matcher.is_noop();
     let has_selected_filters = snapshot
         .multi_file_filter_mask
         .iter()
         .zip(snapshot.matcher.filters())
         .any(|(selected, filter)| *selected && !filter.excluding);
-    if snapshot.filter_counts.is_none()
-        || (has_combined_filter && snapshot.matches.is_none())
-        || (has_selected_filters && snapshot.selected_filter_lines.is_none())
-        || (!snapshot.query.is_empty() && snapshot.search_matches.is_none())
-    {
-        return None;
-    }
-
     let old_tail = old_index.suffix_from_line(refresh_line);
     let new_tail = new_index.suffix_from_line(refresh_line);
-    let old_tail_results = scan_all_with_temporary_query_and_counts_for_filters(
+    let old_tail_results = scan_all_with_query_and_counts_for_filters(
         old_source.data(),
         &old_tail,
         &snapshot.matcher,
-        &snapshot.query,
-        snapshot.configured_filter_count,
+        &Query::always_true(),
         snapshot.multi_file_filter_mask.as_slice(),
         &Progress::default(),
     )?;
-    let new_tail_results = scan_all_with_temporary_query_and_counts_for_filters(
+    let new_tail_results = scan_all_with_query_and_counts_for_filters(
         new_source.data(),
         &new_tail,
         &snapshot.matcher,
-        &snapshot.query,
-        snapshot.configured_filter_count,
+        &Query::always_true(),
         snapshot.multi_file_filter_mask.as_slice(),
         &Progress::default(),
     )?;
@@ -2472,7 +2528,7 @@ fn incremental_refresh_results(
         *total = total.saturating_sub(old_count).saturating_add(new_count);
     }
 
-    let matches = if has_combined_filter {
+    let matches = if has_filter {
         let ScanOutcome::Matched(tail) = new_tail_results.outcome else {
             return None;
         };
@@ -2530,6 +2586,38 @@ fn merge_refreshed_lines(previous: &[u64], refresh_line: u64, tail: Vec<u64>) ->
     merged
 }
 
+fn union_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() || j < right.len() {
+        match (left.get(i), right.get(j)) {
+            (Some(&a), Some(&b)) if a < b => {
+                out.push(a);
+                i += 1;
+            }
+            (Some(&a), Some(&b)) if b < a => {
+                out.push(b);
+                j += 1;
+            }
+            (Some(&a), Some(_)) => {
+                out.push(a);
+                i += 1;
+                j += 1;
+            }
+            (Some(&a), None) => {
+                out.push(a);
+                i += 1;
+            }
+            (None, Some(&b)) => {
+                out.push(b);
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
+
 fn next_char_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     if byte == text.len() {
@@ -2560,13 +2648,13 @@ mod tests {
     use std::sync::Arc;
 
     use logd_core::{
-        scan_all_with_temporary_query_and_counts_for_filters, FileSource, FilterSpec, LineIndex,
-        MatcherSet, Progress, Query, ScanOutcome,
+        scan_all_with_query_and_counts_for_filters, FileSource, FilterSpec, LineIndex, MatcherSet,
+        Progress, Query, ScanOutcome,
     };
 
     use super::{
-        incremental_refresh_results, merge_refreshed_lines, RefreshScanSnapshot, TextPoint,
-        TextSelection,
+        incremental_refresh_results, merge_refreshed_lines, union_sorted, RefreshScanSnapshot,
+        TextPoint, TextSelection,
     };
 
     fn selection(anchor: (u64, usize), active: (u64, usize)) -> TextSelection {
@@ -2618,6 +2706,16 @@ mod tests {
     }
 
     #[test]
+    fn union_sorted_merges_filter_and_search_rows_without_duplicates() {
+        assert_eq!(
+            union_sorted(&[1, 4, 9], &[0, 4, 7, 10]),
+            vec![0, 1, 4, 7, 9, 10]
+        );
+        assert_eq!(union_sorted(&[], &[2, 3]), vec![2, 3]);
+        assert_eq!(union_sorted(&[2, 3], &[]), vec![2, 3]);
+    }
+
+    #[test]
     fn incremental_refresh_updates_matches_and_filter_counts() {
         let directory = std::env::temp_dir().join(format!(
             "logd-refresh-{}-{:?}",
@@ -2642,12 +2740,11 @@ mod tests {
             .unwrap(),
         );
         let query = Arc::new(Query::always_true());
-        let initial = scan_all_with_temporary_query_and_counts_for_filters(
+        let initial = scan_all_with_query_and_counts_for_filters(
             old_source.data(),
             &old_index,
             &matcher,
-            &query,
-            1,
+            &Query::always_true(),
             &[true],
             &Progress::default(),
         )
@@ -2658,7 +2755,6 @@ mod tests {
         let snapshot = RefreshScanSnapshot {
             matcher,
             query,
-            configured_filter_count: 1,
             multi_file_filter_mask: Arc::new(vec![true]),
             matches: Some(Arc::new(initial_matches)),
             filter_counts: Some(Arc::new(initial.filter_counts)),
