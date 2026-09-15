@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use gpui_component::dock::{DockAreaState, DockPlacement};
 
 const FILTER_PLACEMENT_KEY: &str = "filter_placement";
+const FUZZY_SEARCH_KEY: &str = "fuzzy_search_enabled";
 const SETTINGS_FILE: &str = "settings.conf";
 const DOCK_LAYOUT_FILE: &str = "dock-layout.json";
 const RECENT_FILES_FILE: &str = "recent-files.json";
@@ -16,6 +17,48 @@ pub fn load_filter_placement() -> DockPlacement {
     read_cache_file(SETTINGS_FILE)
         .and_then(|contents| parse_filter_placement(&contents))
         .unwrap_or(DockPlacement::Right)
+}
+
+pub fn load_fuzzy_search_enabled() -> bool {
+    read_cache_file(SETTINGS_FILE)
+        .and_then(|contents| parse_bool_setting(&contents, FUZZY_SEARCH_KEY))
+        .unwrap_or(true)
+}
+
+pub fn save_fuzzy_search_enabled(enabled: bool) -> io::Result<()> {
+    let path = cache_file_path(SETTINGS_FILE).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "executable cache directory not found",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let existing = read_cache_file(SETTINGS_FILE).unwrap_or_default();
+    let setting = format!("{FUZZY_SEARCH_KEY}={enabled}");
+    let mut lines = Vec::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        if line
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == FUZZY_SEARCH_KEY)
+        {
+            if !replaced {
+                lines.push(setting.clone());
+                replaced = true;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(setting);
+    }
+    let mut contents = lines.join("\n");
+    contents.push('\n');
+    std::fs::write(path, contents)
 }
 
 pub fn load_dock_layout() -> Option<DockAreaState> {
@@ -143,6 +186,20 @@ fn parse_filter_placement(contents: &str) -> Option<DockPlacement> {
     })
 }
 
+fn parse_bool_setting(contents: &str, key: &str) -> Option<bool> {
+    contents.lines().find_map(|line| {
+        let (line_key, value) = line.split_once('=')?;
+        if line_key.trim() != key {
+            return None;
+        }
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
 fn parse_theme_name(contents: &str) -> Option<String> {
     let name = contents.trim();
     if name.is_empty() {
@@ -205,6 +262,19 @@ mod tests {
     fn ignores_unknown_filter_placement() {
         assert_eq!(parse_filter_placement("filter_placement=center\n"), None);
         assert_eq!(parse_filter_placement("broken\n"), None);
+    }
+
+    #[test]
+    fn parses_saved_fuzzy_search_setting() {
+        assert!(parse_bool_setting(
+            "filter_placement=left\nfuzzy_search_enabled=true\n",
+            FUZZY_SEARCH_KEY
+        ));
+        assert!(!parse_bool_setting("fuzzy_search_enabled=off\n", FUZZY_SEARCH_KEY).unwrap());
+        assert_eq!(
+            parse_bool_setting("fuzzy_search_enabled=unknown\n", FUZZY_SEARCH_KEY),
+            None
+        );
     }
 
     #[test]

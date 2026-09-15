@@ -75,7 +75,16 @@ pub fn hover_menu(
         menu: None,
         dismiss_subscription: None,
     });
-    if state.read(cx).menu.is_none() {
+    // Build the menu only when it is opened. Menu items can depend on current
+    // application state (for example, whether a log view exists); eagerly
+    // constructing them while the app is still empty leaves stale disabled
+    // items on the first hover.
+    if !open {
+        state.update(cx, |state, _| {
+            state.menu = None;
+            state.dismiss_subscription = None;
+        });
+    } else if state.read(cx).menu.is_none() {
         let menu = PopupMenu::build(window, cx, builder);
         let dismiss_callback = open_callback.clone();
         let menu_state = state.clone();
@@ -91,21 +100,15 @@ pub fn hover_menu(
             state.dismiss_subscription = Some(subscription);
         });
     }
-    let menu = state
-        .read(cx)
-        .menu
-        .clone()
-        .expect("hover menu state initializes its popup menu");
-    if open {
-        menu.focus_handle(cx).focus(window, cx);
-    }
+
+    let menu = state.read(cx).menu.clone();
 
     let hover_callback = Rc::new(on_hover);
     let trigger = trigger.on_hover(move |hovered, window, cx| {
         hover_callback(hovered, window, cx);
     });
     let menu_state = state.clone();
-    Popover::new(popover_id)
+    let mut popover = Popover::new(popover_id)
         .trigger(trigger)
         .open(open)
         .appearance(false)
@@ -121,10 +124,13 @@ pub fn hover_menu(
                 });
             }
             open_callback(is_open, window, cx);
-        })
-        .track_focus(&menu.focus_handle(cx))
-        .content(move |_, _, _| menu.clone())
-        .into_any_element()
+        });
+    if let Some(menu) = menu {
+        popover = popover
+            .track_focus(&menu.focus_handle(cx))
+            .content(move |_, _, _| menu.clone());
+    }
+    popover.into_any_element()
 }
 
 pub fn app_icon() -> impl IntoElement {

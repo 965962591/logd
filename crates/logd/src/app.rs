@@ -376,6 +376,7 @@ impl LogdApp {
     pub fn new(initial: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let language = Language::from_env();
         let search_history = crate::settings::load_search_history();
+        let fuzzy_search_enabled = crate::settings::load_fuzzy_search_enabled();
         let keyword = cx.new(|cx| {
             InputState::new(window, cx).placeholder(text(Key::SearchPlaceholder, language))
         });
@@ -568,7 +569,7 @@ impl LogdApp {
             filters: Vec::new(),
             search_query: String::new(),
             search_keywords: Vec::new(),
-            fuzzy_search_enabled: true,
+            fuzzy_search_enabled,
             title_menu_open: None,
             show_only_filtered: false,
             tat_path: None,
@@ -1457,6 +1458,7 @@ impl LogdApp {
             return;
         }
         self.fuzzy_search_enabled = enabled;
+        let _ = crate::settings::save_fuzzy_search_enabled(enabled);
         let search_views = self
             .tabs
             .iter()
