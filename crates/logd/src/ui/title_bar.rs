@@ -1,10 +1,13 @@
 //! VS Code-style client title bar.
 
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::PopupMenu;
+use gpui_component::popover::Popover;
 use gpui_component::{
     h_flex, Disableable as _, Icon, IconName, InteractiveElementExt as _, Sizable as _,
 };
@@ -46,6 +49,83 @@ const MARK_FILLED_SVG: &[u8] = include_bytes!(concat!(
 
 static APP_ICON: LazyLock<Arc<Image>> =
     LazyLock::new(|| Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON_BYTES.to_vec())));
+
+struct HoverMenuState {
+    menu: Option<Entity<PopupMenu>>,
+    dismiss_subscription: Option<Subscription>,
+}
+
+/// Add a click/hover-open dropdown to a title-bar menu button. The popup menu
+/// entity is retained across renders so submenu selection and keyboard focus
+/// are not reset by app notifications.
+pub fn hover_menu(
+    id: &'static str,
+    trigger: Button,
+    open: bool,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_open_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let open_callback = Rc::new(on_open_change);
+    let state_id: ElementId = format!("title-hover-menu-state:{id}").into();
+    let popover_id: ElementId = format!("title-hover-menu:{id}").into();
+    let state = window.use_keyed_state(state_id.clone(), cx, |_, _| HoverMenuState {
+        menu: None,
+        dismiss_subscription: None,
+    });
+    if state.read(cx).menu.is_none() {
+        let menu = PopupMenu::build(window, cx, builder);
+        let dismiss_callback = open_callback.clone();
+        let menu_state = state.clone();
+        let subscription = window.subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+            menu_state.update(cx, |state, _| {
+                state.menu = None;
+                state.dismiss_subscription = None;
+            });
+            dismiss_callback(&false, window, cx);
+        });
+        state.update(cx, |state, _| {
+            state.menu = Some(menu);
+            state.dismiss_subscription = Some(subscription);
+        });
+    }
+    let menu = state
+        .read(cx)
+        .menu
+        .clone()
+        .expect("hover menu state initializes its popup menu");
+    if open {
+        menu.focus_handle(cx).focus(window, cx);
+    }
+
+    let hover_callback = Rc::new(on_hover);
+    let trigger = trigger.on_hover(move |hovered, window, cx| {
+        hover_callback(hovered, window, cx);
+    });
+    let menu_state = state.clone();
+    Popover::new(popover_id)
+        .trigger(trigger)
+        .open(open)
+        .appearance(false)
+        // PopupMenu owns outside-click handling. Its submenus are rendered
+        // in a deferred layer, so Popover must not treat them as outside
+        // content and dismiss the menu before their click reaches the item.
+        .overlay_closable(false)
+        .on_open_change(move |is_open, window, cx| {
+            if !*is_open {
+                menu_state.update(cx, |state, _| {
+                    state.menu = None;
+                    state.dismiss_subscription = None;
+                });
+            }
+            open_callback(is_open, window, cx);
+        })
+        .track_focus(&menu.focus_handle(cx))
+        .content(move |_, _, _| menu.clone())
+        .into_any_element()
+}
 
 pub fn app_icon() -> impl IntoElement {
     img(APP_ICON.clone()).size(px(20.)).flex_none()

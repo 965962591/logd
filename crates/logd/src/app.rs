@@ -23,7 +23,7 @@ use gpui_component::dock::{
 };
 use gpui_component::input::{Enter, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_component::link::Link;
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::tab::{Tab as UiTab, TabBar};
@@ -172,14 +172,19 @@ impl UpdateDialog {
 impl Render for UpdateDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let language = self.language;
-        let check = cx.entity().clone();
-        let download = cx.entity().clone();
-        let (status_text, progress, can_download) = match &self.status {
-            UpdateStatus::Idle => (text(Key::UpdateIdle, language).to_string(), None, false),
+        let update = cx.entity().clone();
+        let (status_text, progress, action_label, action_disabled) = match &self.status {
+            UpdateStatus::Idle => (
+                text(Key::UpdateIdle, language).to_string(),
+                None,
+                Key::CheckForUpdates,
+                false,
+            ),
             UpdateStatus::Checking => (
                 text(Key::CheckingForUpdates, language).to_string(),
                 None,
-                false,
+                Key::CheckForUpdates,
+                true,
             ),
             UpdateStatus::Available(release) => (
                 format!(
@@ -188,7 +193,8 @@ impl Render for UpdateDialog {
                     release.version
                 ),
                 None,
-                true,
+                Key::InstallUpdate,
+                false,
             ),
             UpdateStatus::Downloading {
                 version,
@@ -210,69 +216,63 @@ impl Render for UpdateDialog {
                         format_download_size(*total),
                     ),
                     Some(percent),
-                    false,
+                    Key::InstallUpdate,
+                    true,
                 )
             }
             UpdateStatus::UpToDate => (
                 text(Key::AlreadyUpToDate, language).to_string(),
                 None,
+                Key::CheckForUpdates,
                 false,
             ),
             UpdateStatus::Error(error) => (
                 format!("{}: {}", text(Key::UpdateFailed, language), error),
                 None,
+                Key::CheckForUpdates,
                 false,
             ),
-            UpdateStatus::Restarting => (text(Key::Restarting, language).to_string(), None, false),
+            UpdateStatus::Restarting => (
+                text(Key::Restarting, language).to_string(),
+                None,
+                Key::InstallUpdate,
+                true,
+            ),
         };
         let mut content = v_flex().gap_2().child(status_text);
         if let Some(value) = progress {
             content = content.child(Progress::new("update-progress").value(value).w_full());
         }
         content.child(
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("check-update")
-                        .label(text(Key::CheckForUpdates, language))
-                        .disabled(matches!(
-                            self.status,
-                            UpdateStatus::Checking
-                                | UpdateStatus::Downloading { .. }
-                                | UpdateStatus::Restarting
-                        ))
-                        .on_click(move |_, _, cx| {
-                            check.update(cx, |this, cx| {
-                                this.check();
-                                cx.notify();
-                            });
-                        }),
-                )
-                .child(
-                    Button::new("download-update")
-                        .primary()
-                        .label(text(Key::InstallUpdate, language))
-                        .disabled(!can_download)
-                        .on_click(move |_, _, cx| {
-                            download.update(cx, |this, cx| {
+            h_flex().gap_2().child(
+                Button::new("update-action")
+                    .primary()
+                    .label(text(action_label, language))
+                    .disabled(action_disabled)
+                    .on_click(move |_, _, cx| {
+                        update.update(cx, |this, cx| {
+                            if matches!(this.status, UpdateStatus::Available(_)) {
                                 this.download();
-                                cx.notify();
-                            });
-                        }),
-                ), // .child(
-                   //     Button::new("close-about")
-                   //         .label(text(Key::Close, language))
-                   //         .disabled(matches!(
-                   //             self.status,
-                   //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
-                   //         ))
-                   //         .on_click(window.listener_for(
-                   //             &close,
-                   //             |_: &mut UpdateDialog, _, window, cx| {
-                   //                 window.close_dialog(cx);
-                   //             },
-                   //         )),
-                   // ),
+                            } else {
+                                this.check();
+                            }
+                            cx.notify();
+                        });
+                    }),
+            ), // .child(
+               //     Button::new("close-about")
+               //         .label(text(Key::Close, language))
+               //         .disabled(matches!(
+               //             self.status,
+               //             UpdateStatus::Downloading { .. } | UpdateStatus::Restarting
+               //         ))
+               //         .on_click(window.listener_for(
+               //             &close,
+               //             |_: &mut UpdateDialog, _, window, cx| {
+               //                 window.close_dialog(cx);
+               //             },
+               //         )),
+               // ),
         )
     }
 }
@@ -328,6 +328,7 @@ pub struct LogdApp {
     filters: Vec<FilterSpec>,
     search_query: String,
     search_keywords: Vec<String>,
+    title_menu_open: Option<Key>,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
     saved_filters: Vec<FilterSpec>,
@@ -565,6 +566,7 @@ impl LogdApp {
             filters: Vec::new(),
             search_query: String::new(),
             search_keywords: Vec::new(),
+            title_menu_open: None,
             show_only_filtered: false,
             tat_path: None,
             saved_filters: Vec::new(),
@@ -2094,6 +2096,7 @@ impl LogdApp {
     }
 
     fn dispatch(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
+        self.title_menu_open = None;
         match command {
             MenuCommand::Open => self.prompt_open(window, cx),
             MenuCommand::OpenRecent(path) => self.open_path(&path, window, cx),
@@ -2172,10 +2175,59 @@ impl LogdApp {
         cx.stop_propagation();
     }
 
+    fn title_menu(
+        &self,
+        command_group: Key,
+        button: Button,
+        builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = match command_group {
+            Key::File => "menu-file",
+            Key::View => "menu-view",
+            Key::Encoding => "menu-encoding",
+            _ => "menu-filters",
+        };
+        let app = cx.entity();
+        let hover_app = app.clone();
+        let open_app = app.clone();
+        let open = self.title_menu_open == Some(command_group);
+        title_bar::hover_menu(
+            id,
+            button,
+            open,
+            move |hovered, window, cx| {
+                if *hovered {
+                    hover_app.update(cx, |this, cx| {
+                        if this.title_menu_open != Some(command_group) {
+                            this.title_menu_open = Some(command_group);
+                            cx.notify();
+                        }
+                    });
+                }
+                let _ = window;
+            },
+            move |is_open, _window, cx| {
+                open_app.update(cx, |this, cx| {
+                    if *is_open {
+                        this.title_menu_open = Some(command_group);
+                    } else if this.title_menu_open == Some(command_group) {
+                        this.title_menu_open = None;
+                    }
+                    cx.notify();
+                });
+            },
+            builder,
+            window,
+            cx,
+        )
+    }
+
     fn menu_button(
         &self,
         command_group: Key,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = theme::palette(cx);
@@ -2215,8 +2267,10 @@ impl LogdApp {
             .label(text(command_group, lang));
 
         match command_group {
-            Key::File => button
-                .dropdown_menu(move |menu, window, cx| {
+            Key::File => self.title_menu(
+                command_group,
+                button,
+                move |menu, window, cx| {
                     let open_app = app.clone();
                     let refresh_app = app.clone();
                     let export_app = app.clone();
@@ -2323,10 +2377,14 @@ impl LogdApp {
                             )
                         },
                     )
-                })
-                .into_any_element(),
-            Key::View => button
-                .dropdown_menu(move |menu, window, cx| {
+                },
+                window,
+                cx,
+            ),
+            Key::View => self.title_menu(
+                command_group,
+                button,
+                move |menu, window, cx| {
                     let language_app = app.clone();
                     let copy_app = app.clone();
                     let menu = menu.item(
@@ -2408,10 +2466,14 @@ impl LogdApp {
                             })
                         },
                     )
-                })
-                .into_any_element(),
-            Key::Encoding => button
-                .dropdown_menu(move |menu, window, _| {
+                },
+                window,
+                cx,
+            ),
+            Key::Encoding => self.title_menu(
+                command_group,
+                button,
+                move |menu, window, _| {
                     Encoding::ALL
                         .iter()
                         .copied()
@@ -2433,10 +2495,14 @@ impl LogdApp {
                                     )),
                             )
                         })
-                })
-                .into_any_element(),
-            _ => button
-                .dropdown_menu(move |menu, window, _| {
+                },
+                window,
+                cx,
+            ),
+            _ => self.title_menu(
+                command_group,
+                button,
+                move |menu, window, _| {
                     let add_app = app.clone();
                     let edit_app = app.clone();
                     let delete_app = app.clone();
@@ -2474,8 +2540,10 @@ impl LogdApp {
                             }),
                         ),
                     )
-                })
-                .into_any_element(),
+                },
+                window,
+                cx,
+            ),
         }
     }
 

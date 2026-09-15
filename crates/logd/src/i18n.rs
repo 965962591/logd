@@ -31,7 +31,7 @@ impl Language {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     File,
     Open,
