@@ -763,18 +763,20 @@ impl LogView {
         filters: Vec<FilterSpec>,
         search_query: String,
         search_keywords: Vec<String>,
+        fuzzy_search_enabled: bool,
         cx: &mut Context<Self>,
     ) {
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
         self.apply_filters(filters, cx);
-        self.apply_search(search_query, search_keywords, cx);
+        self.apply_search(search_query, search_keywords, fuzzy_search_enabled, cx);
     }
 
     pub fn apply_search(
         &mut self,
         query_source: String,
         search_keywords: Vec<String>,
+        fuzzy_search_enabled: bool,
         cx: &mut Context<Self>,
     ) {
         // Use the first structured log timestamp as the date context for
@@ -797,7 +799,7 @@ impl LogView {
             CompileOptions {
                 base_date,
                 encoding: Some(self.doc.encoding()),
-                fuzzy_text: true,
+                fuzzy_text: fuzzy_search_enabled,
                 ..Default::default()
             },
         );

@@ -993,6 +993,16 @@ mod tests {
     }
 
     #[test]
+    fn exact_text_is_case_insensitive_and_preserves_spaces() {
+        let query = Query::parse(r#""MAGIC: 42""#, CompileOptions::default()).unwrap();
+        assert!(hit(&query, LINE_D));
+        assert!(!hit(
+            &query,
+            "01-02 03:04:05.678  1234  5678 D AeAlgo  : MAGIC:42"
+        ));
+    }
+
+    #[test]
     fn case_insensitive_by_default() {
         assert!(hit(&q("magic"), LINE_D));
         let cs = Query::parse(

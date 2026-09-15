@@ -313,6 +313,7 @@ enum MenuCommand {
     SetEncoding(Encoding),
     SetTheme(SharedString),
     CopySelection,
+    ToggleFuzzySearch,
     ToggleFilters,
     ToggleSearchResults,
     AddFilter,
@@ -328,6 +329,7 @@ pub struct LogdApp {
     filters: Vec<FilterSpec>,
     search_query: String,
     search_keywords: Vec<String>,
+    fuzzy_search_enabled: bool,
     title_menu_open: Option<Key>,
     show_only_filtered: bool,
     tat_path: Option<PathBuf>,
@@ -566,6 +568,7 @@ impl LogdApp {
             filters: Vec::new(),
             search_query: String::new(),
             search_keywords: Vec::new(),
+            fuzzy_search_enabled: true,
             title_menu_open: None,
             show_only_filtered: false,
             tat_path: None,
@@ -1100,7 +1103,8 @@ impl LogdApp {
     fn apply_search_to_view(&self, view: &Entity<LogView>, cx: &mut App) {
         let query = self.search_query.clone();
         let keywords = self.search_keywords.clone();
-        view.update(cx, |view, cx| view.apply_search(query, keywords, cx));
+        let fuzzy = self.fuzzy_search_enabled;
+        view.update(cx, |view, cx| view.apply_search(query, keywords, fuzzy, cx));
     }
 
     fn has_multi_file_filter_results(&self) -> bool {
@@ -1448,6 +1452,26 @@ impl LogdApp {
         cx.notify();
     }
 
+    fn set_fuzzy_search_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.fuzzy_search_enabled == enabled {
+            return;
+        }
+        self.fuzzy_search_enabled = enabled;
+        let search_views = self
+            .tabs
+            .iter()
+            .map(|tab| tab.view.clone())
+            .collect::<Vec<_>>();
+        for view in search_views {
+            self.apply_search_to_view(&view, cx);
+        }
+        self.search_results_panel.update(cx, |panel, cx| {
+            panel.reset_scroll();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     pub(crate) fn begin_add_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter_editor_open = true;
         self.editing_filter = None;
@@ -1595,10 +1619,18 @@ impl LogdApp {
         let filters = self.filters_for_tab(self.active);
         let search_query = self.search_query.clone();
         let search_keywords = self.search_keywords.clone();
+        let fuzzy_search_enabled = self.fuzzy_search_enabled;
         let source = view.read(cx).doc().source().clone();
         let path = self.tabs[self.active].path.clone();
         view.update(cx, |view, cx| {
-            view.set_encoding(encoding, filters, search_query, search_keywords, cx)
+            view.set_encoding(
+                encoding,
+                filters,
+                search_query,
+                search_keywords,
+                fuzzy_search_enabled,
+                cx,
+            )
         });
         self.tabs[self.active].field_catalog = Arc::new(FieldCatalog::default());
         self.build_field_catalog(path, source, encoding, window, cx);
@@ -2121,6 +2153,9 @@ impl LogdApp {
                     view.update(cx, |view, cx| view.copy_selection(cx));
                 }
             }
+            MenuCommand::ToggleFuzzySearch => {
+                self.set_fuzzy_search_enabled(!self.fuzzy_search_enabled, cx)
+            }
             MenuCommand::ToggleFilters => {
                 let visible = self.filter_panel.read(cx).visible();
                 self.show_filter_panel(!visible, window, cx)
@@ -2242,6 +2277,7 @@ impl LogdApp {
         let active_encoding = self
             .active_view()
             .map(|view| view.read(cx).doc().encoding());
+        let fuzzy_search_enabled = self.fuzzy_search_enabled;
         let active_theme = cx.theme().theme_name().clone();
         let themes = theme::available_themes(cx);
         let light_themes = themes
@@ -2276,6 +2312,7 @@ impl LogdApp {
                     let export_app = app.clone();
                     let save_copy_app = app.clone();
                     let clear_live_log_app = app.clone();
+                    let fuzzy_search_app = app.clone();
                     let menu = menu
                         .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
                             window.listener_for(&open_app, |this, _, window, cx| {
@@ -2303,6 +2340,16 @@ impl LogdApp {
                                     this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
                                 }),
                             ),
+                        )
+                        .item(
+                            PopupMenuItem::new(text(Key::FuzzySearch, lang))
+                                .checked(fuzzy_search_enabled)
+                                .on_click(window.listener_for(
+                                    &fuzzy_search_app,
+                                    |this, _, window, cx| {
+                                        this.dispatch(MenuCommand::ToggleFuzzySearch, window, cx)
+                                    },
+                                )),
                         )
                         .separator()
                         .item(
