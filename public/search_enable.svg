@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 内层：实心圆 -->
+  <circle cx="12" cy="12" r="3" fill="#1976D2" />
+  <!-- 中层：主色描边 -->
+  <circle cx="12" cy="12" r="7" stroke="#1976D2" stroke-width="2" />
+  <!-- 外层：浅色描边（MUI 主色的浅色变体） -->
+  <circle cx="12" cy="12" r="11" stroke="#90CAF9" stroke-width="2" />
+</svg>

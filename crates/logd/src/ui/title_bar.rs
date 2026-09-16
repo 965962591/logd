@@ -30,6 +30,14 @@ const APP_ICON_BYTES: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/2.png"));
 const REGEX_TABLE_SVG: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../public/re.svg"));
+const SEARCH_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../public/search.svg"
+));
+const SEARCH_ENABLE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../public/search_enable.svg"
+));
 const CAPTURE_START_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../public/capture-start.svg"
@@ -49,6 +57,12 @@ const MARK_FILLED_SVG: &[u8] = include_bytes!(concat!(
 
 static APP_ICON: LazyLock<Arc<Image>> =
     LazyLock::new(|| Arc::new(Image::from_bytes(ImageFormat::Png, APP_ICON_BYTES.to_vec())));
+static SEARCH_ENABLE_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Svg,
+        SEARCH_ENABLE_SVG.to_vec(),
+    ))
+});
 
 struct HoverMenuState {
     menu: Option<Entity<PopupMenu>>,
@@ -175,6 +189,33 @@ pub fn regex_table_toggle(
         .small()
         .ghost()
         .toggled(open)
+        .tab_stop(false)
+        .tooltip(tooltip)
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            action(event, window, cx);
+        })
+}
+
+pub fn fuzzy_search_toggle(
+    enabled: bool,
+    tooltip: impl Into<SharedString>,
+    palette: theme::Palette,
+    action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let icon = if enabled {
+        img(SEARCH_ENABLE_ICON.clone())
+            .size(px(14.))
+            .flex_none()
+            .into_any_element()
+    } else {
+        inline_icon(SEARCH_SVG, palette).into_any_element()
+    };
+    Button::new("title-toggle-fuzzy-search")
+        .children(vec![icon])
+        .small()
+        .ghost()
+        .toggled(enabled)
         .tab_stop(false)
         .tooltip(tooltip)
         .on_click(move |event, window, cx| {

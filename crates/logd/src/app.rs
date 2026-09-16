@@ -2279,7 +2279,6 @@ impl LogdApp {
         let active_encoding = self
             .active_view()
             .map(|view| view.read(cx).doc().encoding());
-        let fuzzy_search_enabled = self.fuzzy_search_enabled;
         let active_theme = cx.theme().theme_name().clone();
         let themes = theme::available_themes(cx);
         let light_themes = themes
@@ -2314,7 +2313,6 @@ impl LogdApp {
                     let export_app = app.clone();
                     let save_copy_app = app.clone();
                     let clear_live_log_app = app.clone();
-                    let fuzzy_search_app = app.clone();
                     let menu = menu
                         .item(PopupMenuItem::new(text(Key::Open, lang)).on_click(
                             window.listener_for(&open_app, |this, _, window, cx| {
@@ -2342,16 +2340,6 @@ impl LogdApp {
                                     this.dispatch(MenuCommand::SaveEditedCopy, window, cx)
                                 }),
                             ),
-                        )
-                        .item(
-                            PopupMenuItem::new(text(Key::FuzzySearch, lang))
-                                .checked(fuzzy_search_enabled)
-                                .on_click(window.listener_for(
-                                    &fuzzy_search_app,
-                                    |this, _, window, cx| {
-                                        this.dispatch(MenuCommand::ToggleFuzzySearch, window, cx)
-                                    },
-                                )),
                         )
                         .separator()
                         .item(
@@ -2760,6 +2748,8 @@ impl LogdApp {
             .into_any_element();
         let clear_app = app.clone();
         let search_input_app = app.clone();
+        let fuzzy_toggle_app = app.clone();
+        let fuzzy_search_enabled = self.fuzzy_search_enabled;
         let search_history_combo = Combobox::new(&search_history_select)
             .small()
             .w_full()
@@ -2767,11 +2757,22 @@ impl LogdApp {
             .appearance(false)
             .menu_max_h(px(320.))
             .render_trigger(move |_, window, _| {
+                let fuzzy_toggle_app = fuzzy_toggle_app.clone();
                 h_flex()
                     .w_full()
                     .h_full()
                     .min_w_0()
                     .items_center()
+                    .child(title_bar::fuzzy_search_toggle(
+                        fuzzy_search_enabled,
+                        text(Key::FuzzySearch, lang),
+                        palette,
+                        move |_, window, cx| {
+                            fuzzy_toggle_app.update(cx, |this, cx| {
+                                this.dispatch(MenuCommand::ToggleFuzzySearch, window, cx)
+                            });
+                        },
+                    ))
                     .child(
                         div()
                             .id("search-keyword-input")

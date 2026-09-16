@@ -266,11 +266,14 @@ mod tests {
 
     #[test]
     fn parses_saved_fuzzy_search_setting() {
-        assert!(parse_bool_setting(
-            "filter_placement=left\nfuzzy_search_enabled=true\n",
-            FUZZY_SEARCH_KEY
-        ));
-        assert!(!parse_bool_setting("fuzzy_search_enabled=off\n", FUZZY_SEARCH_KEY).unwrap());
+        assert_eq!(
+            parse_bool_setting("filter_placement=left\nfuzzy_search_enabled=true\n", FUZZY_SEARCH_KEY),
+            Some(true)
+        );
+        assert_eq!(
+            parse_bool_setting("fuzzy_search_enabled=off\n", FUZZY_SEARCH_KEY),
+            Some(false)
+        );
         assert_eq!(
             parse_bool_setting("fuzzy_search_enabled=unknown\n", FUZZY_SEARCH_KEY),
             None

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 内层：变为空心，使用灰色 -->
+  <circle cx="12" cy="12" r="3" stroke="#BDBDBD" stroke-width="2" />
+  <!-- 中层：灰色描边 -->
+  <circle cx="12" cy="12" r="7" stroke="#BDBDBD" stroke-width="2" />
+  <!-- 外层：更浅的灰色描边（或降低透明度） -->
+  <circle cx="12" cy="12" r="11" stroke="#E0E0E0" stroke-width="2" />
+</svg>
