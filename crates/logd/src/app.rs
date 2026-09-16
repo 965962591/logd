@@ -28,8 +28,8 @@ use gpui_component::progress::Progress;
 use gpui_component::scroll::{ScrollableElement, Scrollbar, ScrollbarMode};
 use gpui_component::tab::{Tab as UiTab, TabBar};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, InteractiveElementExt as _,
-    Root, Selectable as _, Sizable, WindowExt as _,
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName,
+    InteractiveElementExt as _, Root, Selectable as _, Sizable, WindowExt as _,
 };
 use logd_core::{
     fuzzy_score, Encoding, FieldCatalog, FilterScope, FilterSpec, HighlightMode, LogdFile, Query,
@@ -3216,6 +3216,7 @@ impl LogdApp {
 
     pub fn render_filters(
         app: &Entity<Self>,
+        columns: u16,
         window: &mut Window,
         cx: &mut Context<FilterPanel>,
     ) -> AnyElement {
@@ -3259,6 +3260,7 @@ impl LogdApp {
         let reset_fore_app = app.clone();
         let reset_back_app = app.clone();
         let bold_app = app.clone();
+        let filter_panel = cx.entity().downgrade();
 
         v_flex()
             .size_full()
@@ -3481,10 +3483,22 @@ impl LogdApp {
                 )
             })
             .child(
-                v_flex()
+                div()
                     .id("filter-list")
                     .flex_1()
+                    .min_h_0()
+                    .grid()
+                    .grid_cols(columns)
+                    .content_start()
+                    .items_start()
                     .overflow_y_scrollbar()
+                    .on_prepaint(move |bounds, _, cx| {
+                        filter_panel
+                            .update(cx, |panel, cx| {
+                                panel.observe_content_width(bounds.size.width, cx)
+                            })
+                            .ok();
+                    })
                     .children(filters.iter().enumerate().map(|(index, filter)| {
                         render_filter_row(
                             app,
@@ -3979,7 +3993,11 @@ fn render_filter_row(
     let context_app = app.clone();
     h_flex()
         .id(("filter-row", index))
-        .min_h(px(28.))
+        .w_full()
+        .min_w_0()
+        .max_w_full()
+        .h(px(40.))
+        .max_h(px(40.))
         .px_2()
         .gap_2()
         .items_center()
@@ -4153,6 +4171,7 @@ fn render_filter_row(
                         .max_w_full()
                         .self_start()
                         .overflow_hidden()
+                        .whitespace_nowrap()
                         .text_ellipsis()
                         .px_1()
                         .when_some(filter.fore, |preview, color| {
@@ -4166,6 +4185,10 @@ fn render_filter_row(
                 .when(!filter.description.is_empty(), |item| {
                     item.child(
                         div()
+                            .max_w_full()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_size(px(10.))
                             .text_color(palette.muted)
                             .child(filter.description.clone()),

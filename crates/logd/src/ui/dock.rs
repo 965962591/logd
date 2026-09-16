@@ -34,6 +34,7 @@ pub const FILTER_PANEL: &str = "logd.filters";
 pub const SEARCH_RESULTS_PANEL: &str = "logd.search-results";
 pub const REGEX_TABLE_PANEL: &str = "logd.regex-table";
 pub const MARK_PANEL: &str = "logd.marks";
+const FILTER_COLUMN_WIDTH: f32 = 360.;
 const EXPORT_ICON: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../public/export.svg"
@@ -473,6 +474,11 @@ pub struct FilterPanel {
     app: WeakEntity<LogdApp>,
     focus: FocusHandle,
     visible: bool,
+    columns: u16,
+}
+
+fn filter_column_count(width: f32) -> u16 {
+    (width / FILTER_COLUMN_WIDTH).floor().max(1.) as u16
 }
 
 impl FilterPanel {
@@ -484,6 +490,7 @@ impl FilterPanel {
             app,
             focus: cx.focus_handle(),
             visible: true,
+            columns: 1,
         }
     }
 
@@ -494,6 +501,14 @@ impl FilterPanel {
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible != visible {
             self.visible = visible;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn observe_content_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        let columns = filter_column_count(width.as_f32());
+        if self.columns != columns {
+            self.columns = columns;
             cx.notify();
         }
     }
@@ -620,7 +635,7 @@ impl Render for FilterPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.app
             .upgrade()
-            .map(|app| LogdApp::render_filters(&app, window, cx))
+            .map(|app| LogdApp::render_filters(&app, self.columns, window, cx))
             .unwrap_or_else(|| div().into_any_element())
     }
 }
@@ -1908,7 +1923,7 @@ impl Render for SearchResultsPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{restored_visibility, visibility_state, FILTER_PANEL};
+    use super::{filter_column_count, restored_visibility, visibility_state, FILTER_PANEL};
     use gpui_component::dock::PanelState;
 
     #[test]
@@ -1921,5 +1936,13 @@ mod tests {
             assert_eq!(restored.panel_name, FILTER_PANEL);
             assert_eq!(restored_visibility(&restored.info), Some(visible));
         }
+    }
+
+    #[test]
+    fn filter_columns_follow_available_width() {
+        assert_eq!(filter_column_count(359.), 1);
+        assert_eq!(filter_column_count(720.), 2);
+        assert_eq!(filter_column_count(960.), 2);
+        assert_eq!(filter_column_count(1_080.), 3);
     }
 }
