@@ -3544,8 +3544,10 @@ impl LogdApp {
                             };
                             let toggle_group = group_name.clone();
                             let drop_group = group_name.clone();
+                            let content_drop_group = group_name.clone();
                             let toggle_panel = filter_panel.clone();
                             let drop_app = app.clone();
+                            let content_drop_app = app.clone();
                             v_flex()
                                 .w_full()
                                 .child(
@@ -3602,6 +3604,18 @@ impl LogdApp {
                                             .grid_cols(columns)
                                             .content_start()
                                             .items_start()
+                                            .drag_over::<DraggedFilter>(move |content, _, _, _| {
+                                                content.bg(palette.selection)
+                                            })
+                                            .on_drop(move |dragged: &DraggedFilter, _, cx| {
+                                                content_drop_app.update(cx, |app, cx| {
+                                                    app.move_filter_to_group(
+                                                        dragged.index,
+                                                        content_drop_group.clone(),
+                                                        cx,
+                                                    )
+                                                });
+                                            })
                                             .children(indices.into_iter().map(|index| {
                                                 render_filter_row(
                                                     app,
@@ -4364,7 +4378,9 @@ fn render_filter_row(
                 .on_click(window.listener_for(&previous_app, move |this, _, _, cx| {
                     this.jump_filter_match(index, false, cx);
                 })),
-        ))
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation()))
         .child(control_tooltip(
             ("filter-next-match-tooltip", index),
             text(Key::NextFilterMatch, lang),
@@ -4377,7 +4393,9 @@ fn render_filter_row(
                 .on_click(window.listener_for(&next_app, move |this, _, _, cx| {
                     this.jump_filter_match(index, true, cx);
                 })),
-        ))
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation()))
         .child(control_tooltip(
             ("filter-match-count-tooltip", index),
             text(Key::FilterMatchCount, lang),
