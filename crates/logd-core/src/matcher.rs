@@ -61,6 +61,8 @@ pub struct FilterSpec {
     /// `.tat` 的 `excluding="y"`：命中就把整行藏掉。
     pub excluding: bool,
     pub description: String,
+    /// Optional UI group. An empty value is shown in the ungrouped section.
+    pub group: String,
     pub text: String,
     pub regex: bool,
     pub case_sensitive: bool,
@@ -88,6 +90,7 @@ impl Default for FilterSpec {
             enabled: true,
             excluding: false,
             description: String::new(),
+            group: String::new(),
             text: String::new(),
             regex: false,
             case_sensitive: false,

@@ -155,6 +155,9 @@ impl TatFile {
             if let Some(size) = f.font_size {
                 attr(&mut s, "logd_font_size", &size.to_string());
             }
+            if !f.group.is_empty() {
+                attr(&mut s, "logd_group", &f.group);
+            }
             if f.scope != FilterScope::default() {
                 attr(
                     &mut s,
@@ -211,6 +214,7 @@ fn parse_filter(attrs: &[(String, String)]) -> FilterSpec {
             "logd_bold" => f.bold = parse_bool(v),
             "logd_italic" => f.italic = parse_bool(v),
             "logd_font_size" => f.font_size = v.trim().parse().ok(),
+            "logd_group" => f.group = v.trim().to_string(),
             "logd_scope" => {
                 f.scope = match v.trim().to_ascii_lowercase().as_str() {
                     "current" | "file" => FilterScope::CurrentFile,
@@ -314,6 +318,7 @@ mod tests {
         t.filters[1].italic = true;
         t.filters[1].font_size = Some(16);
         t.filters[2].scope = FilterScope::CurrentFile;
+        t.filters[2].group = "Camera".into();
         t.show_only_filtered = true;
 
         let xml = t.to_xml();
@@ -321,6 +326,7 @@ mod tests {
         assert!(xml.contains("logd_bold=\"y\""));
         assert!(xml.contains("logd_scope=\"current\""));
         assert!(xml.contains("logd_font_size=\"16\""));
+        assert!(xml.contains("logd_group=\"Camera\""));
         assert!(xml.contains("showOnlyFilteredLines=\"True\""));
 
         let back = TatFile::parse(xml.as_bytes()).unwrap();

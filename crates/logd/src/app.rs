@@ -345,6 +345,7 @@ pub struct LogdApp {
     search_suggestion_index: Option<usize>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
+    filter_group: Entity<InputState>,
     filter_fore: Entity<ColorPickerState>,
     filter_back: Entity<ColorPickerState>,
     filter_bold: bool,
@@ -388,6 +389,9 @@ impl LogdApp {
         let filter_description = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(text(Key::FilterDescriptionPlaceholder, language))
+        });
+        let filter_group = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text(Key::FilterGroupPlaceholder, language))
         });
         let filter_fore = cx.new(|cx| ColorPickerState::new(window, cx));
         let filter_back = cx.new(|cx| ColorPickerState::new(window, cx));
@@ -585,6 +589,7 @@ impl LogdApp {
             search_suggestion_index: None,
             filter_text,
             filter_description,
+            filter_group,
             filter_fore,
             filter_back,
             filter_bold: false,
@@ -1481,6 +1486,8 @@ impl LogdApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filter_group
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_scope = FilterScope::default();
         self.filter_bold = false;
         self.filter_font_size = None;
@@ -1530,6 +1537,8 @@ impl LogdApp {
         self.filter_description.update(cx, |state, cx| {
             state.set_value(filter.description, window, cx)
         });
+        self.filter_group
+            .update(cx, |state, cx| state.set_value(filter.group, window, cx));
         self.filter_scope = filter.scope;
         self.filter_bold = filter.bold;
         self.filter_font_size = filter.font_size;
@@ -1544,12 +1553,14 @@ impl LogdApp {
             return;
         }
         let description = self.filter_description.read(cx).value().trim().to_string();
+        let group = self.filter_group.read(cx).value().trim().to_string();
         let fore = self.filter_fore.read(cx).value().map(hsla_to_rgb);
         let back = self.filter_back.read(cx).value().map(hsla_to_rgb);
         match self.editing_filter {
             Some(index) if index < self.filters.len() => {
                 self.filters[index].text = value;
                 self.filters[index].description = description;
+                self.filters[index].group = group;
                 self.filters[index].fore = fore;
                 self.filters[index].back = back;
                 self.filters[index].scope = self.filter_scope;
@@ -1561,6 +1572,7 @@ impl LogdApp {
                 self.filters.push(FilterSpec {
                     text: value,
                     description,
+                    group,
                     mode: HighlightMode::Field,
                     fore,
                     back,
@@ -1578,7 +1590,29 @@ impl LogdApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.filter_description
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.filter_group
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.filters_changed(cx);
+    }
+
+    fn move_filter_to_group(&mut self, index: usize, group: String, cx: &mut Context<Self>) {
+        let Some(filter) = self.filters.get_mut(index) else {
+            return;
+        };
+        let group = group.trim().to_string();
+        if filter.group != group {
+            filter.group = group;
+            cx.notify();
+        }
+    }
+
+    fn jump_filter_match(&mut self, index: usize, forward: bool, cx: &mut Context<Self>) {
+        if index >= self.filters.len() {
+            return;
+        }
+        if let Some(view) = self.active_view().cloned() {
+            view.update(cx, |view, cx| view.jump_filter_match(index, forward, cx));
+        }
     }
 
     fn delete_selected_filter(&mut self, cx: &mut Context<Self>) {
@@ -3217,6 +3251,7 @@ impl LogdApp {
     pub fn render_filters(
         app: &Entity<Self>,
         columns: u16,
+        collapsed_groups: HashSet<String>,
         window: &mut Window,
         cx: &mut Context<FilterPanel>,
     ) -> AnyElement {
@@ -3227,6 +3262,7 @@ impl LogdApp {
             editor_open,
             editor_text,
             editor_description,
+            editor_group,
             filter_fore,
             filter_back,
             filter_scope,
@@ -3245,6 +3281,7 @@ impl LogdApp {
                 state.filter_editor_open,
                 state.filter_text.clone(),
                 state.filter_description.clone(),
+                state.filter_group.clone(),
                 state.filter_fore.clone(),
                 state.filter_back.clone(),
                 state.filter_scope,
@@ -3261,6 +3298,7 @@ impl LogdApp {
         let reset_back_app = app.clone();
         let bold_app = app.clone();
         let filter_panel = cx.entity().downgrade();
+        let width_filter_panel = filter_panel.clone();
 
         v_flex()
             .size_full()
@@ -3276,6 +3314,7 @@ impl LogdApp {
                         .border_color(palette.border)
                         .child(Input::new(&editor_text).small())
                         .child(Input::new(&editor_description).small())
+                        .child(Input::new(&editor_group).small())
                         .child(control_tooltip(
                             "filter-editor-scope-tooltip",
                             format!(
@@ -3487,33 +3526,101 @@ impl LogdApp {
                     .id("filter-list")
                     .flex_1()
                     .min_h_0()
-                    .grid()
-                    .grid_cols(columns)
-                    .content_start()
-                    .items_start()
                     .overflow_y_scrollbar()
                     .on_prepaint(move |bounds, _, cx| {
-                        filter_panel
+                        width_filter_panel
                             .update(cx, |panel, cx| {
                                 panel.observe_content_width(bounds.size.width, cx)
                             })
                             .ok();
                     })
-                    .children(filters.iter().enumerate().map(|(index, filter)| {
-                        render_filter_row(
-                            app,
-                            filter,
-                            index,
-                            selected,
-                            filter_counts
-                                .as_deref()
-                                .and_then(|counts| counts.get(index).copied()),
-                            filter_counts_pending,
-                            lang,
-                            palette,
-                            window,
-                        )
-                    }))
+                    .children(filter_groups(&filters).into_iter().enumerate().map(
+                        |(group_index, (group_name, indices))| {
+                            let collapsed = collapsed_groups.contains(&group_name);
+                            let label = if group_name.is_empty() {
+                                text(Key::Ungrouped, lang).to_string()
+                            } else {
+                                group_name.clone()
+                            };
+                            let toggle_group = group_name.clone();
+                            let drop_group = group_name.clone();
+                            let toggle_panel = filter_panel.clone();
+                            let drop_app = app.clone();
+                            v_flex()
+                                .w_full()
+                                .child(
+                                    h_flex()
+                                        .id(("filter-group", group_index))
+                                        .w_full()
+                                        .h(px(30.))
+                                        .px_2()
+                                        .gap_1()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .border_b_1()
+                                        .border_color(palette.border)
+                                        .child(
+                                            Icon::new(if collapsed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .xsmall(),
+                                        )
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
+                                        .child(
+                                            div()
+                                                .ml_auto()
+                                                .text_size(px(10.))
+                                                .text_color(palette.muted)
+                                                .child(indices.len().to_string()),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            toggle_panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.toggle_group(toggle_group.clone(), cx)
+                                                })
+                                                .ok();
+                                        })
+                                        .drag_over::<DraggedFilter>(move |header, _, _, _| {
+                                            header.bg(palette.selection)
+                                        })
+                                        .on_drop(move |dragged: &DraggedFilter, _, cx| {
+                                            drop_app.update(cx, |app, cx| {
+                                                app.move_filter_to_group(
+                                                    dragged.index,
+                                                    drop_group.clone(),
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .when(!collapsed, |section| {
+                                    section.child(
+                                        div()
+                                            .grid()
+                                            .grid_cols(columns)
+                                            .content_start()
+                                            .items_start()
+                                            .children(indices.into_iter().map(|index| {
+                                                render_filter_row(
+                                                    app,
+                                                    &filters[index],
+                                                    index,
+                                                    selected,
+                                                    filter_counts.as_deref().and_then(|counts| {
+                                                        counts.get(index).copied()
+                                                    }),
+                                                    filter_counts_pending,
+                                                    lang,
+                                                    palette,
+                                                    window,
+                                                )
+                                            })),
+                                    )
+                                })
+                        },
+                    ))
                     .when(filters.is_empty(), |list| {
                         list.child(
                             div()
@@ -3971,6 +4078,46 @@ fn control_tooltip(
         .child(child)
 }
 
+#[derive(Clone)]
+struct DraggedFilter {
+    index: usize,
+    label: String,
+}
+
+impl Render for DraggedFilter {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
+        h_flex()
+            .max_w(px(320.))
+            .px_2()
+            .h(px(32.))
+            .bg(palette.background)
+            .border_1()
+            .border_color(palette.border)
+            .child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(self.label.clone()),
+            )
+    }
+}
+
+fn filter_groups(filters: &[FilterSpec]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, filter) in filters.iter().enumerate() {
+        let group = filter.group.trim();
+        if let Some((_, indices)) = groups.iter_mut().find(|(name, _)| name == group) {
+            indices.push(index);
+        } else {
+            groups.push((group.to_string(), vec![index]));
+        }
+    }
+    groups.sort_by_key(|(name, _)| !name.is_empty());
+    groups
+}
+
 fn render_filter_row(
     app: &Entity<LogdApp>,
     filter: &FilterSpec,
@@ -3990,7 +4137,10 @@ fn render_filter_row(
     let regex_app = app.clone();
     let case_app = app.clone();
     let scope_app = app.clone();
+    let previous_app = app.clone();
+    let next_app = app.clone();
     let context_app = app.clone();
+    let can_navigate = filter.is_active() && match_count.is_none_or(|count| count > 0);
     h_flex()
         .id(("filter-row", index))
         .w_full()
@@ -4018,6 +4168,13 @@ fn render_filter_row(
                 this.selected_filter = Some(index);
                 cx.notify();
             }),
+        )
+        .on_drag(
+            DraggedFilter {
+                index,
+                label: filter.text.clone(),
+            },
+            move |dragged, _, _, cx| cx.new(|_| dragged.clone()),
         )
         .child(control_tooltip(
             ("filter-enabled-tooltip", index),
@@ -4195,6 +4352,32 @@ fn render_filter_row(
                     )
                 }),
         )
+        .child(control_tooltip(
+            ("filter-previous-match-tooltip", index),
+            text(Key::PreviousFilterMatch, lang),
+            Button::new(("filter-previous-match", index))
+                .icon(IconName::ArrowUp)
+                .xsmall()
+                .ghost()
+                .disabled(!can_navigate)
+                .accessibility_label(text(Key::PreviousFilterMatch, lang))
+                .on_click(window.listener_for(&previous_app, move |this, _, _, cx| {
+                    this.jump_filter_match(index, false, cx);
+                })),
+        ))
+        .child(control_tooltip(
+            ("filter-next-match-tooltip", index),
+            text(Key::NextFilterMatch, lang),
+            Button::new(("filter-next-match", index))
+                .icon(IconName::ArrowDown)
+                .xsmall()
+                .ghost()
+                .disabled(!can_navigate)
+                .accessibility_label(text(Key::NextFilterMatch, lang))
+                .on_click(window.listener_for(&next_app, move |this, _, _, cx| {
+                    this.jump_filter_match(index, true, cx);
+                })),
+        ))
         .child(control_tooltip(
             ("filter-match-count-tooltip", index),
             text(Key::FilterMatchCount, lang),
@@ -4540,7 +4723,39 @@ pub fn run(initial: Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{group, parse_search_expression, search_tree_file_row_count, SearchExpression};
+    use logd_core::FilterSpec;
+
+    use super::{
+        filter_groups, group, parse_search_expression, search_tree_file_row_count, SearchExpression,
+    };
+
+    #[test]
+    fn filter_groups_put_ungrouped_first_and_keep_filter_order() {
+        let filters = vec![
+            FilterSpec {
+                group: "Camera".into(),
+                ..Default::default()
+            },
+            FilterSpec::default(),
+            FilterSpec {
+                group: "Camera".into(),
+                ..Default::default()
+            },
+            FilterSpec {
+                group: "Audio".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            filter_groups(&filters),
+            vec![
+                (String::new(), vec![1]),
+                ("Camera".into(), vec![0, 2]),
+                ("Audio".into(), vec![3]),
+            ]
+        );
+    }
 
     #[test]
     fn groups_thousands() {

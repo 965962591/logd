@@ -146,6 +146,8 @@ pub struct LogView {
     /// 每次发起筛选自增。回调里对不上就说明结果已经过期，直接丢弃。
     scan_gen: u64,
     search_scan_gen: u64,
+    filter_navigation_gen: u64,
+    last_filter_navigation: Option<(usize, u64)>,
     /// 过滤器变了但这个标签页还没重扫（非活动标签页先记账，切过去再扫）
     dirty: bool,
     /// 正则编译失败之类的提示
@@ -286,6 +288,8 @@ impl LogView {
             search_result_flash_task: None,
             scan_gen: 0,
             search_scan_gen: 0,
+            filter_navigation_gen: 0,
+            last_filter_navigation: None,
             dirty: false,
             error: None,
             from_cache: loaded.from_cache,
@@ -672,6 +676,7 @@ impl LogView {
     /// 换一套过滤器。非活动标签页可以先 [`mark_dirty`]，切过去时再调这个。
     pub fn apply_filters(&mut self, filters: Vec<FilterSpec>, cx: &mut Context<Self>) {
         self.dirty = false;
+        self.last_filter_navigation = None;
         self.filter_match_counts = None;
         self.multi_file_filter_mask = Arc::new(
             filters
@@ -979,6 +984,73 @@ impl LogView {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Find the previous/next line hit by one configured filter without
+    /// materialising a per-filter line index for every filter. The scan runs
+    /// off the UI thread and starts from the centre of the current viewport.
+    pub fn jump_filter_match(
+        &mut self,
+        filter_index: usize,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .doc
+            .matcher()
+            .filters()
+            .get(filter_index)
+            .is_some_and(FilterSpec::is_active)
+        {
+            return;
+        }
+        let viewport = self.doc.viewport();
+        let first_visible = self.doc.row_to_file_line(viewport.anchor_line());
+        let last_visible = self.doc.row_to_file_line(viewport.last_visible_line());
+        let remembered = self.last_filter_navigation.and_then(|(index, line)| {
+            (index == filter_index
+                && first_visible.is_some_and(|first| line >= first)
+                && last_visible.is_some_and(|last| line <= last))
+            .then_some(line)
+        });
+        let reference_row = viewport
+            .anchor_line()
+            .saturating_add(viewport.visible_rows() as u64 / 2);
+        let Some(reference_line) = remembered.or_else(|| self.doc.row_to_file_line(reference_row))
+        else {
+            return;
+        };
+        let source = self.doc.source().clone();
+        let index = self.doc.index().clone();
+        let matcher = self.doc.matcher().clone();
+        self.filter_navigation_gen = self.filter_navigation_gen.wrapping_add(1);
+        let generation = self.filter_navigation_gen;
+
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    find_filter_match(
+                        source.data(),
+                        &index,
+                        &matcher,
+                        filter_index,
+                        reference_line,
+                        forward,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.filter_navigation_gen == generation {
+                    if let Some(file_line) = found {
+                        this.last_filter_navigation = Some((filter_index, file_line));
+                        this.reveal_search_result(file_line, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- 输入 ----
@@ -2620,6 +2692,51 @@ fn union_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
     out
 }
 
+fn find_filter_match(
+    data: &[u8],
+    index: &LineIndex,
+    matcher: &MatcherSet,
+    filter_index: usize,
+    reference_line: u64,
+    forward: bool,
+) -> Option<u64> {
+    const BATCH_LINES: u64 = 4096;
+    if filter_index >= matcher.filters().len() || index.total_lines == 0 {
+        return None;
+    }
+    let mut spans = Vec::with_capacity(BATCH_LINES as usize);
+    let mut hits = Vec::with_capacity(matcher.filters().len());
+
+    if forward {
+        let mut first = reference_line.saturating_add(1);
+        while first < index.total_lines {
+            let count = (index.total_lines - first).min(BATCH_LINES) as usize;
+            index.line_spans(data, first, count, &mut spans);
+            for (offset, &(start, end)) in spans.iter().enumerate() {
+                matcher.matching_filters(&data[start as usize..end as usize], &mut hits);
+                if hits.get(filter_index).copied().unwrap_or(false) {
+                    return Some(first + offset as u64);
+                }
+            }
+            first = first.saturating_add(count as u64);
+        }
+    } else {
+        let mut end = reference_line.min(index.total_lines);
+        while end > 0 {
+            let first = end.saturating_sub(BATCH_LINES);
+            index.line_spans(data, first, (end - first) as usize, &mut spans);
+            for (offset, &(start, line_end)) in spans.iter().enumerate().rev() {
+                matcher.matching_filters(&data[start as usize..line_end as usize], &mut hits);
+                if hits.get(filter_index).copied().unwrap_or(false) {
+                    return Some(first + offset as u64);
+                }
+            }
+            end = first;
+        }
+    }
+    None
+}
+
 fn next_char_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     if byte == text.len() {
@@ -2655,8 +2772,8 @@ mod tests {
     };
 
     use super::{
-        incremental_refresh_results, merge_refreshed_lines, union_sorted, RefreshScanSnapshot,
-        TextPoint, TextSelection,
+        find_filter_match, incremental_refresh_results, merge_refreshed_lines, union_sorted,
+        RefreshScanSnapshot, TextPoint, TextSelection,
     };
 
     fn selection(anchor: (u64, usize), active: (u64, usize)) -> TextSelection {
@@ -2715,6 +2832,31 @@ mod tests {
         );
         assert_eq!(union_sorted(&[], &[2, 3]), vec![2, 3]);
         assert_eq!(union_sorted(&[2, 3], &[]), vec![2, 3]);
+    }
+
+    #[test]
+    fn filter_navigation_searches_on_each_side_of_current_view() {
+        let data = b"zero\nhit one\nmiss\nhit two\nlast\n";
+        let index = LineIndex::build_head(data, data.len() as u64);
+        let matcher = MatcherSet::new(
+            vec![FilterSpec {
+                text: "hit".into(),
+                ..Default::default()
+            }],
+            logd_core::Encoding::Utf8,
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_filter_match(data, &index, &matcher, 0, 1, true),
+            Some(3)
+        );
+        assert_eq!(
+            find_filter_match(data, &index, &matcher, 0, 4, false),
+            Some(3)
+        );
+        assert_eq!(find_filter_match(data, &index, &matcher, 0, 1, false), None);
+        assert_eq!(find_filter_match(data, &index, &matcher, 1, 0, true), None);
     }
 
     #[test]

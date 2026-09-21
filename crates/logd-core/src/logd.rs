@@ -89,6 +89,7 @@ mod tests {
             show_only_filtered: true,
             filters: vec![FilterSpec {
                 text: "AEtable".into(),
+                group: "AE".into(),
                 bold: true,
                 font_size: Some(16),
                 ..Default::default()
@@ -104,5 +105,6 @@ mod tests {
         let file = LogdFile::parse(br#"{"filters":[{"text":"x"}]}"#).unwrap();
         assert_eq!(file.filters[0].font_size, None);
         assert!(!file.filters[0].bold);
+        assert!(file.filters[0].group.is_empty());
     }
 }

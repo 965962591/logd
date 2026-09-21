@@ -475,6 +475,7 @@ pub struct FilterPanel {
     focus: FocusHandle,
     visible: bool,
     columns: u16,
+    collapsed_groups: HashSet<String>,
 }
 
 fn filter_column_count(width: f32) -> u16 {
@@ -491,6 +492,7 @@ impl FilterPanel {
             focus: cx.focus_handle(),
             visible: true,
             columns: 1,
+            collapsed_groups: HashSet::new(),
         }
     }
 
@@ -511,6 +513,13 @@ impl FilterPanel {
             self.columns = columns;
             cx.notify();
         }
+    }
+
+    pub(crate) fn toggle_group(&mut self, group: String, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.insert(group.clone()) {
+            self.collapsed_groups.remove(&group);
+        }
+        cx.notify();
     }
 }
 
@@ -635,7 +644,15 @@ impl Render for FilterPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.app
             .upgrade()
-            .map(|app| LogdApp::render_filters(&app, self.columns, window, cx))
+            .map(|app| {
+                LogdApp::render_filters(
+                    &app,
+                    self.columns,
+                    self.collapsed_groups.clone(),
+                    window,
+                    cx,
+                )
+            })
             .unwrap_or_else(|| div().into_any_element())
     }
 }
