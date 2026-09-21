@@ -2974,7 +2974,8 @@ impl LogdApp {
         let palette = theme::palette(cx);
         let app = cx.entity();
         let lang = self.language;
-        self.tab_scroll.scroll_to_item(self.active);
+        let tab_scroll = self.tab_scroll.clone();
+        let tab_entity_id = cx.entity_id();
         let tabs = h_flex()
             .id("tab-strip")
             .w_full()
@@ -2986,6 +2987,28 @@ impl LogdApp {
             .text_size(px(12.))
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
+            .on_scroll_wheel(move |event, window, cx| {
+                if !event.modifiers.shift {
+                    return;
+                }
+
+                let delta = event.delta.pixel_delta(window.line_height());
+                let horizontal_delta = if delta.x != px(0.) {
+                    delta.x
+                } else {
+                    delta.y
+                };
+                let max_offset = tab_scroll.max_offset().x;
+                if horizontal_delta == px(0.) || max_offset == px(0.) {
+                    return;
+                }
+
+                let mut offset = tab_scroll.offset();
+                offset.x = (offset.x + horizontal_delta).clamp(-max_offset, px(0.));
+                tab_scroll.set_offset(offset);
+                cx.notify(tab_entity_id);
+                cx.stop_propagation();
+            })
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
                 let drag = TabDrag {
@@ -3076,30 +3099,37 @@ impl LogdApp {
                     })
             }));
 
-        // Scrollbars are painted as an overlay by gpui. Keep a small bottom
-        // strip for it so the tab labels remain fully visible.
+        let scrollbar_width = Scrollbar::width();
+
+        // Keep the scrollbar in its own strip below the tab labels. Using the
+        // component's standard width preserves its hover and active expansion.
         v_flex()
             .id("tab-strip-frame")
             .w_full()
-            .h(px(28.))
+            .h(px(24.) + scrollbar_width)
             .flex_none()
             .relative()
             .bg(palette.tab_bar)
             .child(tabs)
             .child(
-                Scrollbar::horizontal(&self.tab_scroll)
-                    .id("tab-scrollbar")
-                    .mode(ScrollbarMode::Always)
-                    .viewport_from_layout()
-                    .styles(|styles| {
-                        styles
-                            .track(|track| track.width(px(4.)).bg(palette.scroll_track))
-                            .track_hover(|track| track.width(px(4.)).bg(palette.scroll_track))
-                            .track_active(|track| track.width(px(4.)).bg(palette.scroll_track))
-                            .thumb(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                            .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                            .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                    }),
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(scrollbar_width)
+                    .child(
+                        Scrollbar::horizontal(&self.tab_scroll)
+                            .id("tab-scrollbar")
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout()
+                            .styles(|styles| {
+                                styles
+                                    .track(|track| track.bg(palette.scroll_track))
+                                    .track_hover(|track| track.bg(palette.scroll_track))
+                                    .track_active(|track| track.bg(palette.scroll_track))
+                            }),
+                    ),
             )
             .into_any_element()
     }
