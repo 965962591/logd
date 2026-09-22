@@ -343,6 +343,7 @@ pub struct LogdApp {
     search_suggestions: Vec<String>,
     search_suggestions_open: bool,
     search_suggestion_index: Option<usize>,
+    search_navigation: Option<(PathBuf, u64)>,
     filter_text: Entity<InputState>,
     filter_description: Entity<InputState>,
     filter_group: Entity<InputState>,
@@ -587,6 +588,7 @@ impl LogdApp {
             search_suggestions: Vec::new(),
             search_suggestions_open: false,
             search_suggestion_index: None,
+            search_navigation: None,
             filter_text,
             filter_description,
             filter_group,
@@ -1084,6 +1086,36 @@ impl LogdApp {
         cx.notify();
     }
 
+    fn jump_search_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        let files = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(tab_index, tab)| {
+                tab.view
+                    .read(cx)
+                    .search_matches()
+                    .filter(|lines| !lines.is_empty())
+                    .map(|lines| (tab_index, lines))
+            })
+            .collect::<Vec<_>>();
+        let current = self.search_navigation.as_ref().and_then(|(path, line)| {
+            self.tabs
+                .iter()
+                .position(|tab| &tab.path == path)
+                .map(|tab_index| (tab_index, *line))
+        });
+        let Some((tab_index, file_line)) =
+            adjacent_search_match(&files, current, self.active, forward)
+        else {
+            return;
+        };
+        self.goto_search_result(tab_index, file_line, cx);
+    }
+
     fn filters_for_tab(&self, tab_index: usize) -> Vec<FilterSpec> {
         self.filters
             .iter()
@@ -1355,6 +1387,9 @@ impl LogdApp {
         if tab_index >= self.tabs.len() {
             return;
         }
+        if !self.search_query.is_empty() {
+            self.search_navigation = Some((self.tabs[tab_index].path.clone(), file_line));
+        }
         self.set_active(tab_index, cx);
         let view = self.tabs[tab_index].view.clone();
         view.update(cx, |view, cx| view.reveal_search_result(file_line, cx));
@@ -1431,6 +1466,7 @@ impl LogdApp {
         let expression = parse_search_expression(&value);
         self.search_query = expression.query;
         self.search_keywords = expression.keywords;
+        self.search_navigation = None;
 
         // Search results are separate from the configured-filter scan. Updating
         // the title-bar query must not rebuild the matcher or invalidate the
@@ -1463,6 +1499,7 @@ impl LogdApp {
             return;
         }
         self.fuzzy_search_enabled = enabled;
+        self.search_navigation = None;
         let _ = crate::settings::save_fuzzy_search_enabled(enabled);
         let search_views = self
             .tabs
@@ -2818,14 +2855,22 @@ impl LogdApp {
                                 &search_input_app,
                                 |this, _: &MoveDown, _, cx| {
                                     cx.stop_propagation();
-                                    this.move_search_suggestion(true, cx);
+                                    if this.search_suggestions_open {
+                                        this.move_search_suggestion(true, cx);
+                                    } else {
+                                        this.jump_search_match(true, cx);
+                                    }
                                 },
                             ))
                             .on_action(window.listener_for(
                                 &search_input_app,
                                 |this, _: &MoveUp, _, cx| {
                                     cx.stop_propagation();
-                                    this.move_search_suggestion(false, cx);
+                                    if this.search_suggestions_open {
+                                        this.move_search_suggestion(false, cx);
+                                    } else {
+                                        this.jump_search_match(false, cx);
+                                    }
                                 },
                             ))
                             .on_action(window.listener_for(
@@ -4491,6 +4536,65 @@ fn search_tree_file_row_count(matches: usize, expanded: bool) -> usize {
     1usize.saturating_add(if expanded { matches } else { 0 })
 }
 
+fn adjacent_search_match(
+    files: &[(usize, Arc<Vec<u64>>)],
+    current: Option<(usize, u64)>,
+    active_tab: usize,
+    forward: bool,
+) -> Option<(usize, u64)> {
+    if files.is_empty() {
+        return None;
+    }
+    let anchor_tab = current.map_or(active_tab, |(tab_index, _)| tab_index);
+    let start = if forward {
+        files
+            .iter()
+            .position(|(tab_index, _)| *tab_index >= anchor_tab)
+            .unwrap_or(0)
+    } else {
+        files
+            .iter()
+            .rposition(|(tab_index, _)| *tab_index <= anchor_tab)
+            .unwrap_or(files.len() - 1)
+    };
+
+    for offset in 0..files.len() {
+        let index = if forward {
+            (start + offset) % files.len()
+        } else {
+            (start + files.len() - offset) % files.len()
+        };
+        let (tab_index, lines) = &files[index];
+        if let Some((current_tab, current_line)) = current.filter(|_| offset == 0) {
+            if *tab_index == current_tab {
+                let line = if forward {
+                    lines.get(lines.partition_point(|line| *line <= current_line))
+                } else {
+                    lines
+                        .partition_point(|line| *line < current_line)
+                        .checked_sub(1)
+                        .and_then(|index| lines.get(index))
+                };
+                if let Some(line) = line {
+                    return Some((*tab_index, *line));
+                }
+                continue;
+            }
+        }
+        let line = if forward { lines.first() } else { lines.last() };
+        if let Some(line) = line {
+            return Some((*tab_index, *line));
+        }
+    }
+
+    let (tab_index, lines) = &files[start];
+    lines
+        .first()
+        .filter(|_| forward)
+        .or_else(|| lines.last().filter(|_| !forward))
+        .map(|line| (*tab_index, *line))
+}
+
 fn search_file_match_count(count: usize, lang: Language) -> String {
     match lang {
         Language::ZhCn => format!("（匹配 {} 次）", group(count as u64)),
@@ -4771,10 +4875,13 @@ pub fn run(initial: Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use logd_core::FilterSpec;
 
     use super::{
-        filter_groups, group, parse_search_expression, search_tree_file_row_count, SearchExpression,
+        adjacent_search_match, filter_groups, group, parse_search_expression,
+        search_tree_file_row_count, SearchExpression,
     };
 
     #[test]
@@ -4906,5 +5013,42 @@ mod tests {
     fn collapsed_search_file_keeps_only_its_header_row() {
         assert_eq!(search_tree_file_row_count(1_314, true), 1_315);
         assert_eq!(search_tree_file_row_count(1_314, false), 1);
+    }
+
+    #[test]
+    fn search_navigation_starts_in_active_file_and_crosses_files() {
+        let files = vec![
+            (0, Arc::new(vec![2, 5])),
+            (2, Arc::new(vec![3, 8])),
+            (4, Arc::new(vec![1])),
+        ];
+
+        assert_eq!(adjacent_search_match(&files, None, 2, true), Some((2, 3)));
+        assert_eq!(
+            adjacent_search_match(&files, Some((2, 8)), 2, true),
+            Some((4, 1))
+        );
+        assert_eq!(
+            adjacent_search_match(&files, Some((2, 3)), 2, false),
+            Some((0, 5))
+        );
+    }
+
+    #[test]
+    fn search_navigation_wraps_at_both_ends() {
+        let files = vec![(0, Arc::new(vec![2, 5])), (2, Arc::new(vec![3]))];
+
+        assert_eq!(
+            adjacent_search_match(&files, Some((2, 3)), 2, true),
+            Some((0, 2))
+        );
+        assert_eq!(
+            adjacent_search_match(&files, Some((0, 2)), 0, false),
+            Some((2, 3))
+        );
+        assert_eq!(
+            adjacent_search_match(&[(1, Arc::new(vec![7]))], Some((1, 7)), 1, true),
+            Some((1, 7))
+        );
     }
 }
