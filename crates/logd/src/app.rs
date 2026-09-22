@@ -2298,24 +2298,12 @@ impl LogdApp {
             _ => "menu-filters",
         };
         let app = cx.entity();
-        let hover_app = app.clone();
         let open_app = app.clone();
         let open = self.title_menu_open == Some(command_group);
-        title_bar::hover_menu(
+        title_bar::popup_menu(
             id,
             button,
             open,
-            move |hovered, window, cx| {
-                if *hovered {
-                    hover_app.update(cx, |this, cx| {
-                        if this.title_menu_open != Some(command_group) {
-                            this.title_menu_open = Some(command_group);
-                            cx.notify();
-                        }
-                    });
-                }
-                let _ = window;
-            },
             move |is_open, _window, cx| {
                 open_app.update(cx, |this, cx| {
                     if *is_open {

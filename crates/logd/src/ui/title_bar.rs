@@ -64,28 +64,27 @@ static SEARCH_ENABLE_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
     ))
 });
 
-struct HoverMenuState {
+struct TitleMenuState {
     menu: Option<Entity<PopupMenu>>,
     dismiss_subscription: Option<Subscription>,
 }
 
-/// Add a click/hover-open dropdown to a title-bar menu button. The popup menu
+/// Add a click-open dropdown to a title-bar menu button. The popup menu
 /// entity is retained across renders so submenu selection and keyboard focus
 /// are not reset by app notifications.
-pub fn hover_menu(
+pub fn popup_menu(
     id: &'static str,
     trigger: Button,
     open: bool,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_open_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
     builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let open_callback = Rc::new(on_open_change);
-    let state_id: ElementId = format!("title-hover-menu-state:{id}").into();
-    let popover_id: ElementId = format!("title-hover-menu:{id}").into();
-    let state = window.use_keyed_state(state_id.clone(), cx, |_, _| HoverMenuState {
+    let state_id: ElementId = format!("title-menu-state:{id}").into();
+    let popover_id: ElementId = format!("title-menu:{id}").into();
+    let state = window.use_keyed_state(state_id.clone(), cx, |_, _| TitleMenuState {
         menu: None,
         dismiss_subscription: None,
     });
@@ -117,10 +116,6 @@ pub fn hover_menu(
 
     let menu = state.read(cx).menu.clone();
 
-    let hover_callback = Rc::new(on_hover);
-    let trigger = trigger.on_hover(move |hovered, window, cx| {
-        hover_callback(hovered, window, cx);
-    });
     let menu_state = state.clone();
     let mut popover = Popover::new(popover_id)
         .trigger(trigger)
