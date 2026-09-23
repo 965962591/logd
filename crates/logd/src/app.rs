@@ -41,8 +41,8 @@ use crate::live_log::{LiveLogEvent, LiveLogService};
 use crate::log_view::LogView;
 use crate::theme;
 use crate::ui::dock::{
-    logd_dock_area, register_logd_panels, FilterPanel, LogPanel, MarkPanel, RegexTablePanel,
-    SearchResultsPanel,
+    logd_dock_area, register_logd_panels, FilterDragPreview, FilterPanel, LogPanel, MarkPanel,
+    RegexTablePanel, SearchResultsPanel,
 };
 use crate::ui::title_bar;
 
@@ -1632,10 +1632,6 @@ impl LogdApp {
         self.filters_changed(cx);
     }
 
-    fn move_filter_to_group(&mut self, index: usize, group: String, cx: &mut Context<Self>) {
-        self.reorder_filter(index, None, &group, cx);
-    }
-
     fn reorder_filter(
         &mut self,
         from: usize,
@@ -1668,8 +1664,14 @@ impl LogdApp {
         self.filters_changed(cx);
     }
 
-    fn reorder_filter_group(&mut self, from: &str, target: &str, cx: &mut Context<Self>) {
-        let Some(order) = reordered_group_indices(&self.filters, from, target) else {
+    fn reorder_filter_group(
+        &mut self,
+        from: &str,
+        target: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(order) = reordered_group_indices(&self.filters, from, target, after) else {
             return;
         };
         let selected = self
@@ -3359,6 +3361,7 @@ impl LogdApp {
         app: &Entity<Self>,
         columns: u16,
         collapsed_groups: HashSet<String>,
+        drag_preview: Option<FilterDragPreview>,
         window: &mut Window,
         cx: &mut Context<FilterPanel>,
     ) -> AnyElement {
@@ -3406,6 +3409,14 @@ impl LogdApp {
         let bold_app = app.clone();
         let filter_panel = cx.entity().downgrade();
         let width_filter_panel = filter_panel.clone();
+        let move_filter_panel = filter_panel.clone();
+        let move_group_panel = filter_panel.clone();
+        let drop_filter_panel = filter_panel.clone();
+        let drop_group_panel = filter_panel.clone();
+        let cancel_filter_panel = filter_panel.clone();
+        let drop_filter_app = app.clone();
+        let drop_group_app = app.clone();
+        let move_filter_app = app.clone();
 
         v_flex()
             .size_full()
@@ -3641,7 +3652,75 @@ impl LogdApp {
                             })
                             .ok();
                     })
-                    .children(filter_groups(&filters).into_iter().enumerate().map(
+                    .on_drag_move::<DraggedFilter>(move |event, _, cx| {
+                        let from = event.drag(cx).index;
+                        let position = event.event.position;
+                        move_filter_panel.update(cx, |panel, cx| {
+                            let preview = if event.bounds.contains(&position) {
+                                let filters = &move_filter_app.read(cx).filters;
+                                panel.row_bounds.iter().find(|(_, bounds)| bounds.contains(&position))
+                                    .and_then(|(index, bounds)| {
+                                        if *index == from { return panel.drag_preview.clone(); }
+                                        let group = filters.get(*index)?.group.trim().to_string();
+                                        let before = if position.y < bounds.center().y {
+                                            Some(*index)
+                                        } else {
+                                            next_filter_in_group(filters, *index, from)
+                                        };
+                                        Some(FilterDragPreview::Filter { from, before, group })
+                                    })
+                                    .or_else(|| panel.group_bounds.iter().find(|(_, bounds)| bounds.contains(&position))
+                                        .map(|(group, _)| FilterDragPreview::Filter { from, before: None, group: group.clone() }))
+                                    .or_else(|| panel.group_bounds.last().filter(|(_, bounds)| position.y >= bounds.bottom())
+                                        .map(|(group, _)| FilterDragPreview::Filter { from, before: None, group: group.clone() }))
+                            } else { None };
+                            panel.set_drag_preview(preview, cx);
+                        }).ok();
+                    })
+                    .on_drag_move::<DraggedFilterGroup>(move |event, _, cx| {
+                        let from = event.drag(cx).name.clone();
+                        let position = event.event.position;
+                        move_group_panel.update(cx, |panel, cx| {
+                            let preview = if event.bounds.contains(&position) {
+                                panel.group_bounds.iter().find(|(_, bounds)| bounds.contains(&position))
+                                    .and_then(|(target, bounds)| {
+                                        if *target == from { panel.drag_preview.clone() }
+                                        else { Some(FilterDragPreview::Group { from: from.clone(), target: target.clone(), after: position.y >= bounds.center().y }) }
+                                    })
+                                    .or_else(|| panel.group_bounds.last().filter(|(_, bounds)| position.y >= bounds.bottom())
+                                        .map(|(target, _)| FilterDragPreview::Group { from, target: target.clone(), after: true }))
+                            } else { None };
+                            panel.set_drag_preview(preview, cx);
+                        }).ok();
+                    })
+                    .on_drop(move |dragged: &DraggedFilter, _, cx| {
+                        let preview = drop_filter_panel.update(cx, |panel, cx| {
+                            let preview = panel.drag_preview.take();
+                            cx.notify();
+                            preview
+                        }).ok().flatten();
+                        if let Some(FilterDragPreview::Filter { from, before, group }) = preview {
+                            if from == dragged.index {
+                                drop_filter_app.update(cx, |app, cx| app.reorder_filter(from, before, &group, cx));
+                            }
+                        }
+                    })
+                    .on_drop(move |dragged: &DraggedFilterGroup, _, cx| {
+                        let preview = drop_group_panel.update(cx, |panel, cx| {
+                            let preview = panel.drag_preview.take();
+                            cx.notify();
+                            preview
+                        }).ok().flatten();
+                        if let Some(FilterDragPreview::Group { from, target, after }) = preview {
+                            if from == dragged.name {
+                                drop_group_app.update(cx, |app, cx| app.reorder_filter_group(&from, &target, after, cx));
+                            }
+                        }
+                    })
+                    .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                        cancel_filter_panel.update(cx, |panel, cx| panel.set_drag_preview(None, cx)).ok();
+                    })
+                    .children(preview_filter_groups(&filters, drag_preview.as_ref()).into_iter().enumerate().map(
                         |(group_index, (group_name, indices))| {
                             let collapsed = collapsed_groups.contains(&group_name);
                             let label = if group_name.is_empty() {
@@ -3650,19 +3729,20 @@ impl LogdApp {
                                 group_name.clone()
                             };
                             let toggle_group = group_name.clone();
-                            let drop_group = group_name.clone();
-                            let content_drop_group = group_name.clone();
-                            let reorder_group = group_name.clone();
+                            let bounds_group = group_name.clone();
                             let group_drag = DraggedFilterGroup {
                                 name: group_name.clone(),
-                                label: label.clone(),
                             };
                             let toggle_panel = filter_panel.clone();
-                            let drop_app = app.clone();
-                            let content_drop_app = app.clone();
-                            let reorder_app = app.clone();
+                            let bounds_panel = filter_panel.clone();
+                            let row_panel = filter_panel.clone();
+                            let preview_filter = matches!(&drag_preview, Some(FilterDragPreview::Filter { from, .. }) if indices.contains(from));
+                            let preview_group = matches!(&drag_preview, Some(FilterDragPreview::Group { from, .. }) if from == &group_name);
                             v_flex()
                                 .w_full()
+                                .on_prepaint(move |bounds, _, cx| {
+                                    bounds_panel.update(cx, |panel, _| panel.group_bounds.push((bounds_group.clone(), bounds))).ok();
+                                })
                                 .child(
                                     h_flex()
                                         .id(("filter-group", group_index))
@@ -3674,6 +3754,7 @@ impl LogdApp {
                                         .cursor_pointer()
                                         .border_b_1()
                                         .border_color(palette.border)
+                                        .when(preview_group, |header| header.bg(palette.selection))
                                         .child(
                                             Icon::new(if collapsed {
                                                 IconName::ChevronRight
@@ -3699,30 +3780,6 @@ impl LogdApp {
                                         })
                                         .on_drag(group_drag, move |dragged, _, _, cx| {
                                             cx.new(|_| dragged.clone())
-                                        })
-                                        .drag_over::<DraggedFilterGroup>(move |header, _, _, _| {
-                                            header.bg(palette.selection)
-                                        })
-                                        .on_drop(move |dragged: &DraggedFilterGroup, _, cx| {
-                                            reorder_app.update(cx, |app, cx| {
-                                                app.reorder_filter_group(
-                                                    &dragged.name,
-                                                    &reorder_group,
-                                                    cx,
-                                                )
-                                            });
-                                        })
-                                        .drag_over::<DraggedFilter>(move |header, _, _, _| {
-                                            header.bg(palette.selection)
-                                        })
-                                        .on_drop(move |dragged: &DraggedFilter, _, cx| {
-                                            drop_app.update(cx, |app, cx| {
-                                                app.move_filter_to_group(
-                                                    dragged.index,
-                                                    drop_group.clone(),
-                                                    cx,
-                                                )
-                                            });
                                         }),
                                 )
                                 .when(!collapsed, |section| {
@@ -3732,23 +3789,13 @@ impl LogdApp {
                                             .grid_cols(columns)
                                             .content_start()
                                             .items_start()
-                                            .drag_over::<DraggedFilter>(move |content, _, _, _| {
-                                                content.bg(palette.selection)
-                                            })
-                                            .on_drop(move |dragged: &DraggedFilter, _, cx| {
-                                                content_drop_app.update(cx, |app, cx| {
-                                                    app.move_filter_to_group(
-                                                        dragged.index,
-                                                        content_drop_group.clone(),
-                                                        cx,
-                                                    )
-                                                });
-                                            })
                                             .children(indices.into_iter().map(|index| {
                                                 render_filter_row(
                                                     app,
+                                                    &row_panel,
                                                     &filters[index],
                                                     index,
+                                                    preview_filter && matches!(&drag_preview, Some(FilterDragPreview::Filter { from, .. }) if *from == index),
                                                     selected,
                                                     filter_counts.as_deref().and_then(|counts| {
                                                         counts.get(index).copied()
@@ -4223,45 +4270,22 @@ fn control_tooltip(
 #[derive(Clone)]
 struct DraggedFilter {
     index: usize,
-    label: String,
 }
 
 impl Render for DraggedFilter {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = theme::palette(cx);
-        h_flex()
-            .max_w(px(320.))
-            .px_2()
-            .h(px(32.))
-            .bg(palette.background)
-            .border_1()
-            .border_color(palette.border)
-            .child(
-                div()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(self.label.clone()),
-            )
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 
 #[derive(Clone)]
 struct DraggedFilterGroup {
     name: String,
-    label: String,
 }
 
 impl Render for DraggedFilterGroup {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = theme::palette(cx);
-        div()
-            .px_2()
-            .h(px(30.))
-            .bg(palette.background)
-            .border_1()
-            .border_color(palette.border)
-            .child(self.label.clone())
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 
@@ -4274,6 +4298,54 @@ fn filter_groups(filters: &[FilterSpec]) -> Vec<(String, Vec<usize>)> {
         } else {
             groups.push((group.to_string(), vec![index]));
         }
+    }
+    groups
+}
+
+fn preview_filter_groups(
+    filters: &[FilterSpec],
+    preview: Option<&FilterDragPreview>,
+) -> Vec<(String, Vec<usize>)> {
+    match preview {
+        Some(FilterDragPreview::Group {
+            from,
+            target,
+            after,
+        }) => {
+            let Some(order) = reordered_group_indices(filters, from, target, *after) else {
+                return filter_groups(filters);
+            };
+            groups_in_order(filters, order, None)
+        }
+        Some(FilterDragPreview::Filter {
+            from,
+            before,
+            group,
+        }) => {
+            let Some(order) = reordered_filter_indices(filters, *from, *before, group) else {
+                return filter_groups(filters);
+            };
+            groups_in_order(filters, order, Some((*from, group)))
+        }
+        None => filter_groups(filters),
+    }
+}
+
+fn groups_in_order(
+    filters: &[FilterSpec],
+    order: Vec<usize>,
+    moved: Option<(usize, &str)>,
+) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for index in order {
+        let name = match moved {
+            Some((from, group)) if index == from => group,
+            _ => filters[index].group.trim(),
+        };
+        if groups.last().is_none_or(|(last, _)| last != name) {
+            groups.push((name.to_string(), Vec::new()));
+        }
+        groups.last_mut().unwrap().1.push(index);
     }
     groups
 }
@@ -4325,15 +4397,30 @@ fn reordered_filter_indices(
     )
 }
 
-fn reordered_group_indices(filters: &[FilterSpec], from: &str, target: &str) -> Option<Vec<usize>> {
+fn next_filter_in_group(filters: &[FilterSpec], target: usize, from: usize) -> Option<usize> {
+    let group = filters.get(target)?.group.trim();
+    filters
+        .iter()
+        .enumerate()
+        .skip(target + 1)
+        .find(|(index, filter)| *index != from && filter.group.trim() == group)
+        .map(|(index, _)| index)
+}
+
+fn reordered_group_indices(
+    filters: &[FilterSpec],
+    from: &str,
+    target: &str,
+    after: bool,
+) -> Option<Vec<usize>> {
     if from == target {
         return None;
     }
     let mut groups = filter_groups(filters);
     let from_index = groups.iter().position(|(name, _)| name == from)?;
-    let target_index = groups.iter().position(|(name, _)| name == target)?;
     let moved = groups.remove(from_index);
-    groups.insert(target_index, moved);
+    let target_index = groups.iter().position(|(name, _)| name == target)?;
+    groups.insert(target_index + usize::from(after), moved);
     Some(
         groups
             .into_iter()
@@ -4344,8 +4431,10 @@ fn reordered_group_indices(filters: &[FilterSpec], from: &str, target: &str) -> 
 
 fn render_filter_row(
     app: &Entity<LogdApp>,
+    panel: &WeakEntity<FilterPanel>,
     filter: &FilterSpec,
     index: usize,
+    preview: bool,
     selected: Option<usize>,
     match_count: Option<u64>,
     match_count_pending: bool,
@@ -4364,8 +4453,7 @@ fn render_filter_row(
     let previous_app = app.clone();
     let next_app = app.clone();
     let context_app = app.clone();
-    let drop_app = app.clone();
-    let drop_group = filter.group.clone();
+    let bounds_panel = panel.clone();
     let can_navigate = filter.is_active() && match_count.is_none_or(|count| count > 0);
     h_flex()
         .id(("filter-row", index))
@@ -4374,10 +4462,20 @@ fn render_filter_row(
         .max_w_full()
         .h(px(40.))
         .max_h(px(40.))
+        .on_prepaint(move |bounds, _, cx| {
+            bounds_panel
+                .update(cx, |panel, _| panel.row_bounds.push((index, bounds)))
+                .ok();
+        })
         .px_2()
         .gap_2()
         .items_center()
         .when(selected == Some(index), |row| row.bg(palette.selection))
+        .when(preview, |row| {
+            row.bg(palette.selection)
+                .border_1()
+                .border_color(palette.caret)
+        })
         .on_click(window.listener_for(&row_app, move |this, _, _, cx| {
             this.selected_filter = Some(index);
             cx.notify();
@@ -4395,19 +4493,8 @@ fn render_filter_row(
                 cx.notify();
             }),
         )
-        .on_drag(
-            DraggedFilter {
-                index,
-                label: filter.text.clone(),
-            },
-            move |dragged, _, _, cx| cx.new(|_| dragged.clone()),
-        )
-        .drag_over::<DraggedFilter>(move |row, _, _, _| row.bg(palette.selection))
-        .on_drop(move |dragged: &DraggedFilter, _, cx| {
-            cx.stop_propagation();
-            drop_app.update(cx, |app, cx| {
-                app.reorder_filter(dragged.index, Some(index), &drop_group, cx)
-            });
+        .on_drag(DraggedFilter { index }, move |dragged, _, _, cx| {
+            cx.new(|_| dragged.clone())
         })
         .child(control_tooltip(
             ("filter-enabled-tooltip", index),
@@ -5023,10 +5110,12 @@ mod tests {
 
     use logd_core::FilterSpec;
 
+    use crate::ui::dock::FilterDragPreview;
+
     use super::{
-        adjacent_search_match, filter_groups, group, parse_search_expression,
-        reordered_filter_indices, reordered_group_indices, search_tree_file_row_count,
-        SearchExpression,
+        adjacent_search_match, filter_groups, group, next_filter_in_group, parse_search_expression,
+        preview_filter_groups, reordered_filter_indices, reordered_group_indices,
+        search_tree_file_row_count, SearchExpression,
     };
 
     #[test]
@@ -5064,10 +5153,17 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            reordered_group_indices(&filters, "Camera", "Network"),
+            reordered_group_indices(&filters, "Camera", "Network", true),
             Some(vec![1, 4, 3, 0, 2])
         );
-        assert_eq!(reordered_group_indices(&filters, "Audio", "Audio"), None);
+        assert_eq!(
+            reordered_group_indices(&filters, "Camera", "Network", false),
+            Some(vec![1, 4, 0, 2, 3])
+        );
+        assert_eq!(
+            reordered_group_indices(&filters, "Audio", "Audio", true),
+            None
+        );
     }
 
     #[test]
@@ -5096,9 +5192,54 @@ mod tests {
             reordered_filter_indices(&filters, 2, None, "Camera"),
             Some(vec![0, 1, 3, 2])
         );
+        assert_eq!(next_filter_in_group(&filters, 1, 0), Some(3));
+        assert_eq!(next_filter_in_group(&filters, 3, 0), None);
+        assert_eq!(
+            reordered_filter_indices(&filters, 0, next_filter_in_group(&filters, 3, 0), "Camera"),
+            Some(vec![1, 3, 0, 2])
+        );
         assert_eq!(
             reordered_filter_indices(&filters, 0, Some(0), "Camera"),
             None
+        );
+    }
+
+    #[test]
+    fn filter_drag_preview_shifts_rows_without_changing_source() {
+        let filters = ["Camera", "Camera", "Audio"].map(|group| FilterSpec {
+            group: group.into(),
+            ..Default::default()
+        });
+        let preview = FilterDragPreview::Filter {
+            from: 0,
+            before: Some(2),
+            group: "Audio".into(),
+        };
+        assert_eq!(
+            preview_filter_groups(&filters, Some(&preview)),
+            vec![("Camera".into(), vec![1]), ("Audio".into(), vec![0, 2])]
+        );
+        assert_eq!(filters[0].group, "Camera");
+    }
+
+    #[test]
+    fn group_drag_preview_shifts_whole_group() {
+        let filters = ["Camera", "Audio", "Camera", "Network"].map(|group| FilterSpec {
+            group: group.into(),
+            ..Default::default()
+        });
+        let preview = FilterDragPreview::Group {
+            from: "Camera".into(),
+            target: "Network".into(),
+            after: true,
+        };
+        assert_eq!(
+            preview_filter_groups(&filters, Some(&preview)),
+            vec![
+                ("Audio".into(), vec![1]),
+                ("Network".into(), vec![3]),
+                ("Camera".into(), vec![0, 2]),
+            ]
         );
     }
 

@@ -476,6 +476,23 @@ pub struct FilterPanel {
     visible: bool,
     columns: u16,
     collapsed_groups: HashSet<String>,
+    pub(crate) drag_preview: Option<FilterDragPreview>,
+    pub(crate) group_bounds: Vec<(String, Bounds<Pixels>)>,
+    pub(crate) row_bounds: Vec<(usize, Bounds<Pixels>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FilterDragPreview {
+    Group {
+        from: String,
+        target: String,
+        after: bool,
+    },
+    Filter {
+        from: usize,
+        before: Option<usize>,
+        group: String,
+    },
 }
 
 fn filter_column_count(width: f32) -> u16 {
@@ -493,6 +510,9 @@ impl FilterPanel {
             visible: true,
             columns: 1,
             collapsed_groups: HashSet::new(),
+            drag_preview: None,
+            group_bounds: Vec::new(),
+            row_bounds: Vec::new(),
         }
     }
 
@@ -520,6 +540,17 @@ impl FilterPanel {
             self.collapsed_groups.remove(&group);
         }
         cx.notify();
+    }
+
+    pub(crate) fn set_drag_preview(
+        &mut self,
+        preview: Option<FilterDragPreview>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_preview != preview {
+            self.drag_preview = preview;
+            cx.notify();
+        }
     }
 }
 
@@ -642,6 +673,11 @@ impl Focusable for FilterPanel {
 
 impl Render for FilterPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() {
+            self.drag_preview = None;
+        }
+        self.group_bounds.clear();
+        self.row_bounds.clear();
         self.app
             .upgrade()
             .map(|app| {
@@ -649,6 +685,7 @@ impl Render for FilterPanel {
                     &app,
                     self.columns,
                     self.collapsed_groups.clone(),
+                    self.drag_preview.clone(),
                     window,
                     cx,
                 )
