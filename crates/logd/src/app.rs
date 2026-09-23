@@ -1633,14 +1633,58 @@ impl LogdApp {
     }
 
     fn move_filter_to_group(&mut self, index: usize, group: String, cx: &mut Context<Self>) {
-        let Some(filter) = self.filters.get_mut(index) else {
+        self.reorder_filter(index, None, &group, cx);
+    }
+
+    fn reorder_filter(
+        &mut self,
+        from: usize,
+        before: Option<usize>,
+        group: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let group = group.trim();
+        let Some(order) = reordered_filter_indices(&self.filters, from, before, group) else {
             return;
         };
-        let group = group.trim().to_string();
-        if filter.group != group {
-            filter.group = group;
-            cx.notify();
+        if self.filters[from].group == group && order.iter().copied().eq(0..self.filters.len()) {
+            return;
         }
+        let selected = self
+            .selected_filter
+            .and_then(|index| order.iter().position(|old| *old == index));
+        let editing = self
+            .editing_filter
+            .and_then(|index| order.iter().position(|old| *old == index));
+        let mut filters = order
+            .iter()
+            .map(|index| self.filters[*index].clone())
+            .collect::<Vec<_>>();
+        let moved = order.iter().position(|index| *index == from).unwrap();
+        filters[moved].group = group.to_string();
+        self.filters = filters;
+        self.selected_filter = selected;
+        self.editing_filter = editing;
+        self.filters_changed(cx);
+    }
+
+    fn reorder_filter_group(&mut self, from: &str, target: &str, cx: &mut Context<Self>) {
+        let Some(order) = reordered_group_indices(&self.filters, from, target) else {
+            return;
+        };
+        let selected = self
+            .selected_filter
+            .and_then(|index| order.iter().position(|old| *old == index));
+        let editing = self
+            .editing_filter
+            .and_then(|index| order.iter().position(|old| *old == index));
+        self.filters = order
+            .iter()
+            .map(|index| self.filters[*index].clone())
+            .collect();
+        self.selected_filter = selected;
+        self.editing_filter = editing;
+        self.filters_changed(cx);
     }
 
     fn jump_filter_match(&mut self, index: usize, forward: bool, cx: &mut Context<Self>) {
@@ -3608,9 +3652,15 @@ impl LogdApp {
                             let toggle_group = group_name.clone();
                             let drop_group = group_name.clone();
                             let content_drop_group = group_name.clone();
+                            let reorder_group = group_name.clone();
+                            let group_drag = DraggedFilterGroup {
+                                name: group_name.clone(),
+                                label: label.clone(),
+                            };
                             let toggle_panel = filter_panel.clone();
                             let drop_app = app.clone();
                             let content_drop_app = app.clone();
+                            let reorder_app = app.clone();
                             v_flex()
                                 .w_full()
                                 .child(
@@ -3646,6 +3696,21 @@ impl LogdApp {
                                                     panel.toggle_group(toggle_group.clone(), cx)
                                                 })
                                                 .ok();
+                                        })
+                                        .on_drag(group_drag, move |dragged, _, _, cx| {
+                                            cx.new(|_| dragged.clone())
+                                        })
+                                        .drag_over::<DraggedFilterGroup>(move |header, _, _, _| {
+                                            header.bg(palette.selection)
+                                        })
+                                        .on_drop(move |dragged: &DraggedFilterGroup, _, cx| {
+                                            reorder_app.update(cx, |app, cx| {
+                                                app.reorder_filter_group(
+                                                    &dragged.name,
+                                                    &reorder_group,
+                                                    cx,
+                                                )
+                                            });
                                         })
                                         .drag_over::<DraggedFilter>(move |header, _, _, _| {
                                             header.bg(palette.selection)
@@ -4181,6 +4246,25 @@ impl Render for DraggedFilter {
     }
 }
 
+#[derive(Clone)]
+struct DraggedFilterGroup {
+    name: String,
+    label: String,
+}
+
+impl Render for DraggedFilterGroup {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(cx);
+        div()
+            .px_2()
+            .h(px(30.))
+            .bg(palette.background)
+            .border_1()
+            .border_color(palette.border)
+            .child(self.label.clone())
+    }
+}
+
 fn filter_groups(filters: &[FilterSpec]) -> Vec<(String, Vec<usize>)> {
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     for (index, filter) in filters.iter().enumerate() {
@@ -4191,8 +4275,71 @@ fn filter_groups(filters: &[FilterSpec]) -> Vec<(String, Vec<usize>)> {
             groups.push((group.to_string(), vec![index]));
         }
     }
-    groups.sort_by_key(|(name, _)| !name.is_empty());
     groups
+}
+
+fn reordered_filter_indices(
+    filters: &[FilterSpec],
+    from: usize,
+    before: Option<usize>,
+    group: &str,
+) -> Option<Vec<usize>> {
+    filters.get(from)?;
+    let group = group.trim();
+    if let Some(target) = before {
+        if filters.get(target)?.group.trim() != group {
+            return None;
+        }
+        if target == from {
+            return None;
+        }
+    }
+    let mut groups = filter_groups(filters);
+    let source = groups
+        .iter()
+        .position(|(_, indices)| indices.contains(&from))?;
+    groups[source].1.retain(|index| *index != from);
+    if groups[source].1.is_empty() {
+        groups.remove(source);
+    }
+    let destination = match groups.iter().position(|(name, _)| name == group) {
+        Some(index) => index,
+        None => {
+            groups.push((group.to_string(), Vec::new()));
+            groups.len() - 1
+        }
+    };
+    let insert = match before {
+        Some(target) => groups[destination]
+            .1
+            .iter()
+            .position(|index| *index == target)?,
+        None => groups[destination].1.len(),
+    };
+    groups[destination].1.insert(insert, from);
+    Some(
+        groups
+            .into_iter()
+            .flat_map(|(_, indices)| indices)
+            .collect(),
+    )
+}
+
+fn reordered_group_indices(filters: &[FilterSpec], from: &str, target: &str) -> Option<Vec<usize>> {
+    if from == target {
+        return None;
+    }
+    let mut groups = filter_groups(filters);
+    let from_index = groups.iter().position(|(name, _)| name == from)?;
+    let target_index = groups.iter().position(|(name, _)| name == target)?;
+    let moved = groups.remove(from_index);
+    groups.insert(target_index, moved);
+    Some(
+        groups
+            .into_iter()
+            .flat_map(|(_, indices)| indices)
+            .collect(),
+    )
 }
 
 fn render_filter_row(
@@ -4217,6 +4364,8 @@ fn render_filter_row(
     let previous_app = app.clone();
     let next_app = app.clone();
     let context_app = app.clone();
+    let drop_app = app.clone();
+    let drop_group = filter.group.clone();
     let can_navigate = filter.is_active() && match_count.is_none_or(|count| count > 0);
     h_flex()
         .id(("filter-row", index))
@@ -4253,6 +4402,13 @@ fn render_filter_row(
             },
             move |dragged, _, _, cx| cx.new(|_| dragged.clone()),
         )
+        .drag_over::<DraggedFilter>(move |row, _, _, _| row.bg(palette.selection))
+        .on_drop(move |dragged: &DraggedFilter, _, cx| {
+            cx.stop_propagation();
+            drop_app.update(cx, |app, cx| {
+                app.reorder_filter(dragged.index, Some(index), &drop_group, cx)
+            });
+        })
         .child(control_tooltip(
             ("filter-enabled-tooltip", index),
             text(Key::FilterEnabled, lang),
@@ -4869,11 +5025,12 @@ mod tests {
 
     use super::{
         adjacent_search_match, filter_groups, group, parse_search_expression,
-        search_tree_file_row_count, SearchExpression,
+        reordered_filter_indices, reordered_group_indices, search_tree_file_row_count,
+        SearchExpression,
     };
 
     #[test]
-    fn filter_groups_put_ungrouped_first_and_keep_filter_order() {
+    fn filter_groups_follow_first_occurrence_and_keep_filter_order() {
         let filters = vec![
             FilterSpec {
                 group: "Camera".into(),
@@ -4893,10 +5050,55 @@ mod tests {
         assert_eq!(
             filter_groups(&filters),
             vec![
-                (String::new(), vec![1]),
                 ("Camera".into(), vec![0, 2]),
+                (String::new(), vec![1]),
                 ("Audio".into(), vec![3]),
             ]
+        );
+    }
+
+    #[test]
+    fn group_reorder_moves_whole_group_and_preserves_item_order() {
+        let filters = ["Camera", "Audio", "Camera", "Network", "Audio"].map(|group| FilterSpec {
+            group: group.into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            reordered_group_indices(&filters, "Camera", "Network"),
+            Some(vec![1, 4, 3, 0, 2])
+        );
+        assert_eq!(reordered_group_indices(&filters, "Audio", "Audio"), None);
+    }
+
+    #[test]
+    fn filter_reorder_handles_group_edges_and_interleaved_groups() {
+        let filters = ["Camera", "Camera", "Audio", "Camera"].map(|group| FilterSpec {
+            group: group.into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            reordered_filter_indices(&filters, 0, Some(3), "Camera"),
+            Some(vec![1, 0, 3, 2])
+        );
+        assert_eq!(
+            reordered_filter_indices(&filters, 3, Some(0), "Camera"),
+            Some(vec![3, 0, 1, 2])
+        );
+        assert_eq!(
+            reordered_filter_indices(&filters, 1, None, "Camera"),
+            Some(vec![0, 3, 1, 2])
+        );
+        assert_eq!(
+            reordered_filter_indices(&filters, 2, None, "Audio"),
+            Some(vec![0, 1, 3, 2])
+        );
+        assert_eq!(
+            reordered_filter_indices(&filters, 2, None, "Camera"),
+            Some(vec![0, 1, 3, 2])
+        );
+        assert_eq!(
+            reordered_filter_indices(&filters, 0, Some(0), "Camera"),
+            None
         );
     }
 
