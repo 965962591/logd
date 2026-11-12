@@ -6,7 +6,7 @@
 //! 「行」有两个坐标系，混了就会显示错行号：
 //! - **文件行号**（`file_line`）：文件里的真实行号，0-based。行号槽里显示的是这个 +1。
 //! - **视图行号**（`row`）：当前列表里的第几项。显示全部时等于文件行号；
-//!   仅显示筛选结果时是 `matches` 数组的下标。
+//!   仅显示筛选结果时对应命中数组，另外允许插入一条用户锁定的文件行。
 
 use std::sync::Arc;
 
@@ -30,6 +30,13 @@ pub struct RenderRow {
     pub search_spans: Vec<Span>,
 }
 
+#[derive(Clone, Copy)]
+struct ViewAnchor {
+    file_line: u64,
+    row_offset: u64,
+    pixel_offset: f32,
+}
+
 pub struct Document {
     source: Arc<FileSource>,
     index: Arc<LineIndex>,
@@ -41,6 +48,13 @@ pub struct Document {
     display_matches: Option<Arc<Vec<u64>>>,
     /// UI 的「仅显示筛选结果」开关。
     show_only_filtered: bool,
+    /// The clicked file line and its preferred position within the viewport.
+    pinned_line: Option<ViewAnchor>,
+    /// Virtual insertion into display_matches; never copy the result array.
+    pinned_match_row: Option<u64>,
+    /// Detect deliberate scrolling without replacing the preferred position
+    /// when a temporary empty/short result clamps the viewport.
+    last_restored_scroll: (u64, f32),
     viewport: Viewport,
     max_render_bytes: usize,
     /// 生效的编码。`FileSource` 在 `Arc` 里改不动，所以用户手动切换的编码存这儿。
@@ -57,6 +71,9 @@ impl Document {
             matches: None,
             display_matches: None,
             show_only_filtered: false,
+            pinned_line: None,
+            pinned_match_row: None,
+            last_restored_scroll: (0, 0.0),
             viewport: Viewport::new(line_height),
             max_render_bytes: DEFAULT_MAX_RENDER_BYTES,
             encoding,
@@ -74,10 +91,11 @@ impl Document {
     /// `b'\n'` 的位置不变；但关键字要按新编码重新编码，所以命中集作废。
     pub fn set_encoding(&mut self, enc: Encoding) {
         if self.encoding != enc {
+            let keep = self.view_anchor();
             self.encoding = enc;
             self.matches = None;
             self.display_matches = None;
-            self.sync_viewport();
+            self.restore_view_anchor(keep);
         }
     }
 
@@ -127,10 +145,15 @@ impl Document {
         self.show_only_filtered
     }
 
+    /// The one file line retained by the last click/navigation, if still valid.
+    pub fn pinned_file_line(&self) -> Option<u64> {
+        self.pinned_line.map(|pin| pin.file_line)
+    }
+
     /// 当前视图里有多少项。
     pub fn display_rows(&self) -> u64 {
         match self.active_matches() {
-            Some(m) => m.len() as u64,
+            Some(m) => m.len() as u64 + u64::from(self.pinned_match_row.is_some()),
             None => self.index.total_lines,
         }
     }
@@ -148,20 +171,22 @@ impl Document {
 
     /// 后台全量索引完成。
     pub fn set_index(&mut self, index: Arc<LineIndex>) {
+        let keep = self.view_anchor();
         self.index = index;
-        self.sync_viewport();
+        self.restore_view_anchor(keep);
     }
 
     /// Replace a file snapshot and its matching index together. Readers at
     /// the end keep following new lines; readers inspecting older content
     /// retain their current position.
     pub fn replace_source_and_index(&mut self, source: Arc<FileSource>, index: Arc<LineIndex>) {
-        let follow_tail = self.viewport.is_at_bottom();
+        let keep = self.view_anchor();
+        let follow_tail = self.pinned_line.is_none() && self.viewport.is_at_bottom();
         self.source = source;
         self.index = index;
         self.matches = None;
         self.display_matches = None;
-        self.sync_viewport();
+        self.restore_view_anchor(keep);
         if follow_tail {
             self.viewport.scroll_to_bottom();
         }
@@ -169,37 +194,55 @@ impl Document {
 
     /// 过滤器变了：命中集立即作废，等新的扫描结果。
     pub fn set_matcher(&mut self, matcher: Arc<MatcherSet>) {
+        let keep = self.view_anchor();
         self.matcher = matcher;
         self.matches = None;
         self.display_matches = None;
-        self.sync_viewport();
+        self.restore_view_anchor(keep);
     }
 
     pub fn set_matches(&mut self, matches: Option<Arc<Vec<u64>>>) {
+        let keep = self.view_anchor();
         self.matches = matches.clone();
         self.display_matches = matches;
-        self.sync_viewport();
+        self.restore_view_anchor(keep);
     }
 
     /// Override only the filtered main view's rows. The configured-filter
     /// result returned by [`matched_lines`](Self::matched_lines) is unchanged.
     pub fn set_display_matches(&mut self, matches: Option<Arc<Vec<u64>>>) {
+        let keep = self.view_anchor();
         self.display_matches = matches;
-        self.sync_viewport();
+        self.restore_view_anchor(keep);
     }
 
-    /// 切换「仅显示筛选结果」。切换时保持当前顶端所在的**文件行**不动，
-    /// 否则用户一按开关视图就跳到不知哪里去了。
+    /// 切换「仅显示筛选结果」。优先保持可见的锁定行及其屏幕位置，
+    /// 没有可见锁定行时保持当前顶端所在的文件行。
     pub fn set_show_only_filtered(&mut self, on: bool) {
         if self.show_only_filtered == on {
             return;
         }
-        let keep = self.top_file_line();
+        let keep = self.view_anchor();
         self.show_only_filtered = on;
-        self.sync_viewport();
-        if let Some(line) = keep {
-            self.goto_file_line(line, ScrollTo::Top);
+        self.restore_view_anchor(keep);
+    }
+
+    /// On the owning thread, retain one valid file line across display changes,
+    /// even when it no longer matches. Invalid lines leave the pin unchanged.
+    /// Uses O(1) space and O(log matches) time; filter/search results are untouched.
+    pub fn pin_file_line(&mut self, file_line: u64) {
+        if file_line >= self.total_file_lines() {
+            return;
         }
+        let keep = ViewAnchor {
+            file_line,
+            row_offset: self
+                .file_line_to_row(file_line)
+                .saturating_sub(self.viewport.anchor_line()),
+            pixel_offset: self.viewport.pixel_offset(),
+        };
+        self.pinned_line = Some(keep);
+        self.restore_view_anchor(Some(keep));
     }
 
     pub fn set_max_render_bytes(&mut self, n: usize) {
@@ -207,8 +250,63 @@ impl Document {
     }
 
     fn sync_viewport(&mut self) {
+        if self
+            .pinned_line
+            .is_some_and(|pin| pin.file_line >= self.total_file_lines())
+        {
+            self.pinned_line = None;
+        }
+        self.pinned_match_row = self.pinned_line.and_then(|pin| {
+            let matches = self.active_matches()?;
+            matches
+                .binary_search(&pin.file_line)
+                .err()
+                .map(|row| row as u64)
+        });
         let n = self.display_rows();
         self.viewport.set_total_lines(n);
+    }
+
+    fn view_anchor(&self) -> Option<ViewAnchor> {
+        if let Some(pin) = self.pinned_line {
+            let row = self.file_line_to_row(pin.file_line);
+            if row >= self.viewport.anchor_line() && row <= self.viewport.last_visible_line() {
+                let scroll = (self.viewport.anchor_line(), self.viewport.pixel_offset());
+                return Some(if scroll == self.last_restored_scroll {
+                    pin
+                } else {
+                    ViewAnchor {
+                        row_offset: row - scroll.0,
+                        pixel_offset: scroll.1,
+                        ..pin
+                    }
+                });
+            }
+        }
+        self.top_file_line().map(|file_line| ViewAnchor {
+            file_line,
+            row_offset: 0,
+            pixel_offset: self.viewport.pixel_offset(),
+        })
+    }
+
+    fn restore_view_anchor(&mut self, keep: Option<ViewAnchor>) {
+        self.sync_viewport();
+        if let Some(keep) = keep {
+            if self
+                .pinned_line
+                .is_some_and(|pin| pin.file_line == keep.file_line)
+            {
+                self.pinned_line = Some(keep);
+            }
+            let row = self.file_line_to_row(keep.file_line);
+            self.viewport
+                .scroll_to_line(row.saturating_sub(keep.row_offset), ScrollTo::Top);
+            if row >= keep.row_offset {
+                self.viewport.scroll_by_pixels(keep.pixel_offset);
+            }
+        }
+        self.last_restored_scroll = (self.viewport.anchor_line(), self.viewport.pixel_offset());
     }
 
     // ---- 坐标换算 ----
@@ -216,7 +314,16 @@ impl Document {
     /// 视图行号 → 文件行号。
     pub fn row_to_file_line(&self, row: u64) -> Option<u64> {
         match self.active_matches() {
-            Some(m) => m.get(row as usize).copied(),
+            Some(m) => {
+                let row = match self.pinned_match_row {
+                    Some(pin_row) if row == pin_row => {
+                        return self.pinned_line.map(|pin| pin.file_line);
+                    }
+                    Some(pin_row) if row > pin_row => row - 1,
+                    _ => row,
+                };
+                m.get(row as usize).copied()
+            }
             None => (row < self.index.total_lines).then_some(row),
         }
     }
@@ -224,7 +331,15 @@ impl Document {
     /// 文件行号 → 视图行号。筛选视图里目标行没被选中时，返回它之后最近的一行。
     pub fn file_line_to_row(&self, file_line: u64) -> u64 {
         match self.active_matches() {
-            Some(m) => m.partition_point(|&l| l < file_line) as u64,
+            Some(m) => {
+                let row = m.partition_point(|&l| l < file_line) as u64;
+                row + u64::from(
+                    self.pinned_match_row.is_some()
+                        && self
+                            .pinned_line
+                            .is_some_and(|pin| pin.file_line < file_line),
+                )
+            }
             None => file_line,
         }
     }
@@ -284,9 +399,11 @@ impl Document {
 
         match self.active_matches() {
             // 筛选视图：命中行号是跳跃的，只能逐行定位
-            Some(m) => {
-                let start = first as usize;
-                for &file_line in m.iter().skip(start).take(count) {
+            Some(_) => {
+                for row in first..first + count as u64 {
+                    let Some(file_line) = self.row_to_file_line(row) else {
+                        continue;
+                    };
                     self.index
                         .line_spans(self.source.data(), file_line, 1, &mut line_buf);
                     if let Some(&(s, e)) = line_buf.first() {
@@ -491,6 +608,156 @@ mod tests {
             d.rows().iter().map(|row| row.file_line).collect::<Vec<_>>(),
             vec![3, 10, 20]
         );
+    }
+
+    #[test]
+    fn clicked_line_keeps_its_pixel_position_across_filter_and_search_updates() {
+        let mut d = sample();
+        d.viewport_mut().scroll_to_line(500, ScrollTo::Top);
+        d.viewport_mut().scroll_by_pixels(3.5);
+        d.viewport_mut().set_max_h_scroll(200.0);
+        d.viewport_mut().scroll_h_by(75.0);
+        d.pin_file_line(502);
+        let screen_y = |d: &Document| {
+            (d.file_line_to_row(502) - d.viewport().anchor_line()) as f32 * 10.0
+                - d.viewport().pixel_offset()
+        };
+        let expected_y = screen_y(&d);
+
+        set_filter(
+            &mut d,
+            FilterSpec {
+                text: "TARGET".into(),
+                ..Default::default()
+            },
+        );
+        d.set_show_only_filtered(true);
+        run_scan(&mut d);
+        assert_eq!(screen_y(&d), expected_y);
+        assert!(d.rows().iter().any(|row| row.file_line == 502));
+        assert_eq!(d.match_count(), Some(100), "pin is not a filter hit");
+
+        let searched = Arc::new(vec![100, 200, 300, 400, 501, 600, 700, 800]);
+        d.set_display_matches(Some(searched.clone()));
+        assert_eq!(screen_y(&d), expected_y);
+        assert_eq!(d.viewport().h_scroll(), 75.0);
+        assert!(Arc::ptr_eq(d.display_matches.as_ref().unwrap(), &searched));
+
+        // A search in flight can temporarily have no hits. Its final result
+        // must recover the preferred position rather than inherit the clamp.
+        d.set_display_matches(Some(Arc::new(vec![])));
+        assert_eq!(d.display_rows(), 1);
+        assert_eq!(d.rows()[0].file_line, 502);
+        d.set_display_matches(Some(searched));
+        assert_eq!(screen_y(&d), expected_y);
+        d.set_show_only_filtered(false);
+        assert_eq!(screen_y(&d), expected_y);
+        d.set_show_only_filtered(true);
+        assert_eq!(screen_y(&d), expected_y);
+    }
+
+    #[test]
+    fn virtual_pin_is_sorted_unique_and_round_trips_at_result_boundaries() {
+        for (pin, matches, expected) in [
+            (5, vec![10, 30], vec![5, 10, 30]),
+            (20, vec![10, 30], vec![10, 20, 30]),
+            (40, vec![10, 30], vec![10, 30, 40]),
+            (10, vec![10, 30], vec![10, 30]),
+            (20, vec![], vec![20]),
+        ] {
+            let mut d = sample();
+            let matches = Arc::new(matches);
+            d.set_matches(Some(matches.clone()));
+            d.set_show_only_filtered(true);
+            d.pin_file_line(pin);
+            d.viewport_mut().scroll_to_top();
+            assert_eq!(d.display_rows(), expected.len() as u64);
+            assert_eq!(
+                d.rows().iter().map(|row| row.file_line).collect::<Vec<_>>(),
+                expected
+            );
+            for (row, &file_line) in expected.iter().enumerate() {
+                assert_eq!(d.row_to_file_line(row as u64), Some(file_line));
+                assert_eq!(d.file_line_to_row(file_line), row as u64);
+            }
+            for file_line in 0..=50 {
+                assert_eq!(
+                    d.file_line_to_row(file_line),
+                    expected.partition_point(|&line| line < file_line) as u64
+                );
+            }
+            assert_eq!(d.row_to_file_line(expected.len() as u64), None);
+            assert!(Arc::ptr_eq(&d.matched_lines().unwrap(), &matches));
+            assert!(Arc::ptr_eq(d.display_matches.as_ref().unwrap(), &matches));
+        }
+    }
+
+    #[test]
+    fn clicking_another_line_replaces_the_previous_pin() {
+        let mut d = sample();
+        d.set_matches(Some(Arc::new(vec![10, 30])));
+        d.set_show_only_filtered(true);
+        d.pin_file_line(20);
+        d.pin_file_line(30);
+        assert_eq!(d.display_rows(), 2);
+        assert_eq!(
+            d.rows().iter().map(|row| row.file_line).collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+        d.set_display_matches(Some(Arc::new(vec![])));
+        assert_eq!(d.rows()[0].file_line, 30);
+    }
+
+    #[test]
+    fn manual_scroll_updates_the_pins_preferred_position() {
+        let mut d = sample();
+        d.viewport_mut().scroll_to_line(500, ScrollTo::Top);
+        d.pin_file_line(502);
+        d.viewport_mut().scroll_by_pixels(10.0);
+        d.set_matches(Some(Arc::new((0..1000).step_by(10).collect())));
+        d.set_show_only_filtered(true);
+        assert_eq!(d.file_line_to_row(502) - d.viewport().anchor_line(), 1);
+
+        // Scrolling away stays possible; a later scan preserves that reading
+        // position instead of pulling the clicked line back onto the screen.
+        d.goto_file_line(800, ScrollTo::Top);
+        d.set_display_matches(Some(Arc::new((0..1000).step_by(5).collect())));
+        assert_eq!(d.top_file_line(), Some(800));
+    }
+
+    #[test]
+    fn replacing_a_grown_filtered_source_keeps_the_clicked_line() {
+        let mut d = doc_from("a\nb\nc\nd\ne\nf\n", 10.0, 20.0);
+        d.set_matches(Some(Arc::new(vec![1, 3, 5])));
+        d.set_show_only_filtered(true);
+        d.viewport_mut().scroll_to_bottom();
+        d.pin_file_line(3);
+        let grown = Arc::new(FileSource::from_bytes_for_test(
+            b"a\nb\nc\nd\ne\nf\ng\nh\n".to_vec(),
+            Encoding::Utf8,
+        ));
+        let index = Arc::new(LineIndex::build_full(grown.data(), &Progress::default()).unwrap());
+        d.replace_source_and_index(grown, index);
+        d.set_matches(Some(Arc::new(vec![1, 5, 7])));
+        assert_eq!(d.rows()[0].file_line, 3);
+        assert!(!d.viewport().is_at_bottom());
+    }
+
+    #[test]
+    fn invalid_or_removed_pins_do_not_create_phantom_rows() {
+        let mut d = sample();
+        d.pin_file_line(502);
+        d.pin_file_line(1000);
+        d.set_show_only_filtered(true);
+        d.set_display_matches(Some(Arc::new(vec![])));
+        assert_eq!(d.rows()[0].file_line, 502);
+
+        let source = Arc::new(FileSource::from_bytes_for_test(Vec::new(), Encoding::Utf8));
+        let index = Arc::new(LineIndex::build_full(source.data(), &Progress::default()).unwrap());
+        d.replace_source_and_index(source, index);
+        d.set_display_matches(Some(Arc::new(vec![])));
+        assert_eq!(d.display_rows(), 0);
+        assert!(d.rows().is_empty());
     }
 
     #[test]

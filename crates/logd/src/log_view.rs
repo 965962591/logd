@@ -181,13 +181,14 @@ pub struct LogView {
 
 #[derive(Clone, Copy)]
 struct LineSelection {
-    anchor_row: u64,
-    active_row: u64,
+    // File identities survive changes to the filtered/search presentation.
+    anchor_line: u64,
+    active_line: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TextPoint {
-    view_row: u64,
+    file_line: u64,
     byte: usize,
 }
 
@@ -199,7 +200,7 @@ struct TextSelection {
 
 impl LineSelection {
     fn range(self) -> std::ops::RangeInclusive<u64> {
-        self.anchor_row.min(self.active_row)..=self.anchor_row.max(self.active_row)
+        self.anchor_line.min(self.active_line)..=self.anchor_line.max(self.active_line)
     }
 }
 
@@ -216,18 +217,18 @@ impl TextSelection {
         self.anchor == self.active
     }
 
-    fn range_for_row(self, view_row: u64, line_len: usize) -> Option<std::ops::Range<usize>> {
+    fn range_for_row(self, file_line: u64, line_len: usize) -> Option<std::ops::Range<usize>> {
         let (start, end) = self.ordered();
-        if !(start.view_row..=end.view_row).contains(&view_row) {
+        if !(start.file_line..=end.file_line).contains(&file_line) {
             return None;
         }
-        if start.view_row == end.view_row {
+        if start.file_line == end.file_line {
             return Some(start.byte.min(line_len)..end.byte.min(line_len));
         }
 
-        let range = if view_row == start.view_row {
+        let range = if file_line == start.file_line {
             start.byte.min(line_len)..line_len
-        } else if view_row == end.view_row {
+        } else if file_line == end.file_line {
             0..end.byte.min(line_len)
         } else {
             0..line_len
@@ -690,9 +691,8 @@ impl LogView {
         match MatcherSet::new(filters, self.doc.encoding()) {
             Ok(m) => {
                 self.error = None;
-                self.clear_text_selection(cx);
-                self.selection = None;
                 self.selecting = false;
+                self.text_selecting = false;
                 self.doc.set_matcher(Arc::new(m));
                 // Keep completed search hits visible while the independent
                 // configured-filter scan catches up.
@@ -707,9 +707,8 @@ impl LogView {
     }
 
     pub fn set_show_only_filtered(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.clear_text_selection(cx);
-        self.selection = None;
         self.selecting = false;
+        self.text_selecting = false;
         self.doc.set_show_only_filtered(on);
         cx.notify();
     }
@@ -720,46 +719,29 @@ impl LogView {
         pointer_y: f32,
         cx: &mut Context<Self>,
     ) {
-        if !self.doc.show_only_filtered() || on {
+        if self.doc.pinned_file_line().is_some() || !self.doc.show_only_filtered() || on {
             self.set_show_only_filtered(on, cx);
             return;
         }
 
-        let anchor = self.doc.viewport().anchor_line();
-        let pixel_offset = self.doc.viewport().pixel_offset();
-        let row_to_anchor = |row| {
-            self.doc
-                .row_to_file_line(row)
-                .map(|file_line| (file_line, row.saturating_sub(anchor)))
-        };
+        // The mouse may be over the menu/toolbar rather than a log row. In
+        // that case keep the clicked line instead of clamping to a view edge.
+        let pointer_in_view = pointer_y >= f32::from(self.last_area.origin.y)
+            && pointer_y < f32::from(self.last_area.bottom());
         let pointer_line = self
             .row_at_y(pointer_y)
-            .and_then(row_to_anchor)
+            .filter(|_| pointer_in_view)
+            .and_then(|row| self.doc.row_to_file_line(row))
             .or_else(|| {
                 self.active_input_line
                     .filter(|file_line| self.line_inputs.contains_key(file_line))
-                    .map(|file_line| {
-                        let row = self.doc.file_line_to_row(file_line);
-                        (file_line, row.saturating_sub(anchor))
-                    })
             })
-            .or_else(|| {
-                self.selection
-                    .and_then(|selection| row_to_anchor(selection.active_row))
-            });
+            .or_else(|| self.selection.map(|selection| selection.active_line));
 
-        self.clear_text_selection(cx);
-        self.selection = None;
-        self.selecting = false;
-        self.doc.set_show_only_filtered(on);
-        if let Some((file_line, row_offset)) = pointer_line {
-            let new_row = self.doc.file_line_to_row(file_line);
-            let new_anchor = new_row.saturating_sub(row_offset);
-            let viewport = self.doc.viewport_mut();
-            viewport.scroll_to_line(new_anchor, ScrollTo::Top);
-            viewport.scroll_by_pixels(pixel_offset);
+        if let Some(file_line) = pointer_line {
+            self.doc.pin_file_line(file_line);
         }
-        cx.notify();
+        self.set_show_only_filtered(on, cx);
     }
 
     pub fn set_encoding(
@@ -771,6 +753,7 @@ impl LogView {
         fuzzy_search_enabled: bool,
         cx: &mut Context<Self>,
     ) {
+        self.clear_text_selection(cx);
         self.doc.set_encoding(enc);
         // 关键字要按新编码重新编码成字节串，matcher 必须重建
         self.apply_filters(filters, cx);
@@ -962,7 +945,9 @@ impl LogView {
         self.clear_text_selection(cx);
         self.selection = None;
         self.selecting = false;
+        self.doc.pin_file_line(file_line);
         self.doc.goto_file_line(file_line, ScrollTo::Center);
+        self.doc.pin_file_line(file_line);
         cx.notify();
     }
 
@@ -1062,7 +1047,10 @@ impl LogView {
         {
             let (start, end) = selection.ordered();
             let mut output = String::new();
-            for view_row in start.view_row..=end.view_row {
+            let start_row = self.doc.file_line_to_row(start.file_line);
+            let end_row = self.doc.file_line_to_row(end.file_line);
+            let mut first = true;
+            for view_row in start_row..=end_row {
                 let Some(file_line) = self.doc.row_to_file_line(view_row) else {
                     continue;
                 };
@@ -1072,12 +1060,13 @@ impl LogView {
                     .cloned()
                     .or_else(|| self.doc.line_text(file_line))
                     .unwrap_or_default();
-                let Some(range) = selection.range_for_row(view_row, text.len()) else {
+                let Some(range) = selection.range_for_row(file_line, text.len()) else {
                     continue;
                 };
-                if view_row != start.view_row {
+                if !first {
                     output.push('\n');
                 }
+                first = false;
                 output.push_str(&text[range]);
             }
             return (!output.is_empty()).then_some(output);
@@ -1098,10 +1087,16 @@ impl LogView {
             return None;
         };
         let mut output = String::new();
-        for row in selection.range() {
+        let range = selection.range();
+        let start_row = self.doc.file_line_to_row(*range.start());
+        let end_row = self.doc.file_line_to_row(*range.end());
+        for row in start_row..=end_row {
             let Some(file_line) = self.doc.row_to_file_line(row) else {
                 continue;
             };
+            if !range.contains(&file_line) {
+                continue;
+            }
             if !output.is_empty() {
                 output.push('\n');
             }
@@ -1150,12 +1145,11 @@ impl LogView {
             .map(|(&file_line, input)| (file_line, input.clone()))
             .collect::<Vec<_>>();
         for (file_line, input) in inputs {
-            let view_row = self.doc.file_line_to_row(file_line);
             let state = input.read(cx);
             let current = state.selected_range();
             let cursor = state.cursor();
             let desired = selection
-                .range_for_row(view_row, state.value().len())
+                .range_for_row(file_line, state.value().len())
                 .unwrap_or(cursor..cursor);
             if current != desired {
                 input.update(cx, |state, cx| state.set_selected_range(desired, cx));
@@ -1208,16 +1202,17 @@ impl LogView {
         };
         let anchor_byte = active_byte;
 
+        self.doc.pin_file_line(file_line);
         self.selection = None;
         self.selecting = false;
         self.active_input_line = Some(file_line);
         self.text_selection = Some(TextSelection {
             anchor: TextPoint {
-                view_row,
+                file_line,
                 byte: anchor_byte,
             },
             active: TextPoint {
-                view_row,
+                file_line,
                 byte: active_byte,
             },
         });
@@ -1255,7 +1250,7 @@ impl LogView {
         let Some(selection) = &mut self.text_selection else {
             return;
         };
-        let active = TextPoint { view_row, byte };
+        let active = TextPoint { file_line, byte };
         if selection.active == active {
             return;
         }
@@ -1276,11 +1271,14 @@ impl LogView {
                     }
                 } else if this.text_selecting {
                     if let Some(position) = this.selection_drag_position {
-                        if let Some(view_row) = this.row_at_y(f32::from(position.y)) {
+                        if let Some(file_line) = this
+                            .row_at_y(f32::from(position.y))
+                            .and_then(|row| this.doc.row_to_file_line(row))
+                        {
                             let Some(selection) = this.text_selection.as_mut() else {
                                 return;
                             };
-                            selection.active.view_row = view_row;
+                            selection.active.file_line = file_line;
                             this.apply_text_selection(cx);
                         }
                     }
@@ -1303,7 +1301,8 @@ impl LogView {
             .set(h_delta, cx, |delta, this, cx| {
                 this.doc.viewport_mut().scroll_h_by(f32::from(delta));
                 if let Some(selection) = this.text_selection.as_mut() {
-                    if let Some(file_line) = this.doc.row_to_file_line(selection.active.view_row) {
+                    let file_line = selection.active.file_line;
+                    if file_line < this.doc.total_file_lines() {
                         let text = this
                             .edits
                             .get(&file_line)
@@ -1333,7 +1332,7 @@ impl LogView {
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let row = self
             .selection
-            .map(|selection| selection.active_row)
+            .map(|selection| self.doc.file_line_to_row(selection.active_line))
             .unwrap_or_else(|| self.doc.viewport().anchor_line());
         self.focus_row_input(row, window, cx);
     }
@@ -1351,6 +1350,7 @@ impl LogView {
         }
         self.editing_line = Some(file_line);
         self.active_input_line = Some(file_line);
+        self.doc.pin_file_line(file_line);
         self.editing_changed = false;
         self.selection = None;
         let focus = input.read(cx).focus_handle(cx);
@@ -1421,6 +1421,7 @@ impl LogView {
                                 this.editing_line = None;
                             }
                             this.active_input_line = Some(file_line);
+                            this.doc.pin_file_line(file_line);
                             this.selection = None;
                             cx.notify();
                         }
@@ -1592,16 +1593,20 @@ impl LogView {
     }
 
     fn select_row(&mut self, row: u64, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file_line) = self.doc.row_to_file_line(row) else {
+            return;
+        };
+        self.doc.pin_file_line(file_line);
         self.clear_text_selection(cx);
         self.active_input_line = None;
         self.selection = match (extend, self.selection) {
             (true, Some(selection)) => Some(LineSelection {
-                active_row: row,
+                active_line: file_line,
                 ..selection
             }),
             _ => Some(LineSelection {
-                anchor_row: row,
-                active_row: row,
+                anchor_line: file_line,
+                active_line: file_line,
             }),
         };
         self.selecting = true;
@@ -1629,9 +1634,12 @@ impl LogView {
         let Some(row) = self.row_at_y(y) else {
             return;
         };
+        let Some(file_line) = self.doc.row_to_file_line(row) else {
+            return;
+        };
         if let Some(selection) = &mut self.selection {
-            if selection.active_row != row {
-                selection.active_row = row;
+            if selection.active_line != file_line {
+                selection.active_line = file_line;
                 cx.notify();
             }
         }
@@ -1804,7 +1812,8 @@ impl LogView {
         let row_font_size = filter_font_size_for_row(row, filters);
         let selected = self
             .selection
-            .is_some_and(|selection| selection.range().contains(&view_row));
+            .is_some_and(|selection| selection.range().contains(&row.file_line))
+            || self.doc.pinned_file_line() == Some(row.file_line);
         let marked = self.marked_lines.contains(&row.file_line);
         let file_line = row.file_line;
         let language = self.language;
@@ -1819,7 +1828,7 @@ impl LogView {
             .filter(|selection| !selection.is_empty())
             .and_then(|selection| {
                 let text = input.read(cx).value();
-                let range = selection.range_for_row(view_row, text.len())?;
+                let range = selection.range_for_row(row.file_line, text.len())?;
                 let run = TextRun {
                     len: text.len(),
                     font: font(theme::MONO),
@@ -1837,7 +1846,7 @@ impl LogView {
             });
         let caret_x = self
             .text_selection
-            .filter(|selection| selection.is_empty() && selection.active.view_row == view_row)
+            .filter(|selection| selection.is_empty() && selection.active.file_line == row.file_line)
             .map(|selection| {
                 let text = input.read(cx).value();
                 let run = TextRun {
@@ -2022,10 +2031,9 @@ impl LogView {
             .min_w_0()
             .overflow_hidden()
             .when_some(line_spec.and_then(|f| f.back), |el, c| el.bg(theme::c(c)))
-            .when(
-                selected && line_spec.and_then(|filter| filter.back).is_none(),
-                |el| el.bg(palette.selection),
-            )
+            // Reuse the existing row-selection token for the caret's pinned
+            // line. Selection wins over filter backgrounds so it stays visible.
+            .when(selected, |el| el.bg(palette.selection))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2767,23 +2775,23 @@ mod tests {
     use std::sync::Arc;
 
     use logd_core::{
-        scan_all_with_query_and_counts_for_filters, FileSource, FilterSpec, LineIndex, MatcherSet,
-        Progress, Query, ScanOutcome,
+        scan_all_with_query_and_counts_for_filters, Document, FileSource, FilterSpec, LineIndex,
+        MatcherSet, Progress, Query, ScanOutcome, ScrollTo,
     };
 
     use super::{
         find_filter_match, incremental_refresh_results, merge_refreshed_lines, union_sorted,
-        RefreshScanSnapshot, TextPoint, TextSelection,
+        LineSelection, RefreshScanSnapshot, TextPoint, TextSelection,
     };
 
     fn selection(anchor: (u64, usize), active: (u64, usize)) -> TextSelection {
         TextSelection {
             anchor: TextPoint {
-                view_row: anchor.0,
+                file_line: anchor.0,
                 byte: anchor.1,
             },
             active: TextPoint {
-                view_row: active.0,
+                file_line: active.0,
                 byte: active.1,
             },
         }
@@ -2814,6 +2822,55 @@ mod tests {
         let selection = selection((8, 7), (8, 2));
 
         assert_eq!(selection.range_for_row(8, 10), Some(2..7));
+    }
+
+    #[test]
+    fn caret_and_row_selection_follow_file_identity_after_results_change() {
+        let path = std::env::temp_dir().join(format!(
+            "logd-selection-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let text: String = (0..100).map(|line| format!("row {line}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        let source = Arc::new(FileSource::open(&path).unwrap());
+        let index = Arc::new(LineIndex::build_full(source.data(), &Progress::default()).unwrap());
+        let mut doc = Document::new(source, index, 10.0);
+        doc.viewport_mut().set_height(30.0);
+        doc.goto_file_line(40, ScrollTo::Top);
+        doc.pin_file_line(42);
+        let caret = selection((42, 3), (42, 3));
+        let selected = LineSelection {
+            anchor_line: 42,
+            active_line: 42,
+        };
+
+        doc.set_show_only_filtered(true);
+        for matches in [vec![0, 7, 21, 40, 55, 60, 70, 80], vec![], vec![2, 42, 44]] {
+            doc.set_display_matches(Some(Arc::new(matches)));
+            let rows = doc.rows();
+            let clicked = rows
+                .iter()
+                .find(|row| row.file_line == caret.active.file_line)
+                .unwrap();
+            assert_eq!(clicked.text, "row 42");
+            assert_eq!(
+                caret.range_for_row(clicked.file_line, clicked.text.len()),
+                Some(3..3)
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| selected.range().contains(&row.file_line))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                doc.row_to_file_line(doc.file_line_to_row(caret.active.file_line)),
+                Some(42)
+            );
+        }
+        drop(doc);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
